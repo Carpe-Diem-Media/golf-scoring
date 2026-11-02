@@ -48,6 +48,16 @@ defmodule GolfScoringWeb.Router do
     pipe_through :browser
 
     get "/access", AccessController, :exchange
+    live "/access-denied", AccessDeniedLive, :show
+  end
+
+  scope "/player", GolfScoringWeb.Player do
+    pipe_through [:browser, :require_player_access]
+
+    live_session :player,
+      on_mount: [{GolfScoringWeb.Player.LiveMount, :require_grant}] do
+      live "/", HomeLive, :index
+    end
   end
 
   scope "/admin" do

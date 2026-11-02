@@ -57,7 +57,7 @@ defmodule GolfScoringWeb.Player.RequirePlayerAccessTest do
       |> invoke_require_player_access()
 
     assert conn.halted
-    assert redirected_to(conn) == "/"
+    assert redirected_to(conn) == "/player/access-denied"
     assert is_nil(Session.grant_id(conn))
   end
 
@@ -77,7 +77,7 @@ defmodule GolfScoringWeb.Player.RequirePlayerAccessTest do
       |> invoke_require_player_access()
 
     assert conn.halted
-    assert redirected_to(conn) == "/"
+    assert redirected_to(conn) == "/player/access-denied"
     assert is_nil(Session.grant_id(conn))
   end
 
@@ -99,7 +99,7 @@ defmodule GolfScoringWeb.Player.RequirePlayerAccessTest do
       |> invoke_require_player_access()
 
     assert conn.halted
-    assert redirected_to(conn) == "/"
+    assert redirected_to(conn) == "/player/access-denied"
     assert is_nil(Session.grant_id(conn))
   end
 

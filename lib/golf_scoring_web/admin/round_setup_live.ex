@@ -129,7 +129,9 @@ defmodule GolfScoringWeb.Admin.RoundSetupLive do
        socket
        |> assign(:current_staff_user, fresh)
        |> assign(:page_title, "Round setup")
+       |> assign(:current_path, ~p"/admin/events/#{event_uuid}/rounds/#{round_uuid}/setup")
        |> assign(:event_id, event_uuid)
+       |> assign(:round_id, round_uuid)
        |> assign(:round, round)
        |> assign(:can_mutate, pre_open?(round))
        |> refresh_round_state(round)}
@@ -363,320 +365,329 @@ defmodule GolfScoringWeb.Admin.RoundSetupLive do
   def render(assigns) do
     ~H"""
     <Layouts.app flash={@flash}>
-      <section id="round-setup" class="space-y-6">
-        <header class="space-y-2">
-          <p class="text-sm font-medium text-base-content/70">
-            Event {@event_id} · Round {@round.id}
-          </p>
-          <h1 class="text-2xl font-semibold tracking-tight">Round setup</h1>
-          <p id="round-state" class="text-sm text-base-content/70">State: {@round.state}</p>
-        </header>
-
-        <div class="rounded-2xl border border-base-300 bg-base-100 p-6 shadow-sm space-y-4">
-          <h2 class="text-lg font-semibold">Competition configuration</h2>
-
-          <ul id="competition-configuration-status" class="text-sm space-y-1">
-            <li :for={item <- @configuration_checklist} id={"competition-check-#{item.key}"}>
-              <span class={if(item.done, do: "text-success", else: "text-warning")}>
-                {if item.done, do: "✓", else: "○"}
-              </span>
-              {item.label}
-            </li>
-          </ul>
-
-          <%= if @allowance_invalidation_notice do %>
-            <p id="allowance-invalidation-notice" class="text-sm text-warning">
-              {@allowance_invalidation_notice}
-            </p>
-          <% end %>
-
-          <.form
-            id="competition-allowance-form"
-            for={%{}}
-            phx-submit="save_allowance"
-            class="flex flex-wrap items-end gap-3"
-          >
-            <.input
-              id="competition-handicap-allowance"
-              name="allowance[handicap_allowance_percent]"
-              type="number"
-              label="Handicap allowance (%)"
-              value={@handicap_allowance_percent}
-              min="0"
-              max="100"
-              disabled={not @can_mutate}
-            />
-            <button
-              id="competition-allowance-save"
-              type="submit"
-              class="btn btn-primary"
-              disabled={not @can_mutate}
-            >
-              Save allowance
-            </button>
-          </.form>
-        </div>
-
-        <div class="rounded-2xl border border-base-300 bg-base-100 p-6 shadow-sm space-y-4">
-          <h2 class="text-lg font-semibold">Starting entries</h2>
-          <p class="text-sm text-base-content/70">
-            {length(@starting_entries)} starter(s) in this Round.
-          </p>
-
-          <div id="starting-entries-list" class="space-y-6">
-            <article
-              :for={entry <- @starting_entries}
-              id={"starting-entry-#{entry.id}"}
-              class="rounded-xl border border-base-200 p-4 space-y-3"
-            >
-              <h3 class="font-medium">{entry.display_name}</h3>
-              <p class="text-xs text-base-content/60">Entry {entry.id}</p>
-
-              <.form
-                id={"entry-tee-form-#{entry.id}"}
-                for={%{}}
-                phx-submit="assign_entry_tee"
-                class="flex flex-wrap items-end gap-2"
-              >
-                <input type="hidden" name="entry[round_entry_id]" value={entry.id} />
-                <.input
-                  id={"entry-tee-#{entry.id}"}
-                  name="entry[snapshot_id]"
-                  type="select"
-                  label="Tee snapshot"
-                  value={entry.round_tee_profile_snapshot_id || ""}
-                  options={@snapshot_options}
-                  prompt="Select snapshot"
-                  disabled={not @can_mutate}
-                />
-                <button type="submit" class="btn btn-sm btn-outline" disabled={not @can_mutate}>
-                  Assign tee
-                </button>
-              </.form>
-
-              <%= if entry.player_has_handicap_index? do %>
-                <.form
-                  id={"entry-handicap-form-#{entry.id}"}
-                  for={%{}}
-                  phx-submit="confirm_handicap"
-                  class="flex flex-wrap items-end gap-2"
-                >
-                  <input type="hidden" name="handicap[round_entry_id]" value={entry.id} />
-                  <.input
-                    id={"entry-hi-#{entry.id}"}
-                    name="handicap[source_handicap_index]"
-                    type="text"
-                    label="Handicap index"
-                    value={entry.source_handicap_index_input}
-                    disabled={not @can_mutate}
-                  />
-                  <button type="submit" class="btn btn-sm btn-outline" disabled={not @can_mutate}>
-                    Confirm HI
-                  </button>
-                </.form>
-              <% else %>
-                <.form
-                  id={"entry-no-hi-form-#{entry.id}"}
-                  for={%{}}
-                  phx-submit="apply_no_hi"
-                  class="flex flex-wrap items-end gap-2"
-                >
-                  <input type="hidden" name="no_hi[round_entry_id]" value={entry.id} />
-                  <.input
-                    id={"entry-deemed-#{entry.id}"}
-                    name="no_hi[deemed_handicap_basis]"
-                    type="text"
-                    label="Deemed handicap basis (no HI)"
-                    value={entry.deemed_handicap_basis_input}
-                    disabled={not @can_mutate}
-                  />
-                  <.input
-                    id={"entry-no-hi-provenance-#{entry.id}"}
-                    name="no_hi[source_reference]"
-                    type="text"
-                    label="Committee provenance reference"
-                    value={entry.no_hi_source_reference_input}
-                    disabled={not @can_mutate}
-                  />
-                  <button type="submit" class="btn btn-sm btn-outline" disabled={not @can_mutate}>
-                    Apply no-HI
-                  </button>
-                </.form>
-              <% end %>
-
-              <div class="flex flex-wrap gap-2 text-sm">
-                <span>Tee: {entry.tee_status_label}</span>
-                <span>Basis: {entry.basis_status_label}</span>
-                <span>Course HI: {entry.course_handicap_label}</span>
-                <span>Playing HI: {entry.playing_handicap_label}</span>
-              </div>
-
-              <div class="flex flex-wrap gap-2">
-                <button
-                  id={"build-course-handicap-#{entry.id}"}
-                  type="button"
-                  class="btn btn-sm btn-secondary"
-                  phx-click="build_course_handicap"
-                  phx-value-round_entry_id={entry.id}
-                  disabled={not @can_mutate}
-                >
-                  Build course handicap
-                </button>
-                <button
-                  id={"build-playing-handicap-#{entry.id}"}
-                  type="button"
-                  class="btn btn-sm btn-secondary"
-                  phx-click="build_playing_handicap"
-                  phx-value-round_entry_id={entry.id}
-                  disabled={not @can_mutate}
-                >
-                  Build playing handicap
-                </button>
-              </div>
-            </article>
-          </div>
-        </div>
-
-        <div class="rounded-2xl border border-base-300 bg-base-100 p-6 shadow-sm space-y-4">
-          <h2 class="text-lg font-semibold">Scoring tracks</h2>
-          <%= if scoring_track_locked?(@standard_track) or scoring_track_locked?(@mystery_track) do %>
-            <p id="scoring-tracks-locked-notice" class="text-sm text-base-content/70">
-              Locked scoring tracks are read-only on this screen.
-            </p>
-          <% end %>
-          <div class="flex flex-wrap gap-3">
-            <button
-              id="save-standard-track"
-              type="button"
-              class="btn btn-outline"
-              phx-click="save_standard_track"
-              disabled={not scoring_track_configurable?(@can_mutate, @standard_track)}
-            >
-              {track_button_label(@standard_track, "Standard better-ball")}
-            </button>
-            <button
-              id="save-mystery-track"
-              type="button"
-              class="btn btn-outline"
-              phx-click="save_mystery_track"
-              disabled={not scoring_track_configurable?(@can_mutate, @mystery_track)}
-            >
-              {track_button_label(@mystery_track, "Mystery leaderboard")}
-            </button>
-          </div>
-        </div>
-
-        <%= if @can_configure_mystery and @mystery_track do %>
+      <AppShell.staff
+        flash={@flash}
+        page_title={@page_title}
+        eyebrow="Event workspace"
+        current_staff_user={@current_staff_user}
+        current_path={@current_path}
+        event_id={@event_id}
+        round_id={@round_id}
+        status_badges={[%{id: "round-state-badge", label: "Round #{@round.state}"}]}
+        breadcrumbs={[
+          %{label: "Dashboard", href: ~p"/admin"},
+          %{label: "Course setup", href: ~p"/admin/events/#{@event_id}/course-setup"},
+          %{label: "Round setup"}
+        ]}
+      >
+        <section id="round-setup" class="space-y-6">
+          <p id="round-state" class="sr-only">State: {@round.state}</p>
           <div class="rounded-2xl border border-base-300 bg-base-100 p-6 shadow-sm space-y-4">
-            <h2 class="text-lg font-semibold">Mystery hole rules</h2>
-            <div id="mystery-hole-rules" class="grid gap-3 sm:grid-cols-2">
-              <%= for hole <- @round_holes do %>
-                <.form
-                  id={"mystery-rule-form-#{hole.id}"}
-                  for={%{}}
-                  phx-submit="save_mystery_rule"
-                  class="flex items-end gap-2"
-                >
-                  <input type="hidden" name="rule[round_hole_id]" value={hole.id} />
-                  <.input
-                    id={"mystery-rule-#{hole.id}"}
-                    name="rule[selection]"
-                    type="select"
-                    label={"Hole #{hole.display_hole_number} (play #{hole.play_order})"}
-                    value={Map.get(@mystery_rule_selections, hole.id, "NONE")}
-                    options={@mystery_rule_options}
-                    disabled={
-                      not mystery_rules_configurable?(
-                        @can_mutate,
-                        @can_configure_mystery,
-                        @mystery_track
-                      )
-                    }
-                  />
-                  <button
-                    id={"mystery-rule-save-#{hole.id}"}
-                    type="submit"
-                    class="btn btn-sm btn-primary"
-                    disabled={
-                      not mystery_rules_configurable?(
-                        @can_mutate,
-                        @can_configure_mystery,
-                        @mystery_track
-                      )
-                    }
-                  >
-                    Save
-                  </button>
-                </.form>
-              <% end %>
-            </div>
-          </div>
-        <% end %>
+            <h2 class="text-lg font-semibold">Competition configuration</h2>
 
-        <%= if @can_mutate do %>
-          <div class="rounded-2xl border border-base-300 bg-base-100 p-6 shadow-sm space-y-4">
-            <h2 class="text-lg font-semibold">Round route</h2>
-            <ol id="round-route-list" class="list-decimal pl-5 text-sm space-y-1">
-              <li :for={hole <- @round_holes}>
-                play {hole.play_order} · course hole {hole.course_hole_id}
-              </li>
-            </ol>
-            <.form id="round-route-form" for={%{}} phx-submit="save_route">
-              <div id="round-route-selectors" class="grid gap-3 sm:grid-cols-2">
-                <%= for play_order <- 1..18 do %>
-                  <.input
-                    id={"round-route-hole-#{play_order}"}
-                    name={"route[hole_#{play_order}]"}
-                    type="select"
-                    label={"Play #{play_order}"}
-                    value={Map.get(@route_selections, play_order, "")}
-                    options={@course_hole_options}
-                    prompt="Select course hole"
-                  />
-                <% end %>
-              </div>
-              <button id="round-route-save-button" type="submit" class="btn btn-primary mt-3">
-                Save route
-              </button>
-            </.form>
-          </div>
-
-          <div class="rounded-2xl border border-base-300 bg-base-100 p-6 shadow-sm space-y-4">
-            <h2 class="text-lg font-semibold">Tee profile snapshots</h2>
-            <ul id="snapshot-status-list" class="text-sm space-y-1">
-              <li :for={snapshot <- @snapshots}>
-                {snapshot.rating_label} · source {snapshot.source_tee_rating_profile_id}
+            <ul id="competition-configuration-status" class="text-sm space-y-1">
+              <li :for={item <- @configuration_checklist} id={"competition-check-#{item.key}"}>
+                <span class={if(item.done, do: "text-success", else: "text-warning")}>
+                  {if item.done, do: "✓", else: "○"}
+                </span>
+                {item.label}
               </li>
             </ul>
-            <.form id="round-snapshot-form" for={%{}} phx-submit="snapshot_tees">
-              <div id="tee-profile-options" class="space-y-2">
-                <%= for profile <- @available_profiles do %>
-                  <label class="flex items-center gap-2 text-sm">
-                    <input
-                      type="checkbox"
-                      name="snapshot[profile_ids][]"
-                      value={profile.id}
-                      checked={profile.id in @selected_profile_ids}
-                    />
-                    {profile.rating_label} ({profile.tee_set_name})
-                  </label>
-                <% end %>
-              </div>
-              <button id="round-snapshot-button" type="submit" class="btn btn-primary mt-3">
-                Snapshot selected profiles
+
+            <%= if @allowance_invalidation_notice do %>
+              <p id="allowance-invalidation-notice" class="text-sm text-warning">
+                {@allowance_invalidation_notice}
+              </p>
+            <% end %>
+
+            <.form
+              id="competition-allowance-form"
+              for={%{}}
+              phx-submit="save_allowance"
+              class="flex flex-wrap items-end gap-3"
+            >
+              <.input
+                id="competition-handicap-allowance"
+                name="allowance[handicap_allowance_percent]"
+                type="number"
+                label="Handicap allowance (%)"
+                value={@handicap_allowance_percent}
+                min="0"
+                max="100"
+                disabled={not @can_mutate}
+              />
+              <button
+                id="competition-allowance-save"
+                type="submit"
+                class="btn btn-primary"
+                disabled={not @can_mutate}
+              >
+                Save allowance
               </button>
             </.form>
-            <button
-              id="round-clear-snapshots-button"
-              type="button"
-              class="btn btn-outline mt-3"
-              phx-click="clear_snapshots"
-            >
-              Clear all snapshots
-            </button>
           </div>
-        <% end %>
-      </section>
+
+          <div class="rounded-2xl border border-base-300 bg-base-100 p-6 shadow-sm space-y-4">
+            <h2 class="text-lg font-semibold">Starting entries</h2>
+            <p class="text-sm text-base-content/70">
+              {length(@starting_entries)} starter(s) in this Round.
+            </p>
+
+            <div id="starting-entries-list" class="space-y-6">
+              <article
+                :for={entry <- @starting_entries}
+                id={"starting-entry-#{entry.id}"}
+                class="rounded-xl border border-base-200 p-4 space-y-3"
+              >
+                <h3 class="font-medium">{entry.display_name}</h3>
+                <p class="text-xs text-base-content/60">Entry {entry.id}</p>
+
+                <.form
+                  id={"entry-tee-form-#{entry.id}"}
+                  for={%{}}
+                  phx-submit="assign_entry_tee"
+                  class="flex flex-wrap items-end gap-2"
+                >
+                  <input type="hidden" name="entry[round_entry_id]" value={entry.id} />
+                  <.input
+                    id={"entry-tee-#{entry.id}"}
+                    name="entry[snapshot_id]"
+                    type="select"
+                    label="Tee snapshot"
+                    value={entry.round_tee_profile_snapshot_id || ""}
+                    options={@snapshot_options}
+                    prompt="Select snapshot"
+                    disabled={not @can_mutate}
+                  />
+                  <button type="submit" class="btn btn-sm btn-outline" disabled={not @can_mutate}>
+                    Assign tee
+                  </button>
+                </.form>
+
+                <%= if entry.player_has_handicap_index? do %>
+                  <.form
+                    id={"entry-handicap-form-#{entry.id}"}
+                    for={%{}}
+                    phx-submit="confirm_handicap"
+                    class="flex flex-wrap items-end gap-2"
+                  >
+                    <input type="hidden" name="handicap[round_entry_id]" value={entry.id} />
+                    <.input
+                      id={"entry-hi-#{entry.id}"}
+                      name="handicap[source_handicap_index]"
+                      type="text"
+                      label="Handicap index"
+                      value={entry.source_handicap_index_input}
+                      disabled={not @can_mutate}
+                    />
+                    <button type="submit" class="btn btn-sm btn-outline" disabled={not @can_mutate}>
+                      Confirm HI
+                    </button>
+                  </.form>
+                <% else %>
+                  <.form
+                    id={"entry-no-hi-form-#{entry.id}"}
+                    for={%{}}
+                    phx-submit="apply_no_hi"
+                    class="flex flex-wrap items-end gap-2"
+                  >
+                    <input type="hidden" name="no_hi[round_entry_id]" value={entry.id} />
+                    <.input
+                      id={"entry-deemed-#{entry.id}"}
+                      name="no_hi[deemed_handicap_basis]"
+                      type="text"
+                      label="Deemed handicap basis (no HI)"
+                      value={entry.deemed_handicap_basis_input}
+                      disabled={not @can_mutate}
+                    />
+                    <.input
+                      id={"entry-no-hi-provenance-#{entry.id}"}
+                      name="no_hi[source_reference]"
+                      type="text"
+                      label="Committee provenance reference"
+                      value={entry.no_hi_source_reference_input}
+                      disabled={not @can_mutate}
+                    />
+                    <button type="submit" class="btn btn-sm btn-outline" disabled={not @can_mutate}>
+                      Apply no-HI
+                    </button>
+                  </.form>
+                <% end %>
+
+                <div class="flex flex-wrap gap-2 text-sm">
+                  <span>Tee: {entry.tee_status_label}</span>
+                  <span>Basis: {entry.basis_status_label}</span>
+                  <span>Course HI: {entry.course_handicap_label}</span>
+                  <span>Playing HI: {entry.playing_handicap_label}</span>
+                </div>
+
+                <div class="flex flex-wrap gap-2">
+                  <button
+                    id={"build-course-handicap-#{entry.id}"}
+                    type="button"
+                    class="btn btn-sm btn-secondary"
+                    phx-click="build_course_handicap"
+                    phx-value-round_entry_id={entry.id}
+                    disabled={not @can_mutate}
+                  >
+                    Build course handicap
+                  </button>
+                  <button
+                    id={"build-playing-handicap-#{entry.id}"}
+                    type="button"
+                    class="btn btn-sm btn-secondary"
+                    phx-click="build_playing_handicap"
+                    phx-value-round_entry_id={entry.id}
+                    disabled={not @can_mutate}
+                  >
+                    Build playing handicap
+                  </button>
+                </div>
+              </article>
+            </div>
+          </div>
+
+          <div class="rounded-2xl border border-base-300 bg-base-100 p-6 shadow-sm space-y-4">
+            <h2 class="text-lg font-semibold">Scoring tracks</h2>
+            <%= if scoring_track_locked?(@standard_track) or scoring_track_locked?(@mystery_track) do %>
+              <p id="scoring-tracks-locked-notice" class="text-sm text-base-content/70">
+                Locked scoring tracks are read-only on this screen.
+              </p>
+            <% end %>
+            <div class="flex flex-wrap gap-3">
+              <button
+                id="save-standard-track"
+                type="button"
+                class="btn btn-outline"
+                phx-click="save_standard_track"
+                disabled={not scoring_track_configurable?(@can_mutate, @standard_track)}
+              >
+                {track_button_label(@standard_track, "Standard better-ball")}
+              </button>
+              <button
+                id="save-mystery-track"
+                type="button"
+                class="btn btn-outline"
+                phx-click="save_mystery_track"
+                disabled={not scoring_track_configurable?(@can_mutate, @mystery_track)}
+              >
+                {track_button_label(@mystery_track, "Mystery leaderboard")}
+              </button>
+            </div>
+          </div>
+
+          <%= if @can_configure_mystery and @mystery_track do %>
+            <div class="rounded-2xl border border-base-300 bg-base-100 p-6 shadow-sm space-y-4">
+              <h2 class="text-lg font-semibold">Mystery hole rules</h2>
+              <div id="mystery-hole-rules" class="grid gap-3 sm:grid-cols-2">
+                <%= for hole <- @round_holes do %>
+                  <.form
+                    id={"mystery-rule-form-#{hole.id}"}
+                    for={%{}}
+                    phx-submit="save_mystery_rule"
+                    class="flex items-end gap-2"
+                  >
+                    <input type="hidden" name="rule[round_hole_id]" value={hole.id} />
+                    <.input
+                      id={"mystery-rule-#{hole.id}"}
+                      name="rule[selection]"
+                      type="select"
+                      label={"Hole #{hole.display_hole_number} (play #{hole.play_order})"}
+                      value={Map.get(@mystery_rule_selections, hole.id, "NONE")}
+                      options={@mystery_rule_options}
+                      disabled={
+                        not mystery_rules_configurable?(
+                          @can_mutate,
+                          @can_configure_mystery,
+                          @mystery_track
+                        )
+                      }
+                    />
+                    <button
+                      id={"mystery-rule-save-#{hole.id}"}
+                      type="submit"
+                      class="btn btn-sm btn-primary"
+                      disabled={
+                        not mystery_rules_configurable?(
+                          @can_mutate,
+                          @can_configure_mystery,
+                          @mystery_track
+                        )
+                      }
+                    >
+                      Save
+                    </button>
+                  </.form>
+                <% end %>
+              </div>
+            </div>
+          <% end %>
+
+          <%= if @can_mutate do %>
+            <div class="rounded-2xl border border-base-300 bg-base-100 p-6 shadow-sm space-y-4">
+              <h2 class="text-lg font-semibold">Round route</h2>
+              <ol id="round-route-list" class="list-decimal pl-5 text-sm space-y-1">
+                <li :for={hole <- @round_holes}>
+                  play {hole.play_order} · course hole {hole.course_hole_id}
+                </li>
+              </ol>
+              <.form id="round-route-form" for={%{}} phx-submit="save_route">
+                <div id="round-route-selectors" class="grid gap-3 sm:grid-cols-2">
+                  <%= for play_order <- 1..18 do %>
+                    <.input
+                      id={"round-route-hole-#{play_order}"}
+                      name={"route[hole_#{play_order}]"}
+                      type="select"
+                      label={"Play #{play_order}"}
+                      value={Map.get(@route_selections, play_order, "")}
+                      options={@course_hole_options}
+                      prompt="Select course hole"
+                    />
+                  <% end %>
+                </div>
+                <button id="round-route-save-button" type="submit" class="btn btn-primary mt-3">
+                  Save route
+                </button>
+              </.form>
+            </div>
+
+            <div class="rounded-2xl border border-base-300 bg-base-100 p-6 shadow-sm space-y-4">
+              <h2 class="text-lg font-semibold">Tee profile snapshots</h2>
+              <ul id="snapshot-status-list" class="text-sm space-y-1">
+                <li :for={snapshot <- @snapshots}>
+                  {snapshot.rating_label} · source {snapshot.source_tee_rating_profile_id}
+                </li>
+              </ul>
+              <.form id="round-snapshot-form" for={%{}} phx-submit="snapshot_tees">
+                <div id="tee-profile-options" class="space-y-2">
+                  <%= for profile <- @available_profiles do %>
+                    <label class="flex items-center gap-2 text-sm">
+                      <input
+                        type="checkbox"
+                        name="snapshot[profile_ids][]"
+                        value={profile.id}
+                        checked={profile.id in @selected_profile_ids}
+                      />
+                      {profile.rating_label} ({profile.tee_set_name})
+                    </label>
+                  <% end %>
+                </div>
+                <button id="round-snapshot-button" type="submit" class="btn btn-primary mt-3">
+                  Snapshot selected profiles
+                </button>
+              </.form>
+              <button
+                id="round-clear-snapshots-button"
+                type="button"
+                class="btn btn-outline mt-3"
+                phx-click="clear_snapshots"
+              >
+                Clear all snapshots
+              </button>
+            </div>
+          <% end %>
+        </section>
+      </AppShell.staff>
     </Layouts.app>
     """
   end

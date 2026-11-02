@@ -12,11 +12,13 @@ defmodule GolfScoringWeb.Player.RequirePlayerAccess do
   @impl Plug
   def init(opts), do: opts
 
+  @player_denied_path "/player/access-denied"
+
   @impl Plug
   def call(conn, _opts) do
     case Session.grant_id(conn) do
       nil ->
-        conn |> redirect(to: "/") |> halt()
+        conn |> redirect(to: @player_denied_path) |> halt()
 
       grant_id ->
         case PlayerAccessGrantGuard.load_grant_for_session(grant_id) do
@@ -29,7 +31,7 @@ defmodule GolfScoringWeb.Player.RequirePlayerAccess do
           {:error, :invalid_player_session} ->
             conn
             |> Session.clear()
-            |> redirect(to: "/")
+            |> redirect(to: @player_denied_path)
             |> halt()
         end
     end

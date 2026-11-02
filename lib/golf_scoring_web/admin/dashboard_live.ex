@@ -16,7 +16,9 @@ defmodule GolfScoringWeb.Admin.DashboardLive do
         {:ok,
          socket
          |> assign(:current_staff_user, fresh)
-         |> assign(:page_title, "Admin")
+         |> assign(:page_title, "Admin dashboard")
+         |> assign(:current_path, ~p"/admin")
+         |> assign(:event_id, nil)
          |> assign(:can_create_event, can_create_event?(fresh))
          |> assign(:last_event_id, nil)}
 
@@ -34,7 +36,8 @@ defmodule GolfScoringWeb.Admin.DashboardLive do
         {:noreply,
          socket
          |> put_flash(:info, "Event created.")
-         |> assign(:last_event_id, event.id)}
+         |> assign(:last_event_id, event.id)
+         |> assign(:event_id, event.id)}
 
       {:error, :forbidden} ->
         {:noreply, put_flash(socket, :error, "You are not allowed to create Events.")}
@@ -48,37 +51,48 @@ defmodule GolfScoringWeb.Admin.DashboardLive do
   def render(assigns) do
     ~H"""
     <Layouts.app flash={@flash}>
-      <section id="admin-dashboard" class="space-y-6">
-        <header class="space-y-2">
-          <p class="text-sm font-medium text-base-content/70">Staff administration</p>
-          <h1 class="text-2xl font-semibold tracking-tight">Admin dashboard</h1>
-        </header>
+      <AppShell.staff
+        flash={@flash}
+        page_title={@page_title}
+        eyebrow="Staff administration"
+        current_staff_user={@current_staff_user}
+        current_path={@current_path}
+        event_id={@event_id}
+        breadcrumbs={[%{label: "Dashboard"}]}
+      >
+        <section id="admin-dashboard" class="space-y-6">
+          <div class="rounded-2xl border border-base-300 bg-base-100 p-6 shadow-sm">
+            <h2 class="text-lg font-semibold">Events</h2>
+            <p class="mt-2 text-sm text-base-content/70">
+              Create a draft Event with an initial Event Admin assignment.
+            </p>
 
-        <div class="rounded-2xl border border-base-300 bg-base-100 p-6 shadow-sm">
-          <h2 class="text-lg font-semibold">Events</h2>
-          <p class="mt-2 text-sm text-base-content/70">
-            Create a draft Event with an initial Event Admin assignment.
-          </p>
+            <div class="mt-4 flex flex-wrap items-center gap-3">
+              <%= if @can_create_event do %>
+                <.button id="create-event-button" phx-click="create_event">
+                  Create Event
+                </.button>
+              <% else %>
+                <p id="create-event-unavailable" class="text-sm text-base-content/70">
+                  Event creation requires an active SYSTEM_ADMIN account.
+                </p>
+              <% end %>
+            </div>
 
-          <div class="mt-4 flex flex-wrap items-center gap-3">
-            <%= if @can_create_event do %>
-              <.button id="create-event-button" phx-click="create_event">
-                Create Event
-              </.button>
-            <% else %>
-              <p id="create-event-unavailable" class="text-sm text-base-content/70">
-                Event creation requires an active SYSTEM_ADMIN account.
-              </p>
+            <%= if @last_event_id do %>
+              <div id="last-created-event" data-event-id={@last_event_id} class="mt-4 space-y-2">
+                <p class="text-sm text-success">Event created.</p>
+                <.link
+                  navigate={~p"/admin/events/#{@last_event_id}/course-setup"}
+                  class="btn btn-outline btn-sm min-h-11"
+                >
+                  Open course setup
+                </.link>
+              </div>
             <% end %>
           </div>
-
-          <%= if @last_event_id do %>
-            <p id="last-created-event" class="mt-4 text-sm text-success">
-              Latest Event: {@last_event_id}
-            </p>
-          <% end %>
-        </div>
-      </section>
+        </section>
+      </AppShell.staff>
     </Layouts.app>
     """
   end

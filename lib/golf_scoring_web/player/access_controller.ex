@@ -11,7 +11,7 @@ defmodule GolfScoringWeb.Player.AccessController do
       {:ok, grant} ->
         conn
         |> Session.put_grant_id(grant.id)
-        |> redirect(to: ~p"/")
+        |> redirect(to: ~p"/player")
 
       {:error, :invalid_credentials} ->
         conn

@@ -259,7 +259,7 @@ defmodule GolfScoring.Accounts.PlayerAccessGrantTest do
       |> Session.put_grant_id(grant_id)
       |> invoke_require_player_access()
 
-    assert redirected_to(conn) == "/"
+    assert redirected_to(conn) == "/player/access-denied"
   end
 
   test "reissue authorization by staff role" do
@@ -386,7 +386,7 @@ defmodule GolfScoring.Accounts.PlayerAccessGrantTest do
       |> Session.put_grant_id(grant_id)
       |> invoke_require_player_access()
 
-    assert redirected_to(conn) == "/"
+    assert redirected_to(conn) == "/player/access-denied"
   end
 
   test "revoke audit exists without sensitive material and rolls back on failure" do
@@ -481,7 +481,7 @@ defmodule GolfScoring.Accounts.PlayerAccessGrantTest do
       |> Session.put_grant_id(grant_id)
       |> invoke_require_player_access()
 
-    assert redirected_to(conn) == "/"
+    assert redirected_to(conn) == "/player/access-denied"
   end
 
   test "failed lazy expiry persistence denies authorization without silent success" do

@@ -19,8 +19,10 @@ defmodule GolfScoringWeb.Admin.CourseSetupLive do
       {:ok,
        socket
        |> assign(:current_staff_user, fresh)
-       |> assign(:page_title, "Course setup")
+       |> assign(:page_title, "Course catalog setup")
+       |> assign(:current_path, ~p"/admin/events/#{event_uuid}/course-setup")
        |> assign(:event_id, event_uuid)
+       |> assign(:round_id, nil)
        |> assign(:can_mutate, true)
        |> assign(:courses, list_active_courses())
        |> assign(:selected_course_id, nil)
@@ -179,159 +181,167 @@ defmodule GolfScoringWeb.Admin.CourseSetupLive do
   def render(assigns) do
     ~H"""
     <Layouts.app flash={@flash}>
-      <section id="course-setup" class="space-y-6">
-        <header class="space-y-2">
-          <p class="text-sm font-medium text-base-content/70">Event {@event_id}</p>
-          <h1 class="text-2xl font-semibold tracking-tight">Course catalog setup</h1>
-        </header>
-
-        <%= if @can_mutate do %>
-          <div class="rounded-2xl border border-base-300 bg-base-100 p-6 shadow-sm space-y-4">
-            <h2 class="text-lg font-semibold">Create Course</h2>
-            <.form id="course-create-form" for={%{}} phx-submit="create_course">
-              <div class="grid gap-3 sm:grid-cols-2">
-                <.input name="course[name]" type="text" label="Name" value="" required />
-                <.input name="course[location]" type="text" label="Location" value="" required />
-              </div>
-              <button id="course-create-button" type="submit" class="btn btn-primary mt-4">
-                Create Course
-              </button>
-            </.form>
-          </div>
-
-          <div class="rounded-2xl border border-base-300 bg-base-100 p-6 shadow-sm space-y-4">
-            <h2 class="text-lg font-semibold">Select Course</h2>
-            <.form id="course-select-form" for={%{}} phx-change="select_course">
-              <.input
-                id="course-select"
-                name="course_id"
-                type="select"
-                label="Course"
-                value={@selected_course_id || ""}
-                options={Enum.map(@courses, &{&1.name, &1.id})}
-                prompt="Choose a course"
-              />
-            </.form>
-          </div>
-
-          <%= if @selected_course_id do %>
+      <AppShell.staff
+        flash={@flash}
+        page_title={@page_title}
+        eyebrow="Event workspace"
+        current_staff_user={@current_staff_user}
+        current_path={@current_path}
+        event_id={@event_id}
+        breadcrumbs={[
+          %{label: "Dashboard", href: ~p"/admin"},
+          %{label: "Course setup"}
+        ]}
+      >
+        <section id="course-setup" class="space-y-6">
+          <%= if @can_mutate do %>
             <div class="rounded-2xl border border-base-300 bg-base-100 p-6 shadow-sm space-y-4">
-              <h2 class="text-lg font-semibold">Course holes</h2>
-              <ul id="course-hole-list" class="text-sm space-y-1">
-                <li :for={hole <- @course_holes}>
-                  Hole {hole.hole_number} · id {hole.id}
-                </li>
-              </ul>
-              <.form id="course-hole-form" for={%{}} phx-submit="configure_hole">
-                <.input name="hole[hole_number]" type="number" label="Hole number" value="" />
-                <button id="course-hole-save-button" type="submit" class="btn btn-primary mt-3">
-                  Save hole
-                </button>
-              </.form>
-            </div>
-
-            <div class="rounded-2xl border border-base-300 bg-base-100 p-6 shadow-sm space-y-4">
-              <h2 class="text-lg font-semibold">Tee sets</h2>
-              <ul id="tee-set-list" class="text-sm space-y-1">
-                <li :for={tee <- @tee_sets}>{tee.name}</li>
-              </ul>
-              <.form id="tee-set-form" for={%{}} phx-submit="configure_tee_set">
-                <.input
-                  name="tee_set[name]"
-                  type="text"
-                  label="Tee set name"
-                  value=""
-                  placeholder="e.g. White"
-                />
-                <button id="tee-set-save-button" type="submit" class="btn btn-primary mt-3">
-                  Save tee set
-                </button>
-              </.form>
-            </div>
-
-            <div
-              :if={@tee_sets != []}
-              class="rounded-2xl border border-base-300 bg-base-100 p-6 shadow-sm space-y-4"
-            >
-              <h2 class="text-lg font-semibold">Tee rating profiles</h2>
-              <ul id="tee-profile-list" class="text-sm space-y-1">
-                <li :for={profile <- @tee_profiles}>{profile.rating_label}</li>
-              </ul>
-              <.form id="tee-profile-form" for={%{}} phx-submit="configure_tee_profile">
-                <.input
-                  name="tee_profile[tee_set_id]"
-                  type="select"
-                  label="Tee set"
-                  value=""
-                  options={Enum.map(@tee_sets, &{&1.name, &1.id})}
-                  prompt="Choose tee set"
-                />
-                <.input
-                  name="tee_profile[rating_label]"
-                  type="text"
-                  label="Rating label"
-                  value=""
-                  placeholder="e.g. Competition White"
-                />
-                <.input
-                  name="tee_profile[course_rating]"
-                  type="text"
-                  label="Course rating"
-                  value=""
-                  placeholder="e.g. 70.8"
-                />
-                <.input
-                  name="tee_profile[slope_rating]"
-                  type="number"
-                  label="Slope"
-                  value=""
-                  placeholder="55–155"
-                />
-                <.input
-                  name="tee_profile[total_par]"
-                  type="number"
-                  label="Total par"
-                  value=""
-                  placeholder="Sum of hole pars"
-                />
-                <div id="tee-profile-hole-ratings" class="mt-4 space-y-3">
-                  <h3 class="text-sm font-semibold">Per-hole ratings</h3>
-                  <%= for hole <- @course_holes do %>
-                    <div class="grid gap-2 rounded-lg border border-base-200 p-3 sm:grid-cols-4">
-                      <p class="text-sm font-medium sm:col-span-4">
-                        Physical hole {hole.hole_number}
-                      </p>
-                      <.input
-                        name={"tee_profile[hole_ratings][#{hole.id}][par]"}
-                        type="number"
-                        label="Par"
-                        value=""
-                        placeholder="3–5"
-                      />
-                      <.input
-                        name={"tee_profile[hole_ratings][#{hole.id}][stroke_index]"}
-                        type="number"
-                        label="Stroke index"
-                        value=""
-                        placeholder="1–18"
-                      />
-                      <.input
-                        name={"tee_profile[hole_ratings][#{hole.id}][distance_m]"}
-                        type="number"
-                        label="Distance (m)"
-                        value=""
-                      />
-                    </div>
-                  <% end %>
+              <h2 class="text-lg font-semibold">Create Course</h2>
+              <.form id="course-create-form" for={%{}} phx-submit="create_course">
+                <div class="grid gap-3 sm:grid-cols-2">
+                  <.input name="course[name]" type="text" label="Name" value="" required />
+                  <.input name="course[location]" type="text" label="Location" value="" required />
                 </div>
-                <button id="tee-profile-save-button" type="submit" class="btn btn-primary mt-3">
-                  Save tee profile
+                <button id="course-create-button" type="submit" class="btn btn-primary mt-4">
+                  Create Course
                 </button>
               </.form>
             </div>
+
+            <div class="rounded-2xl border border-base-300 bg-base-100 p-6 shadow-sm space-y-4">
+              <h2 class="text-lg font-semibold">Select Course</h2>
+              <.form id="course-select-form" for={%{}} phx-change="select_course">
+                <.input
+                  id="course-select"
+                  name="course_id"
+                  type="select"
+                  label="Course"
+                  value={@selected_course_id || ""}
+                  options={Enum.map(@courses, &{&1.name, &1.id})}
+                  prompt="Choose a course"
+                />
+              </.form>
+            </div>
+
+            <%= if @selected_course_id do %>
+              <div class="rounded-2xl border border-base-300 bg-base-100 p-6 shadow-sm space-y-4">
+                <h2 class="text-lg font-semibold">Course holes</h2>
+                <ul id="course-hole-list" class="text-sm space-y-1">
+                  <li :for={hole <- @course_holes}>
+                    Hole {hole.hole_number} · id {hole.id}
+                  </li>
+                </ul>
+                <.form id="course-hole-form" for={%{}} phx-submit="configure_hole">
+                  <.input name="hole[hole_number]" type="number" label="Hole number" value="" />
+                  <button id="course-hole-save-button" type="submit" class="btn btn-primary mt-3">
+                    Save hole
+                  </button>
+                </.form>
+              </div>
+
+              <div class="rounded-2xl border border-base-300 bg-base-100 p-6 shadow-sm space-y-4">
+                <h2 class="text-lg font-semibold">Tee sets</h2>
+                <ul id="tee-set-list" class="text-sm space-y-1">
+                  <li :for={tee <- @tee_sets}>{tee.name}</li>
+                </ul>
+                <.form id="tee-set-form" for={%{}} phx-submit="configure_tee_set">
+                  <.input
+                    name="tee_set[name]"
+                    type="text"
+                    label="Tee set name"
+                    value=""
+                    placeholder="e.g. White"
+                  />
+                  <button id="tee-set-save-button" type="submit" class="btn btn-primary mt-3">
+                    Save tee set
+                  </button>
+                </.form>
+              </div>
+
+              <div
+                :if={@tee_sets != []}
+                class="rounded-2xl border border-base-300 bg-base-100 p-6 shadow-sm space-y-4"
+              >
+                <h2 class="text-lg font-semibold">Tee rating profiles</h2>
+                <ul id="tee-profile-list" class="text-sm space-y-1">
+                  <li :for={profile <- @tee_profiles}>{profile.rating_label}</li>
+                </ul>
+                <.form id="tee-profile-form" for={%{}} phx-submit="configure_tee_profile">
+                  <.input
+                    name="tee_profile[tee_set_id]"
+                    type="select"
+                    label="Tee set"
+                    value=""
+                    options={Enum.map(@tee_sets, &{&1.name, &1.id})}
+                    prompt="Choose tee set"
+                  />
+                  <.input
+                    name="tee_profile[rating_label]"
+                    type="text"
+                    label="Rating label"
+                    value=""
+                    placeholder="e.g. Competition White"
+                  />
+                  <.input
+                    name="tee_profile[course_rating]"
+                    type="text"
+                    label="Course rating"
+                    value=""
+                    placeholder="e.g. 70.8"
+                  />
+                  <.input
+                    name="tee_profile[slope_rating]"
+                    type="number"
+                    label="Slope"
+                    value=""
+                    placeholder="55–155"
+                  />
+                  <.input
+                    name="tee_profile[total_par]"
+                    type="number"
+                    label="Total par"
+                    value=""
+                    placeholder="Sum of hole pars"
+                  />
+                  <div id="tee-profile-hole-ratings" class="mt-4 space-y-3">
+                    <h3 class="text-sm font-semibold">Per-hole ratings</h3>
+                    <%= for hole <- @course_holes do %>
+                      <div class="grid gap-2 rounded-lg border border-base-200 p-3 sm:grid-cols-4">
+                        <p class="text-sm font-medium sm:col-span-4">
+                          Physical hole {hole.hole_number}
+                        </p>
+                        <.input
+                          name={"tee_profile[hole_ratings][#{hole.id}][par]"}
+                          type="number"
+                          label="Par"
+                          value=""
+                          placeholder="3–5"
+                        />
+                        <.input
+                          name={"tee_profile[hole_ratings][#{hole.id}][stroke_index]"}
+                          type="number"
+                          label="Stroke index"
+                          value=""
+                          placeholder="1–18"
+                        />
+                        <.input
+                          name={"tee_profile[hole_ratings][#{hole.id}][distance_m]"}
+                          type="number"
+                          label="Distance (m)"
+                          value=""
+                        />
+                      </div>
+                    <% end %>
+                  </div>
+                  <button id="tee-profile-save-button" type="submit" class="btn btn-primary mt-3">
+                    Save tee profile
+                  </button>
+                </.form>
+              </div>
+            <% end %>
           <% end %>
-        <% end %>
-      </section>
+        </section>
+      </AppShell.staff>
     </Layouts.app>
     """
   end
