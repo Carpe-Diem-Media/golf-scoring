@@ -76,6 +76,65 @@ defmodule GolfScoring.Scoring.ScoreResourcesTest do
     assert Info.action(HoleSubmission, :create_accepted_internal)
   end
 
+  test "named internal create actions are private and omit lifecycle fields from accept" do
+    scorecard_create = Info.action(Scorecard, :create_internal)
+    hole_result_create = Info.action(HoleResult, :record_internal)
+    hole_submission_create = Info.action(HoleSubmission, :create_accepted_internal)
+
+    refute scorecard_create.public?
+    refute hole_result_create.public?
+    refute hole_submission_create.public?
+
+    assert scorecard_create.accept == [:round_id, :round_entry_id]
+    refute :state in scorecard_create.accept
+
+    assert hole_result_create.accept == [
+             :round_id,
+             :scorecard_id,
+             :round_hole_id,
+             :outcome,
+             :gross_strokes
+           ]
+
+    refute :revision in hole_result_create.accept
+
+    refute Info.attribute(Scorecard, :state).writable?
+    refute Info.attribute(HoleResult, :revision).writable?
+  end
+
+  test "caller-supplied Scorecard state and HoleResult revision cannot override defaults" do
+    entry_setup = setup_round_with_entry!()
+
+    assert {:error, %Ash.Error.Invalid{}} =
+             Scorecard
+             |> Changeset.for_create(:create_internal, %{
+               round_id: entry_setup.round.id,
+               round_entry_id: entry_setup.entry.id,
+               state: :in_progress
+             })
+             |> Ash.create(authorize?: false)
+
+    scorecard = create_scorecard!(entry_setup.round.id, entry_setup.entry.id)
+    assert scorecard.state == :not_started
+
+    hole_setup = setup_scorecard_fixture!()
+
+    assert {:error, %Ash.Error.Invalid{}} =
+             HoleResult
+             |> Changeset.for_create(:record_internal, %{
+               round_id: hole_setup.round.id,
+               scorecard_id: hole_setup.scorecard.id,
+               round_hole_id: hole_setup.round_hole.id,
+               outcome: :holed_out,
+               gross_strokes: 3,
+               revision: 99
+             })
+             |> Ash.create(authorize?: false)
+
+    result = record_hole_result!(hole_setup, :holed_out, 3)
+    assert result.revision == 1
+  end
+
   test "valid Scorecard persists with default not_started state" do
     setup = setup_round_with_entry!()
 

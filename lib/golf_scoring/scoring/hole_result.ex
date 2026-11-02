@@ -64,8 +64,7 @@ defmodule GolfScoring.Scoring.HoleResult do
         :scorecard_id,
         :round_hole_id,
         :outcome,
-        :gross_strokes,
-        :revision
+        :gross_strokes
       ]
     end
   end
@@ -87,6 +86,7 @@ defmodule GolfScoring.Scoring.HoleResult do
     attribute :revision, :integer do
       allow_nil? false
       public? false
+      writable? false
       default 1
       constraints min: 1
     end

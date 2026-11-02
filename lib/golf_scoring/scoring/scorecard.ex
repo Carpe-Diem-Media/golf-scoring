@@ -45,7 +45,7 @@ defmodule GolfScoring.Scoring.Scorecard do
     create :create_internal do
       public? false
 
-      accept [:round_id, :round_entry_id, :state]
+      accept [:round_id, :round_entry_id]
     end
   end
 
@@ -55,6 +55,7 @@ defmodule GolfScoring.Scoring.Scorecard do
     attribute :state, :atom do
       allow_nil? false
       public? false
+      writable? false
       default :not_started
       constraints one_of: @states
     end
