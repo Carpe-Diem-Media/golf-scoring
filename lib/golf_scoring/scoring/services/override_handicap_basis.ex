@@ -17,7 +17,7 @@ defmodule GolfScoring.Scoring.Services.OverrideHandicapBasis do
     Repo.transaction(fn ->
       with {:ok, _scope} <- EventAuthorityLock.lock_scope!(event_id, [actor_id]),
            :ok <- authorize(actor_id, event_id),
-           {:ok, entry} <- HandicapEntryLock.lock!(round_entry_id),
+           {:ok, entry} <- HandicapEntryLock.lock_pre_open!(round_entry_id),
            :ok <- scope_entry(entry, round_id, event_id),
            :ok <- require_assigned_tee(entry),
            {:ok, deemed} <- require_replacement_basis(attrs),

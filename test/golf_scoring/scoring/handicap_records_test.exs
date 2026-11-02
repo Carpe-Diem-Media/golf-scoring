@@ -59,7 +59,7 @@ defmodule GolfScoring.Scoring.HandicapRecordsTest do
     assert Info.action(CompetitionHandicap, :build_internal)
   end
 
-  test "assign_round_tee authorizes managers only and allows scoring_open round" do
+  test "assign_round_tee authorizes managers only and rejects scoring_open round" do
     setup = setup_round_with_tees!()
     staff = create_staff_user!()
     assign_role!(setup.admin, setup.event, staff, :registration_staff)
@@ -75,7 +75,7 @@ defmodule GolfScoring.Scoring.HandicapRecordsTest do
 
     scoring_open = set_round_state!(setup.round, :scoring_open)
 
-    assert {:ok, assigned} =
+    assert {:error, {:invalid_round_state, :scoring_open}} =
              Competition.assign_round_tee(
                setup.admin,
                setup.event.id,
@@ -84,7 +84,156 @@ defmodule GolfScoring.Scoring.HandicapRecordsTest do
                setup.tee_a.id
              )
 
-    assert assigned.round_tee_profile_snapshot_id == setup.tee_a.id
+    assert is_nil(
+             Ash.get!(GolfScoring.Competition.RoundEntry, setup.entry.id, authorize?: false).round_tee_profile_snapshot_id
+           )
+  end
+
+  test "post-open handicap operations reject without changing their records" do
+    setup = setup_round_with_tees!(assign_tee: true, competition: true)
+
+    assert {:ok, %{grant: grant}} =
+             Accounts.issue_player_access(setup.admin, setup.event.id, setup.entry.player_id)
+
+    assert {:ok, snapshot} =
+             Scoring.confirm_handicap_input(
+               setup.admin,
+               setup.event.id,
+               setup.round.id,
+               setup.entry.id,
+               %{source_handicap_index: D.new("10.0")}
+             )
+
+    assert {:ok, built} =
+             Scoring.build_handicap_snapshot(
+               setup.entry.id,
+               course_attrs!(D.new("10.0"), setup.tee_a)
+             )
+
+    attrs = playing_attrs!(setup.entry.id, 85)
+    set_round_state!(setup.round, :scoring_open)
+    error = {:error, {:invalid_round_state, :scoring_open}}
+
+    assert ^error =
+             Scoring.confirm_handicap_input(
+               setup.admin,
+               setup.event.id,
+               setup.round.id,
+               setup.entry.id,
+               %{source_handicap_index: D.new("11.0")}
+             )
+
+    assert ^error =
+             Scoring.confirm_handicap_input_for_player_grant(
+               grant.id,
+               setup.round.id,
+               setup.entry.id,
+               %{source_handicap_index: D.new("11.0")}
+             )
+
+    assert ^error =
+             Scoring.build_handicap_snapshot(
+               setup.entry.id,
+               course_attrs!(D.new("10.0"), setup.tee_a)
+             )
+
+    assert ^error =
+             Scoring.build_competition_handicap(setup.entry.id, setup.competition.id, attrs)
+
+    after_snapshot = fetch_snapshot!(setup.entry.id)
+    assert after_snapshot.id == snapshot.id
+    assert after_snapshot.source_handicap_index == snapshot.source_handicap_index
+    assert after_snapshot.built_at == built.built_at
+    assert competition_count(setup.entry.id) == 0
+  end
+
+  @tag :gls75_connections
+  test "opening barrier rejects waiting tee assignment" do
+    setup = committed_gls75_fixture!()
+
+    {first, second} =
+      gls75_race!(
+        fn ->
+          lock_round_row!(setup.round.id)
+        end,
+        fn ->
+          Competition.assign_round_tee(
+            setup.admin,
+            setup.event.id,
+            setup.round.id,
+            setup.entry.id,
+            setup.tee_b.id
+          )
+        end,
+        fn -> set_round_state!(setup.round, :scoring_open) end
+      )
+
+    assert {:ok, _} = first
+    assert {:error, {:invalid_round_state, :scoring_open}} = second
+
+    Sandbox.unboxed_run(Repo, fn ->
+      assert fetch_snapshot!(setup.entry.id).round_tee_profile_snapshot_id == setup.tee_a.id
+
+      assert Ash.get!(GolfScoring.Competition.RoundEntry, setup.entry.id, authorize?: false).round_tee_profile_snapshot_id ==
+               setup.tee_a.id
+    end)
+  end
+
+  @tag :gls75_connections
+  test "opening barrier rejects waiting handicap mutation" do
+    setup = committed_gls75_fixture!()
+
+    {first, second} =
+      gls75_race!(
+        fn ->
+          lock_round_row!(setup.round.id)
+        end,
+        fn ->
+          Scoring.confirm_handicap_input(
+            setup.admin,
+            setup.event.id,
+            setup.round.id,
+            setup.entry.id,
+            %{source_handicap_index: D.new("11.0")}
+          )
+        end,
+        fn -> set_round_state!(setup.round, :scoring_open) end
+      )
+
+    assert {:ok, _} = first
+    assert {:error, {:invalid_round_state, :scoring_open}} = second
+
+    Sandbox.unboxed_run(Repo, fn ->
+      assert D.equal?(fetch_snapshot!(setup.entry.id).source_handicap_index, D.new("10.0"))
+    end)
+  end
+
+  @tag :gls75_connections
+  test "round locker sees a committed handicap mutation" do
+    setup = committed_gls75_fixture!()
+
+    {first, second} =
+      gls75_race!(
+        fn ->
+          Scoring.confirm_handicap_input(
+            setup.admin,
+            setup.event.id,
+            setup.round.id,
+            setup.entry.id,
+            %{source_handicap_index: D.new("11.0")}
+          )
+        end,
+        fn ->
+          Repo.transaction(fn ->
+            lock_round_row!(setup.round.id)
+            fetch_snapshot!(setup.entry.id).source_handicap_index
+          end)
+        end
+      )
+
+    assert {:ok, {:ok, _}} = first
+    assert {:ok, basis} = second
+    assert D.equal?(basis, D.new("11.0"))
   end
 
   test "cross-round tee assignment fails at database layer" do
@@ -1311,7 +1460,7 @@ defmodule GolfScoring.Scoring.HandicapRecordsTest do
     end
   end
 
-  defp gls75_race!(first_fun, second_fun) do
+  defp gls75_race!(first_fun, second_fun, before_commit \\ fn -> :ok end) do
     parent = self()
 
     first =
@@ -1333,7 +1482,7 @@ defmodule GolfScoring.Scoring.HandicapRecordsTest do
     assert_receive {:gls75_second_started, second_pid}, 10_000
     refute first_pid == second_pid
     await_gls75_lock!(second_pid, System.monotonic_time(:millisecond) + 10_000)
-    send(first.pid, :gls75_commit)
+    send(first.pid, {:gls75_commit, before_commit})
     {Task.await(first, 15_000), Task.await(second, 15_000)}
   end
 
@@ -1347,7 +1496,9 @@ defmodule GolfScoring.Scoring.HandicapRecordsTest do
     send(parent, {:gls75_first_held, pid})
 
     receive do
-      :gls75_commit -> result
+      {:gls75_commit, before_commit} ->
+        before_commit.()
+        result
     after
       15_000 -> Repo.rollback(:timeout)
     end
