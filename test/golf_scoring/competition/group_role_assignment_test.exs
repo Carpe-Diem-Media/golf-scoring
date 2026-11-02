@@ -357,6 +357,148 @@ defmodule GolfScoring.Competition.GroupRoleAssignmentTest do
     assert length(audit) == 1
   end
 
+  test "primary scorer handover is allowed during scoring_open and writes one atomic audit" do
+    setup = setup_group_with_entries!(2)
+    [holder, replacement] = setup.entries
+
+    assert {:ok, original} =
+             Competition.assign_primary_scorer(
+               setup.admin,
+               setup.event.id,
+               setup.round.id,
+               setup.group.id,
+               holder.id
+             )
+
+    set_round_state!(setup.round, :scoring_open)
+    audits_before = handover_audit_count(setup.group.id)
+
+    assert {:ok, successor} =
+             Competition.handover_primary_scorer(
+               setup.admin,
+               setup.event.id,
+               setup.round.id,
+               setup.group.id,
+               replacement.id
+             )
+
+    assert Ash.get!(GroupRoleAssignment, original.id, authorize?: false).state == :handed_over
+    assert successor.state == :active
+    assert successor.round_entry_id == replacement.id
+    assert successor.assignment_version == original.assignment_version + 1
+    assert handover_audit_count(setup.group.id) == audits_before + 1
+  end
+
+  test "designated verifier handover is allowed during scoring_open and preserves role separation" do
+    setup = setup_group_with_entries!(3)
+    [scorer_entry, verifier_entry, replacement] = setup.entries
+
+    assert {:ok, scorer} =
+             Competition.assign_primary_scorer(
+               setup.admin,
+               setup.event.id,
+               setup.round.id,
+               setup.group.id,
+               scorer_entry.id
+             )
+
+    assert {:ok, original} =
+             Competition.assign_designated_verifier(
+               setup.admin,
+               setup.event.id,
+               setup.round.id,
+               setup.group.id,
+               verifier_entry.id
+             )
+
+    set_round_state!(setup.round, :scoring_open)
+    audits_before = handover_audit_count(setup.group.id)
+
+    assert {:ok, successor} =
+             Competition.handover_designated_verifier(
+               setup.admin,
+               setup.event.id,
+               setup.round.id,
+               setup.group.id,
+               replacement.id
+             )
+
+    assert Ash.get!(GroupRoleAssignment, original.id, authorize?: false).state == :handed_over
+    assert successor.state == :active
+    assert successor.round_entry_id == replacement.id
+    assert successor.assignment_version == original.assignment_version + 1
+    assert handover_audit_count(setup.group.id) == audits_before + 1
+
+    active_assignments = active_group_assignments(setup.group.id)
+    active_scorer = Enum.find(active_assignments, &(&1.role == :primary_scorer))
+    active_verifier = Enum.find(active_assignments, &(&1.role == :designated_verifier))
+
+    assert active_scorer.round_entry_id == scorer.round_entry_id
+    assert active_verifier.round_entry_id == replacement.id
+    refute active_scorer.round_entry_id == active_verifier.round_entry_id
+  end
+
+  test "an active participant can receive an in-play handover" do
+    setup = setup_group_with_entries!(2)
+    [holder, replacement] = setup.entries
+
+    assert {:ok, _original} =
+             Competition.assign_primary_scorer(
+               setup.admin,
+               setup.event.id,
+               setup.round.id,
+               setup.group.id,
+               holder.id
+             )
+
+    set_round_state!(setup.round, :scoring_open)
+    set_participation_status!(replacement.id, :active)
+
+    assert {:ok, successor} =
+             Competition.handover_primary_scorer(
+               setup.admin,
+               setup.event.id,
+               setup.round.id,
+               setup.group.id,
+               replacement.id
+             )
+
+    assert successor.round_entry_id == replacement.id
+    assert successor.state == :active
+  end
+
+  test "completed, withdrawn, and disqualified participants cannot receive an in-play handover" do
+    for participation_status <- [:completed, :withdrawn, :disqualified] do
+      setup = setup_group_with_entries!(2)
+      [holder, replacement] = setup.entries
+
+      assert {:ok, original} =
+               Competition.assign_primary_scorer(
+                 setup.admin,
+                 setup.event.id,
+                 setup.round.id,
+                 setup.group.id,
+                 holder.id
+               )
+
+      set_round_state!(setup.round, :scoring_open)
+      set_participation_status!(replacement.id, participation_status)
+
+      assert {:error, :ineligible_handover_replacement} =
+               Competition.handover_primary_scorer(
+                 setup.admin,
+                 setup.event.id,
+                 setup.round.id,
+                 setup.group.id,
+                 replacement.id
+               )
+
+      assert Ash.get!(GroupRoleAssignment, original.id, authorize?: false).state == :active
+      assert active_group_assignments(setup.group.id) |> length() == 1
+      assert handover_audit_count(setup.group.id) == 0
+    end
+  end
+
   test "handover validates replacement eligibility and distinct active roles" do
     setup = setup_group_with_entries!(3)
     [scorer, verifier, third] = setup.entries
@@ -407,7 +549,94 @@ defmodule GolfScoring.Competition.GroupRoleAssignmentTest do
              )
   end
 
-  test "handover after scoring opens is rejected" do
+  test "handover rejects scoring_closed, finalized, and cancelled rounds" do
+    for round_state <- [:scoring_closed, :finalized, :cancelled] do
+      setup = setup_group_with_entries!(2)
+      [holder, replacement] = setup.entries
+
+      assert {:ok, original} =
+               Competition.assign_primary_scorer(
+                 setup.admin,
+                 setup.event.id,
+                 setup.round.id,
+                 setup.group.id,
+                 holder.id
+               )
+
+      set_round_state!(setup.round, round_state)
+      expected_state = Atom.to_string(round_state)
+
+      assert {:error, {:invalid_round_state, ^expected_state}} =
+               Competition.handover_primary_scorer(
+                 setup.admin,
+                 setup.event.id,
+                 setup.round.id,
+                 setup.group.id,
+                 replacement.id
+               )
+
+      assert Ash.get!(GroupRoleAssignment, original.id, authorize?: false).state == :active
+      assert active_group_assignments(setup.group.id) |> length() == 1
+      assert handover_audit_count(setup.group.id) == 0
+    end
+  end
+
+  test "handover in scoring_open rejects the current holder and the other active role holder" do
+    setup = setup_group_with_entries!(3)
+    [scorer_entry, verifier_entry, replacement] = setup.entries
+
+    assert {:ok, _} =
+             Competition.assign_primary_scorer(
+               setup.admin,
+               setup.event.id,
+               setup.round.id,
+               setup.group.id,
+               scorer_entry.id
+             )
+
+    assert {:ok, _} =
+             Competition.assign_designated_verifier(
+               setup.admin,
+               setup.event.id,
+               setup.round.id,
+               setup.group.id,
+               verifier_entry.id
+             )
+
+    set_round_state!(setup.round, :scoring_open)
+
+    assert {:error, :handover_requires_different_entry} =
+             Competition.handover_primary_scorer(
+               setup.admin,
+               setup.event.id,
+               setup.round.id,
+               setup.group.id,
+               scorer_entry.id
+             )
+
+    assert {:error, :round_entry_already_holds_other_active_role} =
+             Competition.handover_primary_scorer(
+               setup.admin,
+               setup.event.id,
+               setup.round.id,
+               setup.group.id,
+               verifier_entry.id
+             )
+
+    assert {:ok, successor} =
+             Competition.handover_primary_scorer(
+               setup.admin,
+               setup.event.id,
+               setup.round.id,
+               setup.group.id,
+               replacement.id
+             )
+
+    assert successor.state == :active
+    assert successor.round_entry_id == replacement.id
+  end
+
+  test "ready round handover remains supported" do
     setup = setup_group_with_entries!(2)
     [holder, replacement] = setup.entries
 
@@ -420,9 +649,9 @@ defmodule GolfScoring.Competition.GroupRoleAssignmentTest do
                holder.id
              )
 
-    set_round_state!(setup.round, :scoring_open)
+    set_round_state!(setup.round, :ready)
 
-    assert {:error, {:invalid_round_state, "scoring_open"}} =
+    assert {:ok, successor} =
              Competition.handover_primary_scorer(
                setup.admin,
                setup.event.id,
@@ -430,6 +659,9 @@ defmodule GolfScoring.Competition.GroupRoleAssignmentTest do
                setup.group.id,
                replacement.id
              )
+
+    assert successor.round_entry_id == replacement.id
+    assert successor.assignment_version == 2
   end
 
   test "simulated handover audit failure rolls back assignment changes" do
@@ -471,6 +703,7 @@ defmodule GolfScoring.Competition.GroupRoleAssignmentTest do
       |> length()
 
     assert active_count == 1
+    assert handover_audit_count(setup.group.id) == 0
   end
 
   test "revoke requires reason and preserves revoked history" do
@@ -631,6 +864,141 @@ defmodule GolfScoring.Competition.GroupRoleAssignmentTest do
     end
   end
 
+  @tag :real_concurrency
+  test "an old-authority consumer that locks first commits before the handover" do
+    fixture =
+      Sandbox.unboxed_run(Repo, fn ->
+        setup_committed_handover_fixture!(Process.get(:gls20_email_prefix))
+      end)
+
+    try do
+      parent = self()
+
+      consumer =
+        Task.async(fn ->
+          consume_captured_authority(fixture, parent, :case_a, true)
+        end)
+
+      assert_receive {:authority_consumer_ready, :case_a, consumer_pid,
+                      %{status: :current} = observation},
+                     10_000
+
+      assert observation.captured_assignment_state == "active"
+      assert observation.current_assignment_id == fixture.assignment_id
+
+      handover =
+        Task.async(fn ->
+          Sandbox.unboxed_run(Repo, fn ->
+            handover_pid = pg_backend_pid!()
+            send(parent, {:handover_started, :case_a, handover_pid})
+
+            HandoverGroupRole.run(
+              fixture.admin,
+              fixture.event_id,
+              fixture.round_id,
+              fixture.group_id,
+              fixture.entry_two_id,
+              :primary_scorer
+            )
+          end)
+        end)
+
+      assert_receive {:handover_started, :case_a, handover_pid}, 10_000
+      refute handover_pid == consumer_pid
+
+      try do
+        await_blocked_by!(
+          handover_pid,
+          consumer_pid,
+          System.monotonic_time(:millisecond) + 10_000
+        )
+
+        [[waiting_query]] =
+          Repo.query!("SELECT query FROM pg_stat_activity WHERE pid = $1", [handover_pid]).rows
+
+        assert waiting_query =~ "FROM rounds"
+      after
+        send(consumer.pid, :release_authority_locks)
+      end
+
+      assert :current = Task.await(consumer, 15_000)
+      assert {:ok, successor} = Task.await(handover, 15_000)
+      assert successor.assignment_version == fixture.assignment_version + 1
+      assert successor.round_entry_id == fixture.entry_two_id
+    after
+      cleanup_committed_role_race_fixture!(fixture)
+    end
+  end
+
+  @tag :real_concurrency
+  test "a consumer with old authority sees it as stale after the handover commits" do
+    fixture =
+      Sandbox.unboxed_run(Repo, fn ->
+        setup_committed_handover_fixture!(Process.get(:gls20_email_prefix))
+      end)
+
+    try do
+      parent = self()
+
+      handover =
+        Task.async(fn ->
+          Sandbox.unboxed_run(Repo, fn ->
+            handover_pid = pg_backend_pid!()
+
+            result =
+              HandoverGroupRole.run(
+                fixture.admin,
+                fixture.event_id,
+                fixture.round_id,
+                fixture.group_id,
+                fixture.entry_two_id,
+                :primary_scorer
+              )
+
+            send(parent, {:handover_committed, :case_b, handover_pid, result})
+
+            receive do
+              :release_handover_connection -> :ok
+            after
+              15_000 -> flunk("GLS-33 case B handover did not release its database connection")
+            end
+
+            result
+          end)
+        end)
+
+      assert_receive {:handover_committed, :case_b, handover_pid, handover_result}, 15_000
+
+      successor =
+        try do
+          assert {:ok, successor} = handover_result
+          assert successor.assignment_version == fixture.assignment_version + 1
+
+          consumer =
+            Task.async(fn ->
+              consume_captured_authority(fixture, parent, :case_b, false)
+            end)
+
+          assert_receive {:authority_consumer_ready, :case_b, consumer_pid,
+                          %{status: :stale} = observation},
+                         10_000
+
+          refute handover_pid == consumer_pid
+          assert observation.captured_assignment_state == "handed_over"
+          assert observation.current_assignment_id == successor.id
+          assert :stale = Task.await(consumer, 10_000)
+
+          successor
+        after
+          send(handover.pid, :release_handover_connection)
+        end
+
+      assert {:ok, ^successor} = Task.await(handover, 15_000)
+    after
+      cleanup_committed_role_race_fixture!(fixture)
+    end
+  end
+
   test "handover and revoke do not alter competition side membership" do
     setup = setup_group_with_side!(2)
     [holder, replacement] = setup.entries
@@ -717,6 +1085,29 @@ defmodule GolfScoring.Competition.GroupRoleAssignmentTest do
     Repo.get!(Round, round.id)
   end
 
+  defp set_participation_status!(round_entry_id, status) do
+    Repo.query!("UPDATE round_entries SET participation_status = $1 WHERE id = $2::uuid", [
+      Atom.to_string(status),
+      Ecto.UUID.dump!(round_entry_id)
+    ])
+  end
+
+  defp handover_audit_count(group_id) do
+    [[count]] =
+      Repo.query!(
+        "SELECT count(*)::int FROM audit_events WHERE action = 'handover_group_role' AND target_type = 'PlayingGroup' AND target_id = $1::uuid",
+        [Ecto.UUID.dump!(group_id)]
+      ).rows
+
+    count
+  end
+
+  defp active_group_assignments(group_id) do
+    GroupRoleAssignment
+    |> Ash.Query.filter(playing_group_id == ^group_id and state == :active)
+    |> Ash.read!(authorize?: false)
+  end
+
   defp setup_group_with_side!(count) do
     base = setup_group_with_entries!(count)
 
@@ -778,11 +1169,159 @@ defmodule GolfScoring.Competition.GroupRoleAssignmentTest do
     }
   end
 
+  defp setup_committed_handover_fixture!(email_prefix) do
+    fixture = setup_committed_role_race_fixture!(email_prefix)
+
+    {:ok, assignment} =
+      AssignGroupRole.run(
+        fixture.admin,
+        fixture.event_id,
+        fixture.round_id,
+        fixture.group_id,
+        fixture.entry_one_id,
+        :primary_scorer
+      )
+
+    Repo.query!("UPDATE rounds SET state = 'scoring_open' WHERE id = $1::uuid", [
+      Ecto.UUID.dump!(fixture.round_id)
+    ])
+
+    Map.merge(fixture, %{
+      assignment_id: assignment.id,
+      assignment_version: assignment.assignment_version
+    })
+  end
+
+  defp consume_captured_authority(fixture, parent, test_case, hold_locks?) do
+    Sandbox.unboxed_run(Repo, fn ->
+      consume_authority_transaction(fixture, parent, test_case, hold_locks?, pg_backend_pid!())
+    end)
+  end
+
+  defp consume_authority_transaction(fixture, parent, test_case, hold_locks?, backend_pid) do
+    Repo.transaction(fn ->
+      observation = captured_authority_observation!(fixture)
+      send(parent, {:authority_consumer_ready, test_case, backend_pid, observation})
+      maybe_hold_authority_locks(hold_locks?, observation.status)
+      observation
+    end)
+    |> case do
+      {:ok, observation} -> observation.status
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp captured_authority_observation!(fixture) do
+    {:ok, %{acquired: shared_rows}} =
+      GolfScoring.LockProtocol.acquire!(
+        round: [fixture.round_id],
+        playing_group: [fixture.group_id]
+      )
+
+    round = Enum.find(shared_rows, &(&1.class == :round))
+    group = Enum.find(shared_rows, &(&1.class == :playing_group))
+
+    {:ok, %{acquired: assignment_rows}} =
+      GolfScoring.LockProtocol.acquire!(
+        group_role_assignment: [fixture.assignment_id | active_assignment_ids!(fixture.group_id)]
+      )
+
+    assignments = Enum.map(assignment_rows, & &1.row)
+    captured = Enum.find(assignments, &(&1.id == fixture.assignment_id))
+    current = Enum.find(assignments, &(&1.role == "primary_scorer" and &1.state == "active"))
+
+    %{
+      status:
+        if(current_authority?(round, group, captured, current, fixture),
+          do: :current,
+          else: :stale
+        ),
+      captured_assignment_state: captured && captured.state,
+      current_assignment_id: current && current.id
+    }
+  end
+
+  defp active_assignment_ids!(playing_group_id) do
+    Repo.query!(
+      "SELECT id::text FROM group_role_assignments WHERE playing_group_id = $1::uuid AND state = 'active' ORDER BY id",
+      [Ecto.UUID.dump!(playing_group_id)]
+    ).rows
+    |> Enum.map(fn [id] -> Ecto.UUID.cast!(id) end)
+  end
+
+  defp current_authority?(round, group, captured, current, fixture) do
+    round_group_matches?(round, group, fixture) and
+      captured_assignment_matches?(captured, fixture) and
+      current_assignment_matches?(current, captured)
+  end
+
+  defp round_group_matches?(
+         %{row: %{state: "scoring_open"}},
+         %{row: %{round_id: round_id}},
+         fixture
+       ),
+       do: round_id == fixture.round_id
+
+  defp round_group_matches?(_, _, _), do: false
+
+  defp captured_assignment_matches?(
+         %{id: id, state: "active", assignment_version: version},
+         fixture
+       ),
+       do: id == fixture.assignment_id and version == fixture.assignment_version
+
+  defp captured_assignment_matches?(_, _), do: false
+
+  defp current_assignment_matches?(
+         %{id: id, role: "primary_scorer", state: "active", assignment_version: version},
+         %{id: captured_id, assignment_version: captured_version}
+       ),
+       do: id == captured_id and version == captured_version
+
+  defp current_assignment_matches?(_, _), do: false
+
+  defp maybe_hold_authority_locks(true, :current) do
+    receive do
+      :release_authority_locks -> :ok
+    after
+      15_000 -> Repo.rollback(:authority_consumer_timeout)
+    end
+  end
+
+  defp maybe_hold_authority_locks(_hold_locks?, _status), do: :ok
+
+  defp await_blocked_by!(waiting_pid, blocking_pid, deadline) do
+    [[blocked?]] =
+      Repo.query!(
+        "SELECT $1::integer = ANY(pg_blocking_pids($2::integer))",
+        [blocking_pid, waiting_pid]
+      ).rows
+
+    cond do
+      blocked? ->
+        :ok
+
+      System.monotonic_time(:millisecond) >= deadline ->
+        flunk("PostgreSQL did not report the handover waiting on the authority consumer")
+
+      true ->
+        # The database lock graph decides success; this short pause only backs off polling.
+        Process.sleep(5)
+        await_blocked_by!(waiting_pid, blocking_pid, deadline)
+    end
+  end
+
   defp cleanup_committed_role_race_fixture!(fixture) do
     Sandbox.unboxed_run(Repo, fn ->
       dumped_round = Ecto.UUID.dump!(fixture.round_id)
       dumped_event = Ecto.UUID.dump!(fixture.event_id)
       dumped_staff = Ecto.UUID.dump!(fixture.admin.id)
+      dumped_group = Ecto.UUID.dump!(fixture.group_id)
+
+      Repo.query!(
+        "DELETE FROM audit_events WHERE target_type = 'PlayingGroup' AND target_id = $1::uuid AND action = 'handover_group_role'",
+        [dumped_group]
+      )
 
       Repo.query!("DELETE FROM group_role_assignments WHERE round_id = $1::uuid", [dumped_round])
       Repo.query!("DELETE FROM round_entries WHERE round_id = $1::uuid", [dumped_round])
