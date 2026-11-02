@@ -45,7 +45,7 @@ defmodule GolfScoring.Competition.MysteryHoleRuleTest do
     assert function_exported?(Competition, :configure_scoring_track, 5)
     assert function_exported?(Competition, :configure_mystery_hole_rule, 6)
     assert function_exported?(Competition, :remove_mystery_hole_rule, 5)
-    assert function_exported?(Competition, :lock_scoring_tracks_for_round, 1)
+    refute function_exported?(Competition, :lock_scoring_tracks_for_round, 1)
 
     refute Code.ensure_loaded?(GolfScoring.Competition.MysteryReveal)
   end
@@ -517,7 +517,7 @@ defmodule GolfScoring.Competition.MysteryHoleRuleTest do
                standard_track_attrs()
              )
 
-    assert :ok = Competition.lock_scoring_tracks_for_round(setup.round.id)
+    assert :ok = GolfScoring.Competition.Services.LockScoringTracksForRound.run(setup.round.id)
 
     mystery = Ash.get!(ScoringTrack, mystery.id, authorize?: false)
     standard = Ash.get!(ScoringTrack, standard.id, authorize?: false)
@@ -537,7 +537,7 @@ defmodule GolfScoring.Competition.MysteryHoleRuleTest do
                mystery_track_attrs()
              )
 
-    assert :ok = Competition.lock_scoring_tracks_for_round(setup.round.id)
+    assert :ok = GolfScoring.Competition.Services.LockScoringTracksForRound.run(setup.round.id)
     set_round_state!(setup.round, :ready)
 
     assert {:error, :configuration_locked} =
@@ -575,7 +575,7 @@ defmodule GolfScoring.Competition.MysteryHoleRuleTest do
                :best
              )
 
-    assert :ok = Competition.lock_scoring_tracks_for_round(setup.round.id)
+    assert :ok = GolfScoring.Competition.Services.LockScoringTracksForRound.run(setup.round.id)
     set_round_state!(setup.round, :ready)
 
     [_configured | other_holes] = setup.route

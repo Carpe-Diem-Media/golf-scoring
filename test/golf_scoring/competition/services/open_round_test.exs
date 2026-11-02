@@ -110,6 +110,72 @@ defmodule GolfScoring.Competition.Services.OpenRoundTest do
              Competition.open_round(actor, event.id, round.id)
 
     refute function_exported?(Competition, :open_scoring, 2)
+    refute function_exported?(Competition, :lock_scoring_tracks_for_round, 1)
+  end
+
+  @tag :connections
+  test "successful open broadcasts once after the durable commit" do
+    f = committed_fixture!()
+    topic = "round:#{f.round.id}"
+    :ok = Phoenix.PubSub.subscribe(GolfScoring.PubSub, topic)
+
+    assert {:ok, _} =
+             Sandbox.unboxed_run(Repo, fn ->
+               OpenRound.mark_ready(f.admin, f.event.id, f.round.id)
+             end)
+
+    refute_receive {:round_scoring_opened, _}, 100
+
+    assert {:ok, %{round: %{state: :scoring_open}}} =
+             Sandbox.unboxed_run(Repo, fn ->
+               OpenRound.run(f.admin, f.event.id, f.round.id)
+             end)
+
+    assert_receive {:round_scoring_opened, payload}, 5_000
+    assert payload == %{event_id: f.event.id, round_id: f.round.id}
+
+    assert %{state: :scoring_open} =
+             Sandbox.unboxed_run(Repo, fn ->
+               Repo.get!(GolfScoring.Competition.Round, f.round.id)
+             end)
+
+    assert Enum.all?(f.tracks, fn track ->
+             Sandbox.unboxed_run(Repo, fn ->
+               Ash.get!(GolfScoring.Competition.ScoringTrack, track.id, authorize?: false).configuration_state ==
+                 :locked
+             end)
+           end)
+
+    assert [[1]] =
+             Sandbox.unboxed_run(Repo, fn ->
+               Repo.query!(
+                 "SELECT count(*) FROM audit_events WHERE target_id = $1::uuid AND action = 'round_scoring_opened'",
+                 [Ecto.UUID.dump!(f.round.id)]
+               ).rows
+             end)
+
+    assert {:error, {:invalid_round_state, "scoring_open"}} =
+             Sandbox.unboxed_run(Repo, fn ->
+               OpenRound.run(f.admin, f.event.id, f.round.id)
+             end)
+
+    refute_receive {:round_scoring_opened, _}, 100
+  end
+
+  test "blocked open does not broadcast" do
+    f = complete_round!()
+    assert {:ok, _} = OpenRound.mark_ready(f.admin, f.event.id, f.round.id)
+
+    Repo.query!("DELETE FROM mystery_hole_rules WHERE round_id = $1::uuid", [
+      Ecto.UUID.dump!(f.round.id)
+    ])
+
+    :ok = Phoenix.PubSub.subscribe(GolfScoring.PubSub, "round:#{f.round.id}")
+
+    assert {:error, {:round_opening_blocked, _, _}} =
+             OpenRound.run(f.admin, f.event.id, f.round.id)
+
+    refute_receive {:round_scoring_opened, _}, 100
   end
 
   for {name, sql, family} <- [
@@ -187,6 +253,7 @@ defmodule GolfScoring.Competition.Services.OpenRoundTest do
   test "audit failure after track freeze rolls the whole opening back" do
     f = complete_round!()
     assert {:ok, _} = OpenRound.mark_ready(f.admin, f.event.id, f.round.id)
+    :ok = Phoenix.PubSub.subscribe(GolfScoring.PubSub, "round:#{f.round.id}")
 
     Repo.query!("""
     CREATE FUNCTION gls29_reject_open_audit() RETURNS trigger LANGUAGE plpgsql AS $$
@@ -205,6 +272,45 @@ defmodule GolfScoring.Competition.Services.OpenRoundTest do
 
     assert Enum.all?(f.tracks, fn t ->
              Ash.get!(GolfScoring.Competition.ScoringTrack, t.id, authorize?: false).configuration_state ==
+               :draft
+           end)
+
+    assert [[0]] =
+             Repo.query!(
+               "SELECT count(*) FROM audit_events WHERE target_id = $1::uuid AND action = 'round_scoring_opened'",
+               [Ecto.UUID.dump!(f.round.id)]
+             ).rows
+
+    refute_receive {:round_scoring_opened, _}, 100
+  end
+
+  test "track freeze failure does not broadcast or partially change configuration" do
+    f = complete_round!()
+    assert {:ok, _} = OpenRound.mark_ready(f.admin, f.event.id, f.round.id)
+    :ok = Phoenix.PubSub.subscribe(GolfScoring.PubSub, "round:#{f.round.id}")
+
+    Repo.query!("""
+    CREATE FUNCTION gls29_reject_track_freeze() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN
+      IF OLD.configuration_state = 'draft' AND NEW.configuration_state = 'locked' THEN
+        RAISE EXCEPTION 'reject track freeze';
+      END IF;
+      RETURN NEW;
+    END; $$
+    """)
+
+    Repo.query!("""
+    CREATE TRIGGER gls29_reject_track_freeze
+    BEFORE UPDATE OF configuration_state ON scoring_tracks
+    FOR EACH ROW EXECUTE FUNCTION gls29_reject_track_freeze()
+    """)
+
+    assert {:error, _} = OpenRound.run(f.admin, f.event.id, f.round.id)
+    refute_receive {:round_scoring_opened, _}, 100
+    assert Repo.get!(GolfScoring.Competition.Round, f.round.id).state == :ready
+
+    assert Enum.all?(f.tracks, fn track ->
+             Ash.get!(GolfScoring.Competition.ScoringTrack, track.id, authorize?: false).configuration_state ==
                :draft
            end)
 

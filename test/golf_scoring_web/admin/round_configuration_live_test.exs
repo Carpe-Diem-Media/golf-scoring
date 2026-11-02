@@ -408,7 +408,9 @@ defmodule GolfScoringWeb.Admin.RoundConfigurationLiveTest do
       render_click(element(view, "#save-standard-track"))
       render_click(element(view, "#save-mystery-track"))
 
-      assert :ok = Competition.lock_scoring_tracks_for_round(setup.round.id)
+      assert :ok =
+               GolfScoring.Competition.Services.LockScoringTracksForRound.run(setup.round.id)
+
       {:ok, view, html} = live(conn, setup_path(setup))
 
       assert has_element?(view, "#scoring-tracks-locked-notice")
@@ -471,7 +473,9 @@ defmodule GolfScoringWeb.Admin.RoundConfigurationLiveTest do
       {:ok, view, _html} = live(conn, setup_path(setup))
       save_both_tracks!(view)
 
-      assert :ok = Competition.lock_scoring_tracks_for_round(setup.round.id)
+      assert :ok =
+               GolfScoring.Competition.Services.LockScoringTracksForRound.run(setup.round.id)
+
       {:ok, view, _html} = live(conn, setup_path(setup))
 
       assert checklist_done?(view, "standard_track")
@@ -546,7 +550,9 @@ defmodule GolfScoringWeb.Admin.RoundConfigurationLiveTest do
 
       assert fetch_mystery_rule(setup.round.id, hole.id).rule == :best
 
-      assert :ok = Competition.lock_scoring_tracks_for_round(setup.round.id)
+      assert :ok =
+               GolfScoring.Competition.Services.LockScoringTracksForRound.run(setup.round.id)
+
       {:ok, view, html} = live(conn, setup_path(setup))
 
       assert has_element?(view, "#mystery-hole-rules")

@@ -10,7 +10,6 @@ defmodule GolfScoring.Competition do
   alias GolfScoring.Competition.Services.ConfigureScoringTrack
   alias GolfScoring.Competition.Services.CreateCompetitionSide
   alias GolfScoring.Competition.Services.HandoverGroupRole
-  alias GolfScoring.Competition.Services.LockScoringTracksForRound
   alias GolfScoring.Competition.Services.OpenRound
   alias GolfScoring.Competition.Services.RevokeGroupRole
   alias GolfScoring.Competition.Services.SetSideMembership
@@ -202,9 +201,5 @@ defmodule GolfScoring.Competition do
       scoring_track_id,
       round_hole_id
     )
-  end
-
-  def lock_scoring_tracks_for_round(round_id) do
-    LockScoringTracksForRound.run(round_id)
   end
 end

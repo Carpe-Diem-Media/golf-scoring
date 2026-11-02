@@ -35,13 +35,30 @@ defmodule GolfScoring.Competition.Services.OpenRound do
     with {:ok, actor_id} <- Ecto.UUID.cast(actor_id),
          {:ok, event_id} <- Ecto.UUID.cast(event_id),
          {:ok, round_id} <- Ecto.UUID.cast(round_id) do
-      Repo.transaction(fn -> execute_locked(actor_id, event_id, round_id, operation) end)
+      result =
+        Repo.transaction(fn -> execute_locked(actor_id, event_id, round_id, operation) end)
+
+      case {operation, result} do
+        {:open_scoring, {:ok, %{round: %{id: ^round_id, state: :scoring_open}} = opening_result}} ->
+          Phoenix.PubSub.broadcast(
+            GolfScoring.PubSub,
+            round_topic(round_id),
+            {:round_scoring_opened, %{event_id: event_id, round_id: round_id}}
+          )
+
+          {:ok, opening_result}
+
+        {_operation, result} ->
+          result
+      end
     else
       _ -> {:error, :invalid_input}
     end
   end
 
   defp execute(_, _, _, _), do: {:error, :invalid_input}
+
+  defp round_topic(round_id), do: "round:#{round_id}"
 
   defp execute_locked(actor_id, event_id, round_id, operation) do
     with {:ok, _} <- EventAuthorityLock.lock_scope!(event_id, [actor_id]),
