@@ -5,6 +5,7 @@ defmodule GolfScoring.Scoring.Services.BuildCompetitionHandicap do
 
   alias Ash.Changeset
   alias GolfScoring.Repo
+  alias GolfScoring.Scoring.Calculators.PlayingHandicap
   alias GolfScoring.Scoring.CompetitionHandicap
   alias GolfScoring.Scoring.HandicapEntryLock
   alias GolfScoring.Scoring.HandicapRowLock
@@ -21,7 +22,13 @@ defmodule GolfScoring.Scoring.Services.BuildCompetitionHandicap do
            {:ok, playing} <- require_field(attrs, :playing_handicap),
            {:ok, policy} <- require_policy(attrs),
            {:ok, allowance_applied} <- require_allowance_applied(attrs),
-           unrounded_allowed <- Map.get(attrs, :unrounded_allowed_handicap),
+           unrounded_allowed <-
+             Map.get(
+               attrs,
+               :unrounded_allowed_handicap,
+               Map.get(attrs, "unrounded_allowed_handicap")
+             ),
+           :ok <- validate_output(snapshot, competition, unrounded_allowed, playing),
            {:ok, row} <-
              CompetitionHandicap
              |> Changeset.for_create(:build_internal, %{
@@ -42,6 +49,31 @@ defmodule GolfScoring.Scoring.Services.BuildCompetitionHandicap do
       end
     end)
     |> normalize_result()
+  end
+
+  defp validate_output(snapshot, competition, unrounded, playing) do
+    {:ok, calculated} =
+      PlayingHandicap.calculate(
+        snapshot.course_handicap_unrounded,
+        competition.handicap_allowance_percent
+      )
+
+    if playing === calculated.playing_handicap and
+         valid_unrounded?(unrounded, calculated.unrounded_allowed_handicap),
+       do: :ok,
+       else: {:error, :stale_handicap_output}
+  end
+
+  defp valid_unrounded?(nil, _expected), do: true
+
+  defp valid_unrounded?(unrounded, expected) do
+    case Decimal.cast(unrounded) do
+      {:ok, value} ->
+        Decimal.equal?(value, expected)
+
+      :error ->
+        false
+    end
   end
 
   defp fetch_built_snapshot(round_entry_id) do
