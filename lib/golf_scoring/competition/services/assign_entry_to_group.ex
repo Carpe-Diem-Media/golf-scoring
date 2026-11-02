@@ -6,6 +6,7 @@ defmodule GolfScoring.Competition.Services.AssignEntryToGroup do
   alias Ash.Changeset
   alias GolfScoring.Accounts.Checks.ActiveEventRole
   alias GolfScoring.Accounts.EventAuthorityLock
+  alias GolfScoring.Audit
   alias GolfScoring.Competition.CompetitionSideGroupCohesion
   alias GolfScoring.Competition.CompetitionSideMembership
   alias GolfScoring.Competition.GroupRoleAssignmentGuard
@@ -37,7 +38,8 @@ defmodule GolfScoring.Competition.Services.AssignEntryToGroup do
            :ok <- GroupRoleAssignmentGuard.reject_active_role_group_move(entry, playing_group_id),
            :ok <- validate_competition_side_group_cohesion(round_id, entry.id, playing_group_id),
            :ok <- validate_capacity(group.id, entry),
-           {:ok, updated} <- assign_entry(entry, group.id) do
+           {:ok, updated} <- assign_entry(entry, group.id),
+           :ok <- write_audit_if_ready(actor_id, event_id, round, entry, group.id) do
         updated
       else
         {:error, reason} -> Repo.rollback(reason)
@@ -305,6 +307,39 @@ defmodule GolfScoring.Competition.Services.AssignEntryToGroup do
         {:error, error}
     end
   end
+
+  defp write_audit_if_ready(
+         actor_id,
+         event_id,
+         %{id: round_id, state: "ready"},
+         %{id: entry_id, playing_group_id: current_group_id},
+         playing_group_id
+       )
+       when current_group_id != playing_group_id do
+    case Audit.record_staff_event(
+           %{
+             actor_staff_user_id: actor_id,
+             action: "assign_entry_to_group",
+             target_type: "round",
+             target_id: round_id,
+             context: %{"event_id" => event_id, "round_id" => round_id},
+             changes: %{
+               "round_entry_id" => entry_id,
+               "playing_group_id" => %{
+                 "from" => current_group_id,
+                 "to" => playing_group_id
+               }
+             }
+           },
+           authorize?: false
+         ) do
+      {:ok, _audit} -> :ok
+      {:ok, _audit, _notifications} -> :ok
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp write_audit_if_ready(_actor_id, _event_id, _round, _entry, _group_id), do: :ok
 
   defp normalize_result({:ok, result}), do: {:ok, result}
   defp normalize_result({:error, reason}), do: {:error, reason}
