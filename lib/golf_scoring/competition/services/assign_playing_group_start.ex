@@ -4,6 +4,7 @@ defmodule GolfScoring.Competition.Services.AssignPlayingGroupStart do
   alias Ash.Changeset
   alias GolfScoring.Accounts.Checks.ActiveEventRole
   alias GolfScoring.Accounts.EventAuthorityLock
+  alias GolfScoring.Audit
   alias GolfScoring.Competition.PlayingGroup
   alias GolfScoring.Repo
 
@@ -32,7 +33,16 @@ defmodule GolfScoring.Competition.Services.AssignPlayingGroupStart do
            :ok <- group_belongs_to_round(group, round_id),
            :ok <- round_hole_belongs_to_round(starting_round_hole_id, round_id),
            {:ok, updated} <-
-             apply_start_assignment(group, starting_round_hole_id, starting_position) do
+             apply_start_assignment(group, starting_round_hole_id, starting_position),
+           :ok <-
+             write_audit_if_ready(
+               actor_id,
+               event_id,
+               round,
+               group,
+               starting_round_hole_id,
+               starting_position
+             ) do
         updated
       else
         {:error, reason} -> Repo.rollback(reason)
@@ -150,6 +160,56 @@ defmodule GolfScoring.Competition.Services.AssignPlayingGroupStart do
         {:error, error}
     end
   end
+
+  defp write_audit_if_ready(
+         actor_id,
+         event_id,
+         %{id: round_id, state: "ready"},
+         group,
+         starting_round_hole_id,
+         starting_position
+       ) do
+    if group.starting_round_hole_id == starting_round_hole_id and
+         group.starting_position == starting_position do
+      :ok
+    else
+      case Audit.record_staff_event(
+             %{
+               actor_staff_user_id: actor_id,
+               action: "assign_playing_group_start",
+               target_type: "round",
+               target_id: round_id,
+               context: %{"event_id" => event_id, "round_id" => round_id},
+               changes: %{
+                 "playing_group_id" => group.id,
+                 "starting_round_hole_id" => %{
+                   "from" => group.starting_round_hole_id,
+                   "to" => starting_round_hole_id
+                 },
+                 "starting_position" => %{
+                   "from" => group.starting_position,
+                   "to" => starting_position
+                 }
+               }
+             },
+             authorize?: false
+           ) do
+        {:ok, _audit} -> :ok
+        {:ok, _audit, _notifications} -> :ok
+        {:error, reason} -> {:error, reason}
+      end
+    end
+  end
+
+  defp write_audit_if_ready(
+         _actor_id,
+         _event_id,
+         _round,
+         _group,
+         _starting_round_hole_id,
+         _starting_position
+       ),
+       do: :ok
 
   defp normalize_result({:ok, result}), do: {:ok, result}
   defp normalize_result({:error, reason}), do: {:error, reason}

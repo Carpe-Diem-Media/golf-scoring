@@ -4,6 +4,7 @@ defmodule GolfScoring.Competition.Services.CreateCompetitionSide do
   alias Ash.Changeset
   alias GolfScoring.Accounts.Checks.ActiveEventRole
   alias GolfScoring.Accounts.EventAuthorityLock
+  alias GolfScoring.Audit
   alias GolfScoring.Competition.CompetitionSide
   alias GolfScoring.Repo
 
@@ -23,7 +24,8 @@ defmodule GolfScoring.Competition.Services.CreateCompetitionSide do
            :ok <- round_belongs_to_event(round, event_id),
            :ok <- round_accepts_configuration(round),
            :ok <- lock_round_competition(round_competition_id, round_id),
-           {:ok, side} <- create_side(round_competition_id, round_id, formation) do
+           {:ok, side} <- create_side(round_competition_id, round_id, formation),
+           :ok <- write_audit_if_ready(actor_id, event_id, round, round_competition_id, side) do
         side
       else
         {:error, reason} -> Repo.rollback(reason)
@@ -93,6 +95,40 @@ defmodule GolfScoring.Competition.Services.CreateCompetitionSide do
     })
     |> Ash.create(authorize?: false)
   end
+
+  defp write_audit_if_ready(
+         actor_id,
+         event_id,
+         %{id: round_id, state: "ready"},
+         round_competition_id,
+         side
+       ) do
+    case Audit.record_staff_event(
+           %{
+             actor_staff_user_id: actor_id,
+             action: "create_competition_side",
+             target_type: "round",
+             target_id: round_id,
+             context: %{
+               "event_id" => event_id,
+               "round_id" => round_id,
+               "round_competition_id" => round_competition_id
+             },
+             changes: %{
+               "competition_side_id" => side.id,
+               "round_competition_id" => round_competition_id,
+               "formation" => %{"from" => nil, "to" => Atom.to_string(side.formation)}
+             }
+           },
+           authorize?: false
+         ) do
+      {:ok, _audit} -> :ok
+      {:ok, _audit, _notifications} -> :ok
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp write_audit_if_ready(_actor_id, _event_id, _round, _round_competition_id, _side), do: :ok
 
   defp normalize_result({:ok, result}), do: {:ok, result}
   defp normalize_result({:error, reason}), do: {:error, reason}

@@ -5,6 +5,7 @@ defmodule GolfScoring.Competition.Changes.CreatePlayingGroup do
 
   alias GolfScoring.Accounts.Checks.ActiveEventRole
   alias GolfScoring.Accounts.EventAuthorityLock
+  alias GolfScoring.Audit
   alias GolfScoring.Repo
 
   @manager_roles [:event_admin, :competition_manager]
@@ -14,7 +15,8 @@ defmodule GolfScoring.Competition.Changes.CreatePlayingGroup do
   def change(changeset, _opts, context) do
     actor_id = if is_map(context.actor), do: Map.get(context.actor, :id), else: nil
 
-    Ash.Changeset.before_action(changeset, fn changeset ->
+    changeset
+    |> Ash.Changeset.before_action(fn changeset ->
       event_id = Ash.Changeset.get_argument(changeset, :event_id)
       round_id = Ash.Changeset.get_attribute(changeset, :round_id)
 
@@ -25,10 +27,21 @@ defmodule GolfScoring.Competition.Changes.CreatePlayingGroup do
            :ok <- round_accepts_group_configuration(round) do
         changeset
         |> Ash.Changeset.force_change_attribute(:state, :not_started)
+        |> Ash.Changeset.set_context(%{
+          ready_configuration_audit: %{
+            actor_id: actor_id,
+            event_id: event_id,
+            round_id: round.id,
+            round_state: round.state
+          }
+        })
       else
         {:error, message} ->
           Ash.Changeset.add_error(changeset, field: :round_id, message: message)
       end
+    end)
+    |> Ash.Changeset.after_action(fn changeset, group ->
+      write_audit_if_ready(changeset, group)
     end)
   end
 
@@ -72,4 +85,33 @@ defmodule GolfScoring.Competition.Changes.CreatePlayingGroup do
   defp round_accepts_group_configuration(%{state: state}) do
     {:error, "cannot configure PlayingGroups while the Round is #{state}"}
   end
+
+  defp write_audit_if_ready(
+         %{context: %{ready_configuration_audit: %{round_state: "ready"} = mutation}},
+         group
+       ) do
+    case Audit.record_staff_event(
+           %{
+             actor_staff_user_id: mutation.actor_id,
+             action: "create_playing_group",
+             target_type: "round",
+             target_id: mutation.round_id,
+             context: %{
+               "event_id" => mutation.event_id,
+               "round_id" => mutation.round_id
+             },
+             changes: %{
+               "playing_group_id" => group.id,
+               "state" => %{"from" => nil, "to" => Atom.to_string(group.state)}
+             }
+           },
+           authorize?: false
+         ) do
+      {:ok, _audit} -> {:ok, group}
+      {:ok, _audit, _notifications} -> {:ok, group}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp write_audit_if_ready(_changeset, group), do: {:ok, group}
 end

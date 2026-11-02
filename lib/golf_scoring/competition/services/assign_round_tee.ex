@@ -4,6 +4,7 @@ defmodule GolfScoring.Competition.Services.AssignRoundTee do
   alias Ash.Changeset
   alias GolfScoring.Accounts.Checks.ActiveEventRole
   alias GolfScoring.Accounts.EventAuthorityLock
+  alias GolfScoring.Audit
   alias GolfScoring.Competition.RoundEntry
   alias GolfScoring.LockProtocol
   alias GolfScoring.Repo
@@ -20,11 +21,12 @@ defmodule GolfScoring.Competition.Services.AssignRoundTee do
     Repo.transaction(fn ->
       with {:ok, _scope} <- EventAuthorityLock.lock_scope!(event_id, [actor_id]),
            :ok <- authorize(actor_id, event_id),
-           :ok <- lock_pre_open_round(round_id),
+           {:ok, round} <- lock_pre_open_round(round_id),
            :ok <- authorize_snapshot(round_tee_profile_snapshot_id, round_id),
            {:ok, entry} <- lock_entry(round_entry_id, round_id, event_id),
-           :ok <- InvalidateDerived.realign_entry_tee!(entry.id, round_tee_profile_snapshot_id),
-           {:ok, updated} <- assign_tee(entry, round_tee_profile_snapshot_id) do
+           {:ok, updated} <- assign_tee_if_changed(entry, round_tee_profile_snapshot_id),
+           :ok <-
+             write_audit_if_ready(actor_id, event_id, round, entry, round_tee_profile_snapshot_id) do
         updated
       else
         {:error, reason} -> Repo.rollback(reason)
@@ -47,7 +49,7 @@ defmodule GolfScoring.Competition.Services.AssignRoundTee do
   defp lock_pre_open_round(round_id) do
     with {:ok, %{acquired: [%{row: round}]}} <- LockProtocol.acquire!(round: [round_id]) do
       if round.state in ["draft", "ready"],
-        do: :ok,
+        do: {:ok, round},
         else: {:error, {:invalid_round_state, String.to_existing_atom(round.state)}}
     end
   end
@@ -65,19 +67,20 @@ defmodule GolfScoring.Competition.Services.AssignRoundTee do
   defp lock_entry(round_entry_id, round_id, event_id) do
     case Repo.query!(
            """
-           SELECT id::text, event_id::text, round_id::text, participation_status
+           SELECT id::text, event_id::text, round_id::text, participation_status, round_tee_profile_snapshot_id::text
            FROM round_entries
            WHERE id = $1::uuid
            FOR UPDATE
            """,
            [Ecto.UUID.dump!(round_entry_id)]
          ).rows do
-      [[id, eid, rid, participation]] ->
+      [[id, eid, rid, participation, snapshot_id]] ->
         entry = %{
           id: Ecto.UUID.cast!(id),
           event_id: Ecto.UUID.cast!(eid),
           round_id: Ecto.UUID.cast!(rid),
-          participation_status: String.to_existing_atom(participation)
+          participation_status: String.to_existing_atom(participation),
+          round_tee_profile_snapshot_id: cast_optional_uuid(snapshot_id)
         }
 
         cond do
@@ -105,6 +108,58 @@ defmodule GolfScoring.Competition.Services.AssignRoundTee do
         {:error, error}
     end
   end
+
+  defp assign_tee_if_changed(
+         %{round_tee_profile_snapshot_id: snapshot_id} = entry,
+         snapshot_id
+       ) do
+    case Ash.get(RoundEntry, entry.id, authorize?: false) do
+      {:ok, record} -> {:ok, record}
+      {:error, error} -> {:error, error}
+    end
+  end
+
+  defp assign_tee_if_changed(entry, snapshot_id) do
+    with :ok <- InvalidateDerived.realign_entry_tee!(entry.id, snapshot_id) do
+      assign_tee(entry, snapshot_id)
+    end
+  end
+
+  defp cast_optional_uuid(nil), do: nil
+  defp cast_optional_uuid(value), do: Ecto.UUID.cast!(value)
+
+  defp write_audit_if_ready(
+         actor_id,
+         event_id,
+         %{id: round_id, state: "ready"},
+         %{id: entry_id, round_tee_profile_snapshot_id: current_snapshot_id},
+         snapshot_id
+       )
+       when current_snapshot_id != snapshot_id do
+    case Audit.record_staff_event(
+           %{
+             actor_staff_user_id: actor_id,
+             action: "assign_round_tee",
+             target_type: "round",
+             target_id: round_id,
+             context: %{"event_id" => event_id, "round_id" => round_id},
+             changes: %{
+               "round_entry_id" => entry_id,
+               "round_tee_profile_snapshot_id" => %{
+                 "from" => current_snapshot_id,
+                 "to" => snapshot_id
+               }
+             }
+           },
+           authorize?: false
+         ) do
+      {:ok, _audit} -> :ok
+      {:ok, _audit, _notifications} -> :ok
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp write_audit_if_ready(_actor_id, _event_id, _round, _entry, _snapshot_id), do: :ok
 
   defp normalize_result({:ok, result}), do: {:ok, result}
   defp normalize_result({:error, reason}), do: {:error, reason}
