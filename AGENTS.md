@@ -62,6 +62,44 @@ custom classes must fully style the input
 - Ensure **clean typography, spacing, and layout balance** for a refined, premium look
 - Focus on **delightful details** like hover effects, loading states, and smooth page transitions
 
+### Mandatory Hallmark frontend workflow
+
+Hallmark is mandatory for substantive frontend and UI work.
+
+For every frontend task:
+
+1. Load and follow the installed `$hallmark` skill before implementation.
+2. Read `DESIGN.md` / `design.md` if present. It is authoritative.
+3. Inspect the existing frontend architecture, tokens, components and styles.
+4. Preserve the existing design system unless redesign is explicitly requested.
+5. Implement the requested frontend change using Hallmark's Floor and applicable
+   design gates.
+6. Before completion, run:
+
+   node ~/.agents/skills/hallmark/scripts/sloplint.mjs <affected-target> --render
+
+7. Fix every Hallmark `FAIL`.
+8. Fix every `REFLEX` finding unless there is a concrete project-specific reason
+   to waive it; record the reason.
+9. Re-run sloplint until the applicable checks pass.
+10. For substantial UI changes, perform a Hallmark audit as an additional
+    design review.
+
+Do NOT automatically invoke Hallmark `redesign` after an audit or lint failure.
+
+Use:
+
+    $hallmark redesign <target>
+
+only when the task explicitly requires a redesign or a deliberate replacement
+of the existing visual structure.
+
+For ordinary frontend fixes, preserve the current design system and correct the
+specific findings.
+
+Do not use undocumented Hallmark commands or assume that installation via
+`npx skills add` provides an `npx hallmark` CLI.
+
 
 <!-- usage-rules-start -->
 <!-- ash-start -->
