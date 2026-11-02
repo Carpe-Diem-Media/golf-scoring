@@ -1,6 +1,8 @@
 defmodule GolfScoring.Competition.ReadinessAuditTest do
   use ExUnit.Case, async: false
 
+  require Ash.Query
+
   alias Ash.Changeset
   alias Ecto.Adapters.SQL.Sandbox
   alias GolfScoring.Accounts
@@ -17,6 +19,10 @@ defmodule GolfScoring.Competition.ReadinessAuditTest do
   alias GolfScoring.Competition.Services.SnapshotRoundTeeProfiles
   alias GolfScoring.GolfCatalog
   alias GolfScoring.Repo
+  alias GolfScoring.Scoring
+  alias GolfScoring.Scoring.Calculators.CourseHandicap
+  alias GolfScoring.Scoring.Calculators.PlayingHandicap
+  alias GolfScoring.Scoring.HandicapSnapshot
 
   @password "GLS-77 synthetic staff passphrase 2026"
 
@@ -50,6 +56,47 @@ defmodule GolfScoring.Competition.ReadinessAuditTest do
 
     set_round_state!(round, :ready)
 
+    assert {:ok, round_competition} =
+             ConfigureRoundCompetition.run(admin, event.id, round.id, %{
+               solo_sides_permitted: true
+             })
+
+    assert {:ok, _confirmed_snapshot} =
+             Scoring.confirm_handicap_input(
+               admin,
+               event.id,
+               round.id,
+               entry.id,
+               %{source_handicap_index: Decimal.new("10.0")}
+             )
+
+    assert {:ok, built_snapshot_a} =
+             Scoring.build_handicap_snapshot(
+               entry.id,
+               course_handicap_attrs!(Decimal.new("10.0"), snapshot_a)
+             )
+
+    competition_handicap_attrs_a =
+      playing_handicap_attrs!(built_snapshot_a, round_competition.handicap_allowance_percent)
+
+    assert {:ok, competition_handicap_a} =
+             Scoring.build_competition_handicap(
+               entry.id,
+               round_competition.id,
+               competition_handicap_attrs_a
+             )
+
+    before_tee_change_snapshot = handicap_snapshot!(entry.id)
+
+    before_tee_change_competition_handicaps =
+      competition_handicap_facts(entry.id, round_competition.id)
+
+    assert before_tee_change_snapshot.built_at
+
+    assert before_tee_change_competition_handicaps == [
+             {competition_handicap_a.id, competition_handicap_a.playing_handicap}
+           ]
+
     assert {:ok, ready_entry} =
              AssignRoundTee.run(admin, event.id, round.id, entry.id, snapshot_b.id)
 
@@ -60,18 +107,74 @@ defmodule GolfScoring.Competition.ReadinessAuditTest do
       "round_tee_profile_snapshot_id" => %{"from" => snapshot_a.id, "to" => snapshot_b.id}
     })
 
+    invalidated_snapshot = handicap_snapshot!(entry.id)
+    assert invalidated_snapshot.id == before_tee_change_snapshot.id
+    assert invalidated_snapshot.round_tee_profile_snapshot_id == snapshot_b.id
+    assert is_nil(invalidated_snapshot.built_at)
+    assert is_nil(invalidated_snapshot.course_handicap_unrounded)
+    assert is_nil(invalidated_snapshot.course_handicap_rounded)
+    assert competition_handicap_facts(entry.id, round_competition.id) == []
+
+    assert {:ok, built_snapshot_b} =
+             Scoring.build_handicap_snapshot(
+               entry.id,
+               course_handicap_attrs!(Decimal.new("10.0"), snapshot_b)
+             )
+
+    competition_handicap_attrs_b =
+      playing_handicap_attrs!(built_snapshot_b, round_competition.handicap_allowance_percent)
+
+    assert {:ok, competition_handicap_b} =
+             Scoring.build_competition_handicap(
+               entry.id,
+               round_competition.id,
+               competition_handicap_attrs_b
+             )
+
+    before_entry = Ash.get!(GolfScoring.Competition.RoundEntry, entry.id, authorize?: false)
+    before_snapshot = handicap_snapshot!(entry.id)
+    before_competition_handicaps = competition_handicap_facts(entry.id, round_competition.id)
+    before_audit_count = length(audit_events(round.id, "assign_round_tee"))
+
+    assert before_snapshot.id == built_snapshot_b.id
+    assert before_snapshot.round_tee_profile_snapshot_id == snapshot_b.id
+    assert before_snapshot.confirmed_at
+    assert before_snapshot.built_at
+    assert before_snapshot.course_handicap_unrounded
+    assert before_snapshot.course_handicap_rounded
+
+    assert before_competition_handicaps == [
+             {competition_handicap_b.id, competition_handicap_b.playing_handicap}
+           ]
+
     assert {:ok, same_entry} =
              AssignRoundTee.run(admin, event.id, round.id, entry.id, snapshot_b.id)
 
     assert same_entry.round_tee_profile_snapshot_id == snapshot_b.id
-    assert length(audit_events(round.id, "assign_round_tee")) == 1
+    assert same_entry.updated_at == before_entry.updated_at
+
+    after_snapshot = handicap_snapshot!(entry.id)
+
+    assert Map.take(after_snapshot, handicap_snapshot_evidence()) ==
+             Map.take(before_snapshot, handicap_snapshot_evidence())
+
+    after_competition_handicaps = competition_handicap_facts(entry.id, round_competition.id)
+    assert after_competition_handicaps == before_competition_handicaps
+    assert length(audit_events(round.id, "assign_round_tee")) == before_audit_count
 
     with_rejected_audit("assign_round_tee", fn ->
       assert {:error, _reason} =
                AssignRoundTee.run(admin, event.id, round.id, entry.id, snapshot_a.id)
 
       assert tee_snapshot_id(entry.id) == snapshot_b.id
-      assert length(audit_events(round.id, "assign_round_tee")) == 1
+
+      assert Map.take(handicap_snapshot!(entry.id), handicap_snapshot_evidence()) ==
+               Map.take(before_snapshot, handicap_snapshot_evidence())
+
+      assert competition_handicap_facts(entry.id, round_competition.id) ==
+               before_competition_handicaps
+
+      assert length(audit_events(round.id, "assign_round_tee")) == before_audit_count
     end)
 
     set_round_state!(round, :scoring_open)
@@ -80,6 +183,12 @@ defmodule GolfScoring.Competition.ReadinessAuditTest do
              AssignRoundTee.run(admin, event.id, round.id, entry.id, snapshot_a.id)
 
     assert tee_snapshot_id(entry.id) == snapshot_b.id
+
+    assert Map.take(handicap_snapshot!(entry.id), handicap_snapshot_evidence()) ==
+             Map.take(before_snapshot, handicap_snapshot_evidence())
+
+    assert competition_handicap_facts(entry.id, round_competition.id) ==
+             before_competition_handicaps
   end
 
   test "ready group moves audit actual changes and roll back when the audit fails" do
@@ -552,6 +661,60 @@ defmodule GolfScoring.Competition.ReadinessAuditTest do
       ).rows
 
     Ecto.UUID.cast!(snapshot_id)
+  end
+
+  defp course_handicap_attrs!(handicap_index, tee) do
+    {:ok, attrs} =
+      CourseHandicap.calculate(
+        handicap_index,
+        tee.slope_rating,
+        tee.course_rating,
+        tee.applicable_par
+      )
+
+    attrs
+  end
+
+  defp playing_handicap_attrs!(snapshot, allowance_percent) do
+    {:ok, attrs} =
+      PlayingHandicap.calculate(snapshot.course_handicap_unrounded, allowance_percent)
+
+    Map.merge(attrs, %{policy_identifier: "gls77_readiness_audit_test", allowance_applied: true})
+  end
+
+  defp handicap_snapshot!(entry_id) do
+    HandicapSnapshot
+    |> Ash.Query.filter(round_entry_id == ^entry_id)
+    |> Ash.read_one!(authorize?: false)
+  end
+
+  defp handicap_snapshot_evidence do
+    [
+      :id,
+      :round_tee_profile_snapshot_id,
+      :confirmed_at,
+      :confirmed_by_staff_user_id,
+      :built_at,
+      :course_rating,
+      :slope_rating,
+      :applicable_par,
+      :course_handicap_unrounded,
+      :course_handicap_rounded,
+      :updated_at
+    ]
+  end
+
+  defp competition_handicap_facts(entry_id, round_competition_id) do
+    Repo.query!(
+      """
+      SELECT id::text, playing_handicap
+      FROM competition_handicaps
+      WHERE round_entry_id = $1::uuid AND round_competition_id = $2::uuid
+      ORDER BY id
+      """,
+      [Ecto.UUID.dump!(entry_id), Ecto.UUID.dump!(round_competition_id)]
+    ).rows
+    |> Enum.map(fn [id, playing_handicap] -> {Ecto.UUID.cast!(id), playing_handicap} end)
   end
 
   defp entry_group_id(entry_id) do

@@ -24,8 +24,7 @@ defmodule GolfScoring.Competition.Services.AssignRoundTee do
            {:ok, round} <- lock_pre_open_round(round_id),
            :ok <- authorize_snapshot(round_tee_profile_snapshot_id, round_id),
            {:ok, entry} <- lock_entry(round_entry_id, round_id, event_id),
-           :ok <- InvalidateDerived.realign_entry_tee!(entry.id, round_tee_profile_snapshot_id),
-           {:ok, updated} <- assign_tee(entry, round_tee_profile_snapshot_id),
+           {:ok, updated} <- assign_tee_if_changed(entry, round_tee_profile_snapshot_id),
            :ok <-
              write_audit_if_ready(actor_id, event_id, round, entry, round_tee_profile_snapshot_id) do
         updated
@@ -107,6 +106,22 @@ defmodule GolfScoring.Competition.Services.AssignRoundTee do
 
       {:error, error} ->
         {:error, error}
+    end
+  end
+
+  defp assign_tee_if_changed(
+         %{round_tee_profile_snapshot_id: snapshot_id} = entry,
+         snapshot_id
+       ) do
+    case Ash.get(RoundEntry, entry.id, authorize?: false) do
+      {:ok, record} -> {:ok, record}
+      {:error, error} -> {:error, error}
+    end
+  end
+
+  defp assign_tee_if_changed(entry, snapshot_id) do
+    with :ok <- InvalidateDerived.realign_entry_tee!(entry.id, snapshot_id) do
+      assign_tee(entry, snapshot_id)
     end
   end
 
