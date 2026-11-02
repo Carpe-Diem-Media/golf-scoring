@@ -1,5 +1,5 @@
 defmodule GolfScoring.Competition.Round do
-  @moduledoc "A competition Round and its guarded lifecycle state."
+  @moduledoc "A competition Round. Opening transitions require the RoundOpening coordinator."
 
   use Ash.Resource,
     domain: GolfScoring.Competition,
