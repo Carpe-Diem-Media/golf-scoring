@@ -44,6 +44,15 @@ defmodule GolfScoringWeb.Admin.RoundSetupLive do
     tie_break_policy_identifier: "mystery_holes_then_countback_v1"
   }
 
+  @scoring_track_v1_fields [
+    :track_type,
+    :name,
+    :is_primary,
+    :visibility_policy_identifier,
+    :aggregation_policy_identifier,
+    :tie_break_policy_identifier
+  ]
+
   @mystery_rule_options [
     {"None", "NONE"},
     {"Best", "BEST"},
@@ -69,7 +78,8 @@ defmodule GolfScoringWeb.Admin.RoundSetupLive do
     hs.built_at,
     hs.course_handicap_unrounded::text,
     hs.course_handicap_rounded,
-    ch.playing_handicap
+    ch.playing_handicap,
+    ch.handicap_allowance_percent
   FROM round_entries re
   INNER JOIN players p ON p.id = re.player_id
   LEFT JOIN handicap_snapshots hs ON hs.round_entry_id = re.id
@@ -94,7 +104,8 @@ defmodule GolfScoringWeb.Admin.RoundSetupLive do
     hs.built_at,
     hs.course_handicap_unrounded::text,
     hs.course_handicap_rounded,
-    ch.playing_handicap
+    ch.playing_handicap,
+    ch.handicap_allowance_percent
   FROM round_entries re
   INNER JOIN players p ON p.id = re.player_id
   LEFT JOIN handicap_snapshots hs ON hs.round_entry_id = re.id
@@ -236,6 +247,12 @@ defmodule GolfScoringWeb.Admin.RoundSetupLive do
         {:error, :tee_not_assigned} ->
           {:noreply, put_flash(socket, :error, "Assign a tee before building course handicap.")}
 
+        {:error, :stale_handicap_output} ->
+          {:noreply,
+           socket
+           |> put_flash(:error, format_error(:stale_handicap_output))
+           |> refresh_round_state(round)}
+
         {:error, reason} ->
           {:noreply,
            put_flash(socket, :error, "Course handicap build failed: #{format_error(reason)}")}
@@ -288,6 +305,12 @@ defmodule GolfScoringWeb.Admin.RoundSetupLive do
         {:error, :entry_not_found} ->
           {:noreply, put_flash(socket, :error, "Starting entry not found.")}
 
+        {:error, :stale_handicap_output} ->
+          {:noreply,
+           socket
+           |> put_flash(:error, format_error(:stale_handicap_output))
+           |> refresh_round_state(round)}
+
         {:error, reason} ->
           {:noreply,
            put_flash(socket, :error, "Playing handicap build failed: #{format_error(reason)}")}
@@ -310,23 +333,26 @@ defmodule GolfScoringWeb.Admin.RoundSetupLive do
       not socket.assigns.can_mutate ->
         {:noreply, put_flash(socket, :error, "This Round is read-only.")}
 
-      not socket.assigns.is_event_admin ->
-        {:noreply, put_flash(socket, :error, "Mystery hole rules require Event Admin access.")}
+      not socket.assigns.can_configure_mystery ->
+        {:noreply,
+         put_flash(socket, :error, "You are not allowed to configure mystery hole rules.")}
+
+      is_nil(socket.assigns.mystery_track) ->
+        {:noreply, put_flash(socket, :error, "Configure the mystery scoring track first.")}
+
+      not scoring_track_editable?(socket.assigns.mystery_track) ->
+        {:noreply, put_flash(socket, :error, format_error(:configuration_locked))}
 
       true ->
         staff = Repo.get!(StaffUser, socket.assigns.current_staff_user.id)
         round = socket.assigns.round
         event_id = socket.assigns.event_id
-        mystery_track = socket.assigns.mystery_track
 
-        with %ScoringTrack{id: track_id} <- mystery_track,
+        with %ScoringTrack{id: track_id} <- socket.assigns.mystery_track,
              {:ok, round_hole_id} <- InputParsing.parse_uuid(Map.get(params, "round_hole_id")),
              selection <- Map.get(params, "selection", "NONE") do
           respond_mystery_rule(staff, event_id, round, track_id, round_hole_id, selection, socket)
         else
-          nil ->
-            {:noreply, put_flash(socket, :error, "Configure the mystery scoring track first.")}
-
           {:error, :invalid_input} ->
             {:noreply, put_flash(socket, :error, "Round hole must be valid.")}
         end
@@ -464,6 +490,14 @@ defmodule GolfScoringWeb.Admin.RoundSetupLive do
                     value={entry.deemed_handicap_basis_input}
                     disabled={not @can_mutate}
                   />
+                  <.input
+                    id={"entry-no-hi-provenance-#{entry.id}"}
+                    name="no_hi[source_reference]"
+                    type="text"
+                    label="Committee provenance reference"
+                    value={entry.no_hi_source_reference_input}
+                    disabled={not @can_mutate}
+                  />
                   <button type="submit" class="btn btn-sm btn-outline" disabled={not @can_mutate}>
                     Apply no-HI
                   </button>
@@ -505,13 +539,18 @@ defmodule GolfScoringWeb.Admin.RoundSetupLive do
 
         <div class="rounded-2xl border border-base-300 bg-base-100 p-6 shadow-sm space-y-4">
           <h2 class="text-lg font-semibold">Scoring tracks</h2>
+          <%= if scoring_track_locked?(@standard_track) or scoring_track_locked?(@mystery_track) do %>
+            <p id="scoring-tracks-locked-notice" class="text-sm text-base-content/70">
+              Locked scoring tracks are read-only on this screen.
+            </p>
+          <% end %>
           <div class="flex flex-wrap gap-3">
             <button
               id="save-standard-track"
               type="button"
               class="btn btn-outline"
               phx-click="save_standard_track"
-              disabled={not @can_mutate}
+              disabled={not scoring_track_configurable?(@can_mutate, @standard_track)}
             >
               {track_button_label(@standard_track, "Standard better-ball")}
             </button>
@@ -520,14 +559,14 @@ defmodule GolfScoringWeb.Admin.RoundSetupLive do
               type="button"
               class="btn btn-outline"
               phx-click="save_mystery_track"
-              disabled={not @can_mutate}
+              disabled={not scoring_track_configurable?(@can_mutate, @mystery_track)}
             >
               {track_button_label(@mystery_track, "Mystery leaderboard")}
             </button>
           </div>
         </div>
 
-        <%= if @is_event_admin and @mystery_track do %>
+        <%= if @can_configure_mystery and @mystery_track do %>
           <div class="rounded-2xl border border-base-300 bg-base-100 p-6 shadow-sm space-y-4">
             <h2 class="text-lg font-semibold">Mystery hole rules</h2>
             <div id="mystery-hole-rules" class="grid gap-3 sm:grid-cols-2">
@@ -546,9 +585,26 @@ defmodule GolfScoringWeb.Admin.RoundSetupLive do
                     label={"Hole #{hole.display_hole_number} (play #{hole.play_order})"}
                     value={Map.get(@mystery_rule_selections, hole.id, "NONE")}
                     options={@mystery_rule_options}
-                    disabled={not @can_mutate}
+                    disabled={
+                      not mystery_rules_configurable?(
+                        @can_mutate,
+                        @can_configure_mystery,
+                        @mystery_track
+                      )
+                    }
                   />
-                  <button type="submit" class="btn btn-sm btn-primary" disabled={not @can_mutate}>
+                  <button
+                    id={"mystery-rule-save-#{hole.id}"}
+                    type="submit"
+                    class="btn btn-sm btn-primary"
+                    disabled={
+                      not mystery_rules_configurable?(
+                        @can_mutate,
+                        @can_configure_mystery,
+                        @mystery_track
+                      )
+                    }
+                  >
                     Save
                   </button>
                 </.form>
@@ -625,11 +681,43 @@ defmodule GolfScoringWeb.Admin.RoundSetupLive do
     """
   end
 
+  defp track_button_label(%ScoringTrack{configuration_state: :locked}, default),
+    do: "#{default} (locked)"
+
   defp track_button_label(%ScoringTrack{configuration_state: :draft}, default),
     do: "Update #{default}"
 
   defp track_button_label(%ScoringTrack{}, default), do: "Configure #{default}"
   defp track_button_label(nil, default), do: "Configure #{default}"
+
+  defp scoring_track_locked?(%ScoringTrack{configuration_state: :locked}), do: true
+  defp scoring_track_locked?(_), do: false
+
+  defp scoring_track_configurable?(true, track), do: scoring_track_editable?(track)
+  defp scoring_track_configurable?(_, _), do: false
+
+  defp scoring_track_editable?(nil), do: true
+
+  defp scoring_track_editable?(%ScoringTrack{configuration_state: :draft}), do: true
+  defp scoring_track_editable?(%ScoringTrack{configuration_state: :locked}), do: false
+  defp scoring_track_editable?(_), do: false
+
+  defp mystery_rules_configurable?(true, true, track),
+    do: not is_nil(track) and scoring_track_editable?(track)
+
+  defp mystery_rules_configurable?(_, _, _), do: false
+
+  defp standard_track_configured?(track), do: track_matches_v1?(track, @standard_track_attrs)
+
+  defp mystery_track_configured?(track), do: track_matches_v1?(track, @mystery_track_attrs)
+
+  defp track_matches_v1?(nil, _expected), do: false
+
+  defp track_matches_v1?(%ScoringTrack{} = track, expected_attrs) do
+    Enum.all?(@scoring_track_v1_fields, fn field ->
+      Map.fetch!(track, field) == Map.fetch!(expected_attrs, field)
+    end)
+  end
 
   defp mutate_allowed(%{assigns: %{can_mutate: true}}), do: :ok
   defp mutate_allowed(_), do: :read_only
@@ -786,18 +874,24 @@ defmodule GolfScoringWeb.Admin.RoundSetupLive do
     event_id = socket.assigns.event_id
 
     with {:ok, entry_id} <- InputParsing.parse_uuid(Map.get(params, "round_entry_id")),
-         {:ok, deemed} <- InputParsing.parse_decimal(Map.get(params, "deemed_handicap_basis")) do
-      noreply_apply_no_hi(staff, event_id, round, entry_id, deemed, socket)
+         {:ok, deemed} <- InputParsing.parse_decimal(Map.get(params, "deemed_handicap_basis")),
+         {:ok, provenance} <- parse_provenance_reference(Map.get(params, "source_reference")) do
+      noreply_apply_no_hi(staff, event_id, round, entry_id, deemed, provenance, socket)
     else
       {:error, :invalid_input} ->
-        {:noreply, put_flash(socket, :error, "Entry and deemed basis must be valid.")}
+        {:noreply,
+         put_flash(
+           socket,
+           :error,
+           "Entry, deemed basis, and committee provenance reference must be valid."
+         )}
     end
   end
 
-  defp noreply_apply_no_hi(staff, event_id, round, entry_id, deemed, socket) do
+  defp noreply_apply_no_hi(staff, event_id, round, entry_id, deemed, provenance, socket) do
     case Scoring.apply_no_hi_policy(staff, event_id, round.id, entry_id, %{
            deemed_handicap_basis: deemed,
-           source_reference: @playing_handicap_policy
+           source_reference: provenance
          }) do
       {:ok, _} ->
         {:noreply,
@@ -829,29 +923,33 @@ defmodule GolfScoringWeb.Admin.RoundSetupLive do
     event_id = socket.assigns.event_id
     competition = socket.assigns.round_competition
     track = Map.fetch!(socket.assigns, track_assign)
-    attrs = track_attrs_with_id(base_attrs, track)
 
-    case competition do
-      %RoundCompetition{id: competition_id} ->
-        case Competition.configure_scoring_track(staff, event_id, round.id, competition_id, attrs) do
-          {:ok, _} ->
-            {:noreply,
-             socket
-             |> put_flash(:info, success_message)
-             |> refresh_round_state(round)}
+    with :ok <- ensure_scoring_track_editable(track),
+         %RoundCompetition{id: competition_id} <- competition do
+      attrs = track_attrs_with_id(base_attrs, track)
 
-          {:error, :forbidden} ->
-            {:noreply,
-             put_flash(socket, :error, "You are not allowed to configure scoring tracks.")}
+      case Competition.configure_scoring_track(staff, event_id, round.id, competition_id, attrs) do
+        {:ok, _} ->
+          {:noreply,
+           socket
+           |> put_flash(:info, success_message)
+           |> refresh_round_state(round)}
 
-          {:error, reason} ->
-            {:noreply,
-             put_flash(
-               socket,
-               :error,
-               "#{failure_prefix}: #{format_error(reason)}"
-             )}
-        end
+        {:error, :forbidden} ->
+          {:noreply,
+           put_flash(socket, :error, "You are not allowed to configure scoring tracks.")}
+
+        {:error, reason} ->
+          {:noreply,
+           put_flash(
+             socket,
+             :error,
+             "#{failure_prefix}: #{format_error(reason)}"
+           )}
+      end
+    else
+      {:error, :configuration_locked} ->
+        {:noreply, put_flash(socket, :error, format_error(:configuration_locked))}
 
       nil ->
         {:noreply,
@@ -861,6 +959,10 @@ defmodule GolfScoringWeb.Admin.RoundSetupLive do
            "Save handicap allowance to create primary competition first."
          )}
     end
+  end
+
+  defp ensure_scoring_track_editable(track) do
+    if scoring_track_editable?(track), do: :ok, else: {:error, :configuration_locked}
   end
 
   defp scoring_track_persist_meta(:standard) do
@@ -908,8 +1010,8 @@ defmodule GolfScoringWeb.Admin.RoundSetupLive do
     end
   end
 
-  defp mystery_rule_selection_atom(selection) do
-    case String.upcase(selection) do
+  defp mystery_rule_selection_atom(selection) when is_binary(selection) do
+    case String.upcase(String.trim(selection)) do
       "NONE" -> :none
       "BEST" -> :best
       "WORST" -> :worst
@@ -917,6 +1019,8 @@ defmodule GolfScoringWeb.Admin.RoundSetupLive do
       _ -> :invalid
     end
   end
+
+  defp mystery_rule_selection_atom(_), do: :invalid
 
   defp noreply_mystery_rule_result(:ok, socket, round) do
     {:noreply,
@@ -1000,6 +1104,9 @@ defmodule GolfScoringWeb.Admin.RoundSetupLive do
     staff_id = socket.assigns.current_staff_user.id
     event_id = socket.assigns.event_id
 
+    can_configure_mystery =
+      ActiveEventRole.authorized?(staff_id, event_id, @setup_roles)
+
     configuration_checklist =
       build_configuration_checklist(
         round_holes,
@@ -1007,6 +1114,7 @@ defmodule GolfScoringWeb.Admin.RoundSetupLive do
         round_competition,
         standard_track,
         mystery_track,
+        mystery_rule_selections,
         starting_entries
       )
 
@@ -1016,7 +1124,7 @@ defmodule GolfScoringWeb.Admin.RoundSetupLive do
     socket
     |> assign(:round, round)
     |> assign(:can_mutate, pre_open?(round))
-    |> assign(:is_event_admin, ActiveEventRole.authorized?(staff_id, event_id, [:event_admin]))
+    |> assign(:can_configure_mystery, can_configure_mystery)
     |> assign(:round_holes, round_holes)
     |> assign(:course_holes, course_holes)
     |> assign(:course_hole_options, course_hole_options)
@@ -1112,7 +1220,8 @@ defmodule GolfScoringWeb.Admin.RoundSetupLive do
          built_at,
          course_unrounded,
          course_rounded,
-         playing
+         playing,
+         playing_allowance
        ]) do
     tee_uuid = cast_optional_uuid(tee_snapshot_id)
     player_has_hi? = not is_nil(parse_optional_decimal(latest_hi))
@@ -1126,11 +1235,13 @@ defmodule GolfScoringWeb.Admin.RoundSetupLive do
       deemed_handicap_basis: parse_optional_decimal(deemed),
       source_handicap_index_input: decimal_input(source_hi),
       deemed_handicap_basis_input: decimal_input(deemed),
+      no_hi_source_reference_input: "",
       confirmed_at: confirmed_at,
       built_at: built_at,
       course_handicap_unrounded: parse_optional_decimal(course_unrounded),
       course_handicap_rounded: course_rounded,
       playing_handicap: playing,
+      playing_handicap_allowance_percent: playing_allowance,
       tee_status_label: if(tee_uuid, do: "assigned", else: "missing"),
       basis_status_label: basis_status_label(confirmed_at, source_hi, deemed),
       course_handicap_label: course_handicap_label(built_at, course_rounded),
@@ -1174,18 +1285,28 @@ defmodule GolfScoringWeb.Admin.RoundSetupLive do
          round_competition,
          standard_track,
          mystery_track,
+         mystery_rule_selections,
          starting_entries
        ) do
     route_done = length(round_holes) == 18
     snapshots_done = snapshots != []
     competition_done = not is_nil(round_competition)
-    standard_done = not is_nil(standard_track)
-    mystery_done = not is_nil(mystery_track)
+    standard_done = standard_track_configured?(standard_track)
+    mystery_done = mystery_track_configured?(mystery_track)
+
+    mystery_rules_done =
+      not is_nil(mystery_track) and
+        Enum.any?(mystery_rule_selections, fn {_hole_id, selection} ->
+          selection != "NONE"
+        end)
 
     all_tees = Enum.all?(starting_entries, & &1.round_tee_profile_snapshot_id)
     all_basis = Enum.all?(starting_entries, & &1.confirmed_at)
     all_course = Enum.all?(starting_entries, & &1.built_at)
-    all_playing = Enum.all?(starting_entries, &(not is_nil(&1.playing_handicap)))
+
+    all_playing =
+      starting_entries == [] or
+        Enum.all?(starting_entries, &playing_handicap_current?(&1, round_competition))
 
     [
       checklist_item(:route, "Round route (18 holes)", route_done),
@@ -1193,6 +1314,7 @@ defmodule GolfScoringWeb.Admin.RoundSetupLive do
       checklist_item(:competition, "Primary competition configured", competition_done),
       checklist_item(:standard_track, "Standard scoring track", standard_done),
       checklist_item(:mystery_track, "Mystery scoring track", mystery_done),
+      checklist_item(:mystery_rules, "At least one mystery hole rule", mystery_rules_done),
       checklist_item(
         :entry_tees,
         "All starters assigned a tee",
@@ -1210,11 +1332,30 @@ defmodule GolfScoringWeb.Admin.RoundSetupLive do
       ),
       checklist_item(
         :entry_playing,
-        "All starters have playing handicap",
-        all_playing or starting_entries == []
+        "All starters have playing handicap matching allowance",
+        all_playing
       )
     ]
   end
+
+  defp playing_handicap_current?(entry, %RoundCompetition{handicap_allowance_percent: expected}) do
+    not is_nil(entry.playing_handicap) and
+      entry.playing_handicap_allowance_percent == expected
+  end
+
+  defp playing_handicap_current?(_, nil), do: false
+
+  defp parse_provenance_reference(ref) when is_binary(ref) do
+    trimmed = String.trim(ref)
+
+    if trimmed == "" do
+      {:error, :invalid_input}
+    else
+      {:ok, trimmed}
+    end
+  end
+
+  defp parse_provenance_reference(_), do: {:error, :invalid_input}
 
   defp checklist_item(key, label, done), do: %{key: key, label: label, done: done}
 
@@ -1299,6 +1440,14 @@ defmodule GolfScoringWeb.Admin.RoundSetupLive do
   defp parse_allowance_percent(_), do: {:error, :invalid_input}
 
   defp format_error({:invalid_round_state, state}), do: "invalid round state #{state}"
+
+  defp format_error(:stale_handicap_output),
+    do:
+      "Handicap inputs changed since the last build. Confirm basis, rebuild course handicap, then rebuild playing handicap."
+
+  defp format_error(:configuration_locked),
+    do: "Scoring track configuration is locked and cannot be changed here."
+
   defp format_error(reason) when is_atom(reason), do: Atom.to_string(reason)
   defp format_error(reason), do: inspect(reason)
 

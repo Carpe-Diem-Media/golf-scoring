@@ -25,6 +25,7 @@ defmodule GolfScoringWeb.Admin.RoundConfigurationLiveTest do
   @password "GLS-14 synthetic staff passphrase 2026"
   @sign_in_form "#staffuser-password-sign-in-with-password"
   @playing_handicap_policy "whs_golfrsa_2026_v1"
+  @no_hi_provenance "Committee minutes 2026-03-15 item 4"
 
   setup do
     owner = Sandbox.start_owner!(Repo, shared: true)
@@ -307,7 +308,7 @@ defmodule GolfScoringWeb.Admin.RoundConfigurationLiveTest do
   end
 
   describe "H — no-HI deemed basis and provenance" do
-    test "apply_no_hi persists deemed basis and policy provenance without silent defaults", %{
+    test "apply_no_hi persists deemed basis and explicit committee provenance reference", %{
       conn: conn
     } do
       setup = seed_configuration_context!(include_no_hi_entry: true)
@@ -323,7 +324,11 @@ defmodule GolfScoringWeb.Admin.RoundConfigurationLiveTest do
 
       html =
         render_submit(element(view, "#entry-no-hi-form-#{no_hi_entry.id}"), %{
-          "no_hi" => %{"round_entry_id" => no_hi_entry.id, "deemed_handicap_basis" => "18.5"}
+          "no_hi" => %{
+            "round_entry_id" => no_hi_entry.id,
+            "deemed_handicap_basis" => "18.5",
+            "source_reference" => @no_hi_provenance
+          }
         })
 
       assert html =~ "No-HI policy applied"
@@ -332,13 +337,39 @@ defmodule GolfScoringWeb.Admin.RoundConfigurationLiveTest do
       assert snapshot.basis_source == :committee_deemed
       assert snapshot.deemed_handicap_basis == D.new("18.5")
       assert is_nil(snapshot.source_handicap_index)
-      assert snapshot.source_reference == @playing_handicap_policy
+      assert snapshot.source_reference == @no_hi_provenance
+      refute snapshot.source_reference == @playing_handicap_policy
 
       assert [] ==
                Repo.query!(
                  "SELECT deemed_handicap_basis FROM handicap_snapshots WHERE round_entry_id = $1::uuid AND deemed_handicap_basis IN ('14', '20', '14.0', '20.0')",
                  [Ecto.UUID.dump!(no_hi_entry.id)]
                ).rows
+    end
+
+    test "missing provenance reference does not create a handicap snapshot", %{conn: conn} do
+      setup = seed_configuration_context!(include_no_hi_entry: true)
+      no_hi_entry = setup.no_hi_entry
+      conn = authenticate(conn, setup.admin.email)
+
+      {:ok, view, _html} = live(conn, setup_path(setup))
+      save_allowance!(view, 85)
+
+      render_submit(element(view, "#entry-tee-form-#{no_hi_entry.id}"), %{
+        "entry" => %{"round_entry_id" => no_hi_entry.id, "snapshot_id" => setup.tee_a.id}
+      })
+
+      html =
+        render_submit(element(view, "#entry-no-hi-form-#{no_hi_entry.id}"), %{
+          "no_hi" => %{
+            "round_entry_id" => no_hi_entry.id,
+            "deemed_handicap_basis" => "18.5",
+            "source_reference" => ""
+          }
+        })
+
+      assert html =~ "provenance"
+      refute fetch_snapshot_optional(no_hi_entry.id)
     end
 
     test "empty deemed basis does not create a handicap snapshot", %{conn: conn} do
@@ -355,7 +386,11 @@ defmodule GolfScoringWeb.Admin.RoundConfigurationLiveTest do
 
       html =
         render_submit(element(view, "#entry-no-hi-form-#{no_hi_entry.id}"), %{
-          "no_hi" => %{"round_entry_id" => no_hi_entry.id, "deemed_handicap_basis" => ""}
+          "no_hi" => %{
+            "round_entry_id" => no_hi_entry.id,
+            "deemed_handicap_basis" => "",
+            "source_reference" => @no_hi_provenance
+          }
         })
 
       assert html =~ "valid"
@@ -364,6 +399,27 @@ defmodule GolfScoringWeb.Admin.RoundConfigurationLiveTest do
   end
 
   describe "I — standard and mystery tracks" do
+    test "locked scoring tracks are read-only in the UI", %{conn: conn} do
+      setup = seed_configuration_context!()
+      conn = authenticate(conn, setup.admin.email)
+
+      {:ok, view, _html} = live(conn, setup_path(setup))
+      save_allowance!(view, 85)
+      render_click(element(view, "#save-standard-track"))
+      render_click(element(view, "#save-mystery-track"))
+
+      assert :ok = Competition.lock_scoring_tracks_for_round(setup.round.id)
+      {:ok, view, html} = live(conn, setup_path(setup))
+
+      assert has_element?(view, "#scoring-tracks-locked-notice")
+      assert element_disabled?(html, "save-standard-track")
+      assert element_disabled?(html, "save-mystery-track")
+      assert html =~ "locked"
+
+      html = render_click(view, "save_standard_track", %{})
+      assert html =~ "locked"
+    end
+
     test "save_standard_track and save_mystery_track persist exact attrs idempotently", %{
       conn: conn
     } do
@@ -407,6 +463,20 @@ defmodule GolfScoringWeb.Admin.RoundConfigurationLiveTest do
       assert mys.aggregation_policy_identifier == "mystery_v1"
       assert mys.tie_break_policy_identifier == "mystery_holes_then_countback_v1"
     end
+
+    test "correctly configured locked tracks still satisfy track checklist items", %{conn: conn} do
+      setup = seed_configuration_context!()
+      conn = authenticate(conn, setup.admin.email)
+
+      {:ok, view, _html} = live(conn, setup_path(setup))
+      save_both_tracks!(view)
+
+      assert :ok = Competition.lock_scoring_tracks_for_round(setup.round.id)
+      {:ok, view, _html} = live(conn, setup_path(setup))
+
+      assert checklist_done?(view, "standard_track")
+      assert checklist_done?(view, "mystery_track")
+    end
   end
 
   describe "J — mystery hole rules BEST/WORST/BOTH/NONE" do
@@ -438,6 +508,67 @@ defmodule GolfScoringWeb.Admin.RoundConfigurationLiveTest do
         end
       end
     end
+
+    test "competition manager may configure mystery hole rules", %{conn: conn} do
+      setup = seed_configuration_context!()
+      manager = create_staff_user!()
+      assign_role!(setup.admin, setup.event, manager, :competition_manager)
+      hole = hd(setup.round_holes)
+      conn = authenticate(conn, manager.email)
+
+      {:ok, view, _html} = live(conn, setup_path(setup))
+      save_allowance!(view, 85)
+      render_click(element(view, "#save-mystery-track"))
+
+      assert has_element?(view, "#mystery-hole-rules")
+
+      render_submit(element(view, "#mystery-rule-form-#{hole.id}"), %{
+        "rule" => %{"round_hole_id" => hole.id, "selection" => "BEST"}
+      })
+
+      rule = fetch_mystery_rule(setup.round.id, hole.id)
+      assert rule.rule == :best
+    end
+
+    test "locked mystery track keeps rules visible but rejects server-side mutations", %{
+      conn: conn
+    } do
+      setup = seed_configuration_context!()
+      conn = authenticate(conn, setup.admin.email)
+      hole = hd(setup.round_holes)
+
+      {:ok, view, _html} = live(conn, setup_path(setup))
+      save_both_tracks!(view)
+
+      render_submit(element(view, "#mystery-rule-form-#{hole.id}"), %{
+        "rule" => %{"round_hole_id" => hole.id, "selection" => "BEST"}
+      })
+
+      assert fetch_mystery_rule(setup.round.id, hole.id).rule == :best
+
+      assert :ok = Competition.lock_scoring_tracks_for_round(setup.round.id)
+      {:ok, view, html} = live(conn, setup_path(setup))
+
+      assert has_element?(view, "#mystery-hole-rules")
+      assert element_disabled?(html, "mystery-rule-#{hole.id}")
+      assert element_disabled?(html, "mystery-rule-save-#{hole.id}")
+
+      html =
+        render_submit(element(view, "#mystery-rule-form-#{hole.id}"), %{
+          "rule" => %{"round_hole_id" => hole.id, "selection" => "WORST"}
+        })
+
+      assert html =~ "locked"
+      assert fetch_mystery_rule(setup.round.id, hole.id).rule == :best
+
+      html =
+        render_submit(element(view, "#mystery-rule-form-#{hole.id}"), %{
+          "rule" => %{"round_hole_id" => hole.id, "selection" => "NONE"}
+        })
+
+      assert html =~ "locked"
+      assert fetch_mystery_rule(setup.round.id, hole.id).rule == :best
+    end
   end
 
   describe "K — configuration checklist" do
@@ -451,25 +582,66 @@ defmodule GolfScoringWeb.Admin.RoundConfigurationLiveTest do
       assert checklist_done?(view, "route")
       assert checklist_done?(view, "tee_snapshots")
       refute checklist_done?(view, "competition")
+      refute checklist_done?(view, "mystery_rules")
+    end
+
+    test "checklist requires exact V1 standard track configuration, not type presence alone",
+         %{conn: conn} do
+      for {column, wrong_value} <- standard_track_wrong_v1_cases() do
+        setup = seed_configuration_context!()
+        conn = authenticate(conn, setup.admin.email)
+
+        {:ok, view, _html} = live(conn, setup_path(setup))
+        save_both_tracks!(view)
+
+        standard = fetch_scoring_track!(setup.round.id, :standard_better_ball)
+        set_scoring_track_column!(standard.id, column, wrong_value)
+
+        {:ok, view, _html} = live(conn, setup_path(setup))
+        refute checklist_done?(view, "standard_track")
+      end
+    end
+
+    test "checklist requires exact V1 mystery track configuration, not type presence alone",
+         %{conn: conn} do
+      for {column, wrong_value} <- mystery_track_wrong_v1_cases() do
+        setup = seed_configuration_context!()
+        conn = authenticate(conn, setup.admin.email)
+
+        {:ok, view, _html} = live(conn, setup_path(setup))
+        save_both_tracks!(view)
+
+        mystery = fetch_scoring_track!(setup.round.id, :mystery)
+        set_scoring_track_column!(mystery.id, column, wrong_value)
+
+        {:ok, view, _html} = live(conn, setup_path(setup))
+        refute checklist_done?(view, "mystery_track")
+      end
     end
 
     test "checklist completes after full configuration pipeline", %{conn: conn} do
       setup = seed_configuration_context!()
       conn = authenticate(conn, setup.admin.email)
       [entry_a, entry_b] = setup.entries
+      hole = hd(setup.round_holes)
 
       {:ok, view, _html} = live(conn, setup_path(setup))
 
       save_allowance!(view, 85)
       render_click(element(view, "#save-standard-track"))
       render_click(element(view, "#save-mystery-track"))
+
+      render_submit(element(view, "#mystery-rule-form-#{hole.id}"), %{
+        "rule" => %{"round_hole_id" => hole.id, "selection" => "BEST"}
+      })
+
       configure_entry_handicap_pipeline!(view, setup, entry_a, setup.tee_a.id, "10.0")
       configure_entry_handicap_pipeline!(view, setup, entry_b, setup.tee_b.id, "21.0")
       render_click(element(view, "#build-playing-handicap-#{entry_a.id}"))
       render_click(element(view, "#build-playing-handicap-#{entry_b.id}"))
 
       for key <-
-            ~w(route tee_snapshots competition standard_track mystery_track entry_tees entry_basis entry_course entry_playing) do
+            ~w(route tee_snapshots competition standard_track mystery_track mystery_rules entry_tees entry_basis entry_course entry_playing) do
         assert checklist_done?(view, key)
       end
     end
@@ -504,6 +676,47 @@ defmodule GolfScoringWeb.Admin.RoundConfigurationLiveTest do
 
       assert html =~ "valid"
       refute fetch_snapshot_optional(entry.id)
+    end
+
+    test "malformed mystery rule selection shows controlled error without crashing", %{
+      conn: conn
+    } do
+      setup = seed_configuration_context!()
+      conn = authenticate(conn, setup.admin.email)
+      hole = hd(setup.round_holes)
+
+      {:ok, view, _html} = live(conn, setup_path(setup))
+      save_allowance!(view, 85)
+      render_click(element(view, "#save-mystery-track"))
+
+      html =
+        render_submit(element(view, "#mystery-rule-form-#{hole.id}"), %{
+          "rule" => %{"round_hole_id" => hole.id, "selection" => "not-valid"}
+        })
+
+      assert html =~ "NONE, BEST, WORST, or BOTH"
+      refute fetch_mystery_rule(setup.round.id, hole.id)
+    end
+
+    test "stale handicap build surfaces friendly error and refreshes entry state", %{conn: conn} do
+      setup = seed_configuration_context!()
+      conn = authenticate(conn, setup.admin.email)
+      entry = hd(setup.entries)
+
+      {:ok, view, _html} = live(conn, setup_path(setup))
+      save_allowance!(view, 85)
+      configure_entry_handicap_pipeline!(view, setup, entry, setup.tee_a.id, "10.0")
+
+      snapshot = fetch_snapshot!(entry.id)
+
+      Repo.query!(
+        "UPDATE handicap_snapshots SET course_handicap_unrounded = $1 WHERE id = $2::uuid",
+        [D.new("999.9"), Ecto.UUID.dump!(snapshot.id)]
+      )
+
+      html = render_click(element(view, "#build-playing-handicap-#{entry.id}"))
+      assert html =~ "Handicap inputs changed"
+      refute fetch_competition_handicap_optional(entry.id)
     end
 
     test "no open_scoring control is exposed", %{conn: conn} do
@@ -594,6 +807,51 @@ defmodule GolfScoringWeb.Admin.RoundConfigurationLiveTest do
     })
   end
 
+  defp save_both_tracks!(view) do
+    save_allowance!(view, 85)
+    render_click(element(view, "#save-standard-track"))
+    render_click(element(view, "#save-mystery-track"))
+  end
+
+  defp standard_track_wrong_v1_cases do
+    [
+      {"aggregation_policy_identifier", "wrong_standard_v1"},
+      {"tie_break_policy_identifier", "wrong_countback_v1"},
+      {"visibility_policy_identifier", "wrong_visibility_v1"},
+      {"name", "Wrong Standard Name"}
+    ]
+  end
+
+  defp mystery_track_wrong_v1_cases do
+    [
+      {"aggregation_policy_identifier", "wrong_mystery_v1"},
+      {"tie_break_policy_identifier", "wrong_mystery_countback_v1"},
+      {"visibility_policy_identifier", "leaderboard_v1"},
+      {"name", "Wrong Mystery Name"},
+      {"is_primary", false}
+    ]
+  end
+
+  defp fetch_scoring_track!(round_id, track_type) do
+    ScoringTrack
+    |> Ash.Query.filter(round_id == ^round_id and track_type == ^track_type)
+    |> Ash.read_one!(authorize?: false)
+  end
+
+  defp set_scoring_track_column!(track_id, "is_primary", value) when is_boolean(value) do
+    Repo.query!(
+      "UPDATE scoring_tracks SET is_primary = $1 WHERE id = $2::uuid",
+      [value, Ecto.UUID.dump!(track_id)]
+    )
+  end
+
+  defp set_scoring_track_column!(track_id, column, value) when is_binary(column) do
+    Repo.query!(
+      "UPDATE scoring_tracks SET #{column} = $1 WHERE id = $2::uuid",
+      [value, Ecto.UUID.dump!(track_id)]
+    )
+  end
+
   defp configure_entry_handicap_pipeline!(view, _setup, entry, tee_id, hi) do
     render_submit(element(view, "#entry-tee-form-#{entry.id}"), %{
       "entry" => %{"round_entry_id" => entry.id, "snapshot_id" => tee_id}
@@ -642,6 +900,16 @@ defmodule GolfScoringWeb.Admin.RoundConfigurationLiveTest do
       ]).rows
 
     count
+  end
+
+  defp fetch_competition_handicap_optional(entry_id) do
+    CompetitionHandicap
+    |> Ash.Query.filter(round_entry_id == ^entry_id)
+    |> Ash.read_one(authorize?: false)
+    |> case do
+      {:ok, row} -> row
+      _ -> nil
+    end
   end
 
   defp primary_competition_id(round_id) do
