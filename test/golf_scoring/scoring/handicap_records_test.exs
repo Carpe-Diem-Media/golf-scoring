@@ -19,18 +19,22 @@ defmodule GolfScoring.Scoring.HandicapRecordsTest do
   alias GolfScoring.GolfCatalog
   alias GolfScoring.Repo
   alias GolfScoring.Scoring
+  alias GolfScoring.Scoring.Calculators.CourseHandicap
+  alias GolfScoring.Scoring.Calculators.PlayingHandicap
   alias GolfScoring.Scoring.CompetitionHandicap
   alias GolfScoring.Scoring.HandicapRowLock
   alias GolfScoring.Scoring.HandicapSnapshot
 
   @password "GLS-22 synthetic staff passphrase 2026"
 
-  setup do
+  setup tags do
     Process.put(:gls22_prefix, "gls22-#{Ecto.UUID.generate()}")
     on_exit(fn -> Process.delete(:gls22_prefix) end)
 
-    owner = Sandbox.start_owner!(Repo, shared: true)
-    on_exit(fn -> Sandbox.stop_owner(owner) end)
+    unless tags[:gls75_connections] do
+      owner = Sandbox.start_owner!(Repo, shared: true)
+      on_exit(fn -> Sandbox.stop_owner(owner) end)
+    end
 
     :ok
   end
@@ -306,7 +310,7 @@ defmodule GolfScoring.Scoring.HandicapRecordsTest do
 
     assert {:ok, _} =
              Scoring.build_competition_handicap(setup.entry.id, setup.competition.id, %{
-               playing_handicap: 7,
+               playing_handicap: valid_playing!(setup.entry.id, 85),
                policy_identifier: "policy_keep",
                allowance_applied: true
              })
@@ -329,10 +333,10 @@ defmodule GolfScoring.Scoring.HandicapRecordsTest do
     assert competition_count(setup.entry.id) == 0
 
     assert {:ok, rebuilt} =
-             Scoring.build_handicap_snapshot(setup.entry.id, %{
-               course_handicap_unrounded: D.new("13.0"),
-               course_handicap_rounded: 13
-             })
+             Scoring.build_handicap_snapshot(
+               setup.entry.id,
+               course_attrs!(D.new("10.0"), setup.tee_b)
+             )
 
     assert rebuilt.course_rating == setup.tee_b.course_rating
     assert rebuilt.slope_rating == setup.tee_b.slope_rating
@@ -345,7 +349,7 @@ defmodule GolfScoring.Scoring.HandicapRecordsTest do
 
     assert {:ok, _} =
              Scoring.build_competition_handicap(setup.entry.id, setup.competition.id, %{
-               playing_handicap: 7,
+               playing_handicap: valid_playing!(setup.entry.id, 85),
                policy_identifier: "policy_keep",
                allowance_applied: false
              })
@@ -484,17 +488,269 @@ defmodule GolfScoring.Scoring.HandicapRecordsTest do
              )
 
     assert {:ok, built} =
-             Scoring.build_handicap_snapshot(setup.entry.id, %{
-               course_handicap_unrounded: D.new("12.3"),
-               course_handicap_rounded: 12
-             })
+             Scoring.build_handicap_snapshot(
+               setup.entry.id,
+               course_attrs!(D.new("11.0"), setup.tee_a)
+             )
 
     assert built.course_rating == setup.tee_a.course_rating
     assert built.slope_rating == setup.tee_a.slope_rating
     assert built.applicable_par == setup.tee_a.applicable_par
-    assert built.course_handicap_unrounded == D.new("12.3")
-    assert built.course_handicap_rounded == 12
+
+    assert D.equal?(
+             built.course_handicap_unrounded,
+             course_attrs!(D.new("11.0"), setup.tee_a).course_handicap_unrounded
+           )
+
+    assert built.course_handicap_rounded ==
+             course_attrs!(D.new("11.0"), setup.tee_a).course_handicap_rounded
+
     assert built.built_at
+  end
+
+  test "rejects a course handicap calculated from a stale tee" do
+    setup = setup_round_with_tees!(assign_tee: true, profiles: 2)
+
+    assert {:ok, _} =
+             Scoring.confirm_handicap_input(
+               setup.admin,
+               setup.event.id,
+               setup.round.id,
+               setup.entry.id,
+               %{source_handicap_index: D.new("11.0")}
+             )
+
+    assert {:ok, stale} =
+             CourseHandicap.calculate(
+               D.new("11.0"),
+               setup.tee_a.slope_rating,
+               setup.tee_a.course_rating,
+               setup.tee_a.applicable_par
+             )
+
+    assert {:ok, _} =
+             Competition.assign_round_tee(
+               setup.admin,
+               setup.event.id,
+               setup.round.id,
+               setup.entry.id,
+               setup.tee_b.id
+             )
+
+    assert {:error, :stale_handicap_output} =
+             Scoring.build_handicap_snapshot(setup.entry.id, stale)
+
+    snapshot = fetch_snapshot!(setup.entry.id)
+    assert snapshot.round_tee_profile_snapshot_id == setup.tee_b.id
+    assert is_nil(snapshot.built_at)
+    assert is_nil(snapshot.course_handicap_unrounded)
+    assert is_nil(snapshot.course_handicap_rounded)
+  end
+
+  test "course output comparisons reject each mismatch and accept equivalent decimals" do
+    setup = setup_round_with_tees!(assign_tee: true)
+
+    assert {:ok, _} =
+             Scoring.confirm_handicap_input(
+               setup.admin,
+               setup.event.id,
+               setup.round.id,
+               setup.entry.id,
+               %{
+                 source_handicap_index: D.new("10.0")
+               }
+             )
+
+    attrs = course_attrs!(D.new("10.0"), setup.tee_a)
+
+    for invalid <- [
+          Map.update!(attrs, :course_handicap_unrounded, &D.add(&1, 1)),
+          Map.update!(attrs, :course_handicap_rounded, &(&1 + 1))
+        ] do
+      assert {:error, :stale_handicap_output} =
+               Scoring.build_handicap_snapshot(setup.entry.id, invalid)
+
+      snapshot = fetch_snapshot!(setup.entry.id)
+      assert is_nil(snapshot.built_at)
+      assert is_nil(snapshot.course_handicap_unrounded)
+      assert is_nil(snapshot.course_handicap_rounded)
+    end
+
+    equivalent = Map.update!(attrs, :course_handicap_unrounded, &D.mult(&1, D.new("1.0")))
+    assert {:ok, _} = Scoring.build_handicap_snapshot(setup.entry.id, equivalent)
+  end
+
+  test "playing output accepts an omitted or correct unrounded value and rejects a mismatch" do
+    setup = setup_round_with_tees!(assign_tee: true, competition: true)
+    build_built_snapshot!(setup)
+    snapshot = fetch_snapshot!(setup.entry.id)
+
+    {:ok, calculated} =
+      PlayingHandicap.calculate(
+        snapshot.course_handicap_unrounded,
+        85
+      )
+
+    attrs = Map.merge(calculated, %{policy_identifier: "test_policy", allowance_applied: true})
+
+    wrong = Map.update!(attrs, :unrounded_allowed_handicap, &D.add(&1, 1))
+
+    assert {:error, :stale_handicap_output} =
+             Scoring.build_competition_handicap(setup.entry.id, setup.competition.id, wrong)
+
+    assert competition_count(setup.entry.id) == 0
+
+    assert {:ok, row} =
+             Scoring.build_competition_handicap(setup.entry.id, setup.competition.id, attrs)
+
+    assert D.equal?(row.unrounded_allowed_handicap, calculated.unrounded_allowed_handicap)
+
+    other = create_non_primary_round_competition!(setup, handicap_allowance_percent: 85)
+
+    assert {:ok, row} =
+             Scoring.build_competition_handicap(
+               setup.entry.id,
+               other.id,
+               Map.delete(attrs, :unrounded_allowed_handicap)
+             )
+
+    assert is_nil(row.unrounded_allowed_handicap)
+  end
+
+  @tag :gls75_connections
+  test "tee correction commits before a waiting stale course build" do
+    setup = committed_gls75_fixture!()
+    stale = course_attrs!(D.new("10.0"), setup.tee_a)
+
+    {first, second} =
+      gls75_race!(
+        fn ->
+          Competition.assign_round_tee(
+            setup.admin,
+            setup.event.id,
+            setup.round.id,
+            setup.entry.id,
+            setup.tee_b.id
+          )
+        end,
+        fn -> Scoring.build_handicap_snapshot(setup.entry.id, stale) end
+      )
+
+    assert {:ok, {:ok, _}} = first
+    assert {:error, :stale_handicap_output} = second
+
+    Sandbox.unboxed_run(Repo, fn ->
+      snapshot = fetch_snapshot!(setup.entry.id)
+      assert snapshot.round_tee_profile_snapshot_id == setup.tee_b.id
+      assert_unbuilt!(snapshot)
+    end)
+  end
+
+  @tag :gls75_connections
+  test "basis correction commits before a waiting stale course build" do
+    setup = committed_gls75_fixture!()
+    stale = course_attrs!(D.new("10.0"), setup.tee_a)
+
+    {first, second} =
+      gls75_race!(
+        fn ->
+          Scoring.override_handicap_basis(
+            setup.admin,
+            setup.event.id,
+            setup.round.id,
+            setup.entry.id,
+            %{deemed_handicap_basis: D.new("16.0"), override_reason: "correction"}
+          )
+        end,
+        fn -> Scoring.build_handicap_snapshot(setup.entry.id, stale) end
+      )
+
+    assert {:ok, {:ok, _}} = first
+    assert {:error, :stale_handicap_output} = second
+
+    Sandbox.unboxed_run(Repo, fn ->
+      snapshot = fetch_snapshot!(setup.entry.id)
+      assert snapshot.basis_source == :committee_override
+      assert D.equal?(snapshot.deemed_handicap_basis, D.new("16.0"))
+      assert_unbuilt!(snapshot)
+    end)
+  end
+
+  @tag :gls75_connections
+  test "course build commits before waiting tee correction invalidates it" do
+    setup = committed_gls75_fixture!()
+    attrs = course_attrs!(D.new("10.0"), setup.tee_a)
+
+    {first, second} =
+      gls75_race!(
+        fn -> Scoring.build_handicap_snapshot(setup.entry.id, attrs) end,
+        fn ->
+          Competition.assign_round_tee(
+            setup.admin,
+            setup.event.id,
+            setup.round.id,
+            setup.entry.id,
+            setup.tee_b.id
+          )
+        end
+      )
+
+    assert {:ok, {:ok, _}} = first
+    assert {:ok, _} = second
+
+    Sandbox.unboxed_run(Repo, fn ->
+      snapshot = fetch_snapshot!(setup.entry.id)
+      assert snapshot.round_tee_profile_snapshot_id == setup.tee_b.id
+      assert_unbuilt!(snapshot)
+    end)
+  end
+
+  @tag :gls75_connections
+  test "allowance correction commits before waiting stale playing build" do
+    setup = committed_gls75_fixture!(built: true)
+    attrs = Sandbox.unboxed_run(Repo, fn -> playing_attrs!(setup.entry.id, 85) end)
+
+    {first, second} =
+      gls75_race!(
+        fn ->
+          ConfigureRoundCompetition.run(setup.admin, setup.event.id, setup.round.id, %{
+            handicap_allowance_percent: 90
+          })
+        end,
+        fn -> Scoring.build_competition_handicap(setup.entry.id, setup.competition.id, attrs) end
+      )
+
+    assert {:ok, {:ok, _}} = first
+    assert {:error, :stale_handicap_output} = second
+
+    Sandbox.unboxed_run(Repo, fn ->
+      assert persisted_allowance_percent!(setup.competition.id) == 90
+      assert competition_count(setup.entry.id) == 0
+    end)
+  end
+
+  @tag :gls75_connections
+  test "playing build commits before waiting allowance correction invalidates it" do
+    setup = committed_gls75_fixture!(built: true)
+    attrs = Sandbox.unboxed_run(Repo, fn -> playing_attrs!(setup.entry.id, 85) end)
+
+    {first, second} =
+      gls75_race!(
+        fn -> Scoring.build_competition_handicap(setup.entry.id, setup.competition.id, attrs) end,
+        fn ->
+          ConfigureRoundCompetition.run(setup.admin, setup.event.id, setup.round.id, %{
+            handicap_allowance_percent: 90
+          })
+        end
+      )
+
+    assert {:ok, {:ok, _}} = first
+    assert {:ok, _} = second
+
+    Sandbox.unboxed_run(Repo, fn ->
+      assert persisted_allowance_percent!(setup.competition.id) == 90
+      assert competition_count(setup.entry.id) == 0
+    end)
   end
 
   test "mixed tees produce independent handicap snapshots" do
@@ -606,7 +862,7 @@ defmodule GolfScoring.Scoring.HandicapRecordsTest do
 
       assert {:ok, _} =
                Scoring.build_competition_handicap(setup.entry.id, setup.competition.id, %{
-                 playing_handicap: 8,
+                 playing_handicap: valid_playing!(setup.entry.id, 85),
                  policy_identifier: "gls74_policy",
                  allowance_applied: true
                })
@@ -628,7 +884,7 @@ defmodule GolfScoring.Scoring.HandicapRecordsTest do
 
       assert {:ok, _} =
                Scoring.build_competition_handicap(setup.entry.id, setup.competition.id, %{
-                 playing_handicap: 8,
+                 playing_handicap: valid_playing!(setup.entry.id, 85),
                  policy_identifier: "gls74_policy",
                  allowance_applied: true
                })
@@ -648,14 +904,14 @@ defmodule GolfScoring.Scoring.HandicapRecordsTest do
 
       assert {:ok, primary_row} =
                Scoring.build_competition_handicap(setup.entry.id, setup.competition.id, %{
-                 playing_handicap: 8,
+                 playing_handicap: valid_playing!(setup.entry.id, 85),
                  policy_identifier: "gls74_primary",
                  allowance_applied: true
                })
 
       assert {:ok, other_row} =
                Scoring.build_competition_handicap(setup.entry.id, other.id, %{
-                 playing_handicap: 6,
+                 playing_handicap: valid_playing!(setup.entry.id, 75),
                  policy_identifier: "gls74_other",
                  allowance_applied: true
                })
@@ -683,7 +939,7 @@ defmodule GolfScoring.Scoring.HandicapRecordsTest do
 
       assert {:ok, _} =
                Scoring.build_competition_handicap(setup.entry.id, setup.competition.id, %{
-                 playing_handicap: 8,
+                 playing_handicap: valid_playing!(setup.entry.id, 85),
                  policy_identifier: "gls74_policy",
                  allowance_applied: true
                })
@@ -706,7 +962,7 @@ defmodule GolfScoring.Scoring.HandicapRecordsTest do
 
       assert {:ok, _} =
                Scoring.build_competition_handicap(setup.entry.id, setup.competition.id, %{
-                 playing_handicap: 8,
+                 playing_handicap: valid_playing!(setup.entry.id, 85),
                  policy_identifier: "gls74_policy",
                  allowance_applied: true
                })
@@ -736,7 +992,7 @@ defmodule GolfScoring.Scoring.HandicapRecordsTest do
 
       assert {:ok, row} =
                Scoring.build_competition_handicap(setup.entry.id, setup.competition.id, %{
-                 playing_handicap: 9,
+                 playing_handicap: valid_playing!(setup.entry.id, 90),
                  policy_identifier: "gls74_policy",
                  allowance_applied: true
                })
@@ -777,7 +1033,7 @@ defmodule GolfScoring.Scoring.HandicapRecordsTest do
           Sandbox.allow(Repo, parent, self())
 
           Scoring.build_competition_handicap(setup.entry.id, setup.competition.id, %{
-            playing_handicap: 8,
+            playing_handicap: valid_playing!(setup.entry.id, 85),
             policy_identifier: "gls74_policy",
             allowance_applied: true
           })
@@ -798,10 +1054,10 @@ defmodule GolfScoring.Scoring.HandicapRecordsTest do
 
       send(blocker.pid, :gls74_release_round_competition_lock)
       assert {:ok, :released} = Task.await(blocker, 10_000)
-      assert {:ok, build_row} = Task.await(build_task, 10_000)
+      build_result = Task.await(build_task, 10_000)
       assert {:ok, updated} = Task.await(configure_task, 10_000)
       assert updated.handicap_allowance_percent == 90
-      assert build_row.handicap_allowance_percent in [85, 90]
+      assert match?({:ok, _}, build_result) or build_result == {:error, :stale_handicap_output}
       refute stale_allowance_rows?(setup.competition.id, updated.handicap_allowance_percent)
     end
 
@@ -833,7 +1089,7 @@ defmodule GolfScoring.Scoring.HandicapRecordsTest do
               Sandbox.allow(Repo, parent, self())
 
               Scoring.build_competition_handicap(entry.id, setup.competition.id, %{
-                playing_handicap: 8,
+                playing_handicap: valid_playing!(entry.id, 85),
                 policy_identifier: "gls74_race",
                 allowance_applied: true
               })
@@ -870,14 +1126,14 @@ defmodule GolfScoring.Scoring.HandicapRecordsTest do
              )
 
     assert {:ok, _} =
-             Scoring.build_handicap_snapshot(setup.entry.id, %{
-               course_handicap_unrounded: D.new("11.0"),
-               course_handicap_rounded: 11
-             })
+             Scoring.build_handicap_snapshot(
+               setup.entry.id,
+               course_attrs!(D.new("10.0"), setup.tee_a)
+             )
 
     assert {:ok, competition_row} =
              Scoring.build_competition_handicap(setup.entry.id, setup.competition.id, %{
-               playing_handicap: 10,
+               playing_handicap: valid_playing!(setup.entry.id, 85),
                policy_identifier: "gls22_test_policy_v1",
                allowance_applied: true
              })
@@ -885,7 +1141,7 @@ defmodule GolfScoring.Scoring.HandicapRecordsTest do
     assert competition_row.handicap_allowance_percent ==
              setup.competition.handicap_allowance_percent
 
-    assert competition_row.playing_handicap == 10
+    assert competition_row.playing_handicap == valid_playing!(setup.entry.id, 85)
   end
 
   test "PostgreSQL enforces unique competition handicap per entry and competition" do
@@ -894,7 +1150,7 @@ defmodule GolfScoring.Scoring.HandicapRecordsTest do
 
     assert {:ok, first} =
              Scoring.build_competition_handicap(setup.entry.id, setup.competition.id, %{
-               playing_handicap: 8,
+               playing_handicap: valid_playing!(setup.entry.id, 85),
                policy_identifier: "policy_a",
                allowance_applied: false
              })
@@ -927,7 +1183,7 @@ defmodule GolfScoring.Scoring.HandicapRecordsTest do
 
     assert {:ok, _} =
              Scoring.build_competition_handicap(setup.entry.id, setup.competition.id, %{
-               playing_handicap: 7,
+               playing_handicap: valid_playing!(setup.entry.id, 85),
                policy_identifier: "policy_keep",
                allowance_applied: true
              })
@@ -979,10 +1235,176 @@ defmodule GolfScoring.Scoring.HandicapRecordsTest do
              )
 
     assert {:ok, _} =
-             Scoring.build_handicap_snapshot(setup.entry.id, %{
-               course_handicap_unrounded: D.new("11.0"),
-               course_handicap_rounded: 11
-             })
+             Scoring.build_handicap_snapshot(
+               setup.entry.id,
+               course_attrs!(D.new("10.0"), setup.tee_a)
+             )
+  end
+
+  defp committed_gls75_fixture!(opts \\ []) do
+    fixture =
+      Sandbox.unboxed_run(Repo, fn ->
+        setup = setup_round_with_tees!(profiles: 2, assign_tee: true, competition: true)
+
+        assert {:ok, _} =
+                 Scoring.confirm_handicap_input(
+                   setup.admin,
+                   setup.event.id,
+                   setup.round.id,
+                   setup.entry.id,
+                   %{source_handicap_index: D.new("10.0")}
+                 )
+
+        if Keyword.get(opts, :built, false) do
+          assert {:ok, _} =
+                   Scoring.build_handicap_snapshot(
+                     setup.entry.id,
+                     course_attrs!(D.new("10.0"), setup.tee_a)
+                   )
+        end
+
+        setup
+      end)
+
+    on_exit(fn -> cleanup_gls75_fixture!(fixture) end)
+    fixture
+  end
+
+  defp cleanup_gls75_fixture!(fixture) do
+    Sandbox.unboxed_run(Repo, fn ->
+      round = Ecto.UUID.dump!(fixture.round.id)
+      course = Ecto.UUID.dump!(fixture.course.id)
+      event = Ecto.UUID.dump!(fixture.event.id)
+      staff = Ecto.UUID.dump!(fixture.admin.id)
+      player = Ecto.UUID.dump!(fixture.entry.player_id)
+
+      Repo.transaction(fn ->
+        delete_gls75_round_children!(round)
+
+        Repo.query!("DELETE FROM rounds WHERE id = $1::uuid", [round])
+        Repo.query!("DELETE FROM players WHERE id = $1::uuid", [player])
+
+        Repo.query!(
+          "DELETE FROM tee_rating_profiles WHERE tee_set_id IN (SELECT id FROM tee_sets WHERE course_id = $1::uuid)",
+          [course]
+        )
+
+        Repo.query!("DELETE FROM tee_sets WHERE course_id = $1::uuid", [course])
+        Repo.query!("DELETE FROM course_holes WHERE course_id = $1::uuid", [course])
+        Repo.query!("DELETE FROM courses WHERE id = $1::uuid", [course])
+        Repo.query!("DELETE FROM audit_events WHERE actor_staff_user_id = $1::uuid", [staff])
+        Repo.query!("DELETE FROM event_staff_assignments WHERE event_id = $1::uuid", [event])
+        Repo.query!("DELETE FROM events WHERE id = $1::uuid", [event])
+        Repo.query!("DELETE FROM staff_users WHERE id = $1::uuid", [staff])
+      end)
+      |> case do
+        {:ok, _} -> :ok
+        {:error, reason} -> flunk("fixture cleanup failed: #{inspect(reason)}")
+      end
+    end)
+  end
+
+  defp delete_gls75_round_children!(round) do
+    for table <-
+          ~w(competition_handicaps handicap_snapshots round_entries round_competitions round_tee_hole_snapshots round_tee_profile_snapshots round_holes) do
+      Repo.query!("DELETE FROM #{table} WHERE round_id = $1::uuid", [round])
+    end
+  end
+
+  defp gls75_race!(first_fun, second_fun) do
+    parent = self()
+
+    first =
+      Task.async(fn ->
+        Sandbox.unboxed_run(Repo, fn -> run_gls75_first!(parent, first_fun) end)
+      end)
+
+    assert_receive {:gls75_first_held, first_pid}, 10_000
+
+    second =
+      Task.async(fn ->
+        Sandbox.unboxed_run(Repo, fn ->
+          [[pid]] = Repo.query!("SELECT pg_backend_pid()").rows
+          send(parent, {:gls75_second_started, pid})
+          second_fun.()
+        end)
+      end)
+
+    assert_receive {:gls75_second_started, second_pid}, 10_000
+    refute first_pid == second_pid
+    await_gls75_lock!(second_pid, System.monotonic_time(:millisecond) + 10_000)
+    send(first.pid, :gls75_commit)
+    {Task.await(first, 15_000), Task.await(second, 15_000)}
+  end
+
+  defp run_gls75_first!(parent, first_fun) do
+    Repo.transaction(fn -> hold_gls75_transaction!(parent, first_fun) end)
+  end
+
+  defp hold_gls75_transaction!(parent, first_fun) do
+    result = first_fun.()
+    [[pid]] = Repo.query!("SELECT pg_backend_pid()").rows
+    send(parent, {:gls75_first_held, pid})
+
+    receive do
+      :gls75_commit -> result
+    after
+      15_000 -> Repo.rollback(:timeout)
+    end
+  end
+
+  defp await_gls75_lock!(pid, deadline) do
+    waiting =
+      Sandbox.unboxed_run(Repo, fn ->
+        Repo.query!("SELECT wait_event_type = 'Lock' FROM pg_stat_activity WHERE pid = $1", [pid]).rows
+      end)
+
+    if waiting != [[true]] do
+      if System.monotonic_time(:millisecond) >= deadline,
+        do: flunk("second backend did not wait on a lock")
+
+      await_gls75_lock!(pid, deadline)
+    end
+  end
+
+  defp assert_unbuilt!(snapshot) do
+    assert is_nil(snapshot.built_at)
+    assert is_nil(snapshot.course_rating)
+    assert is_nil(snapshot.slope_rating)
+    assert is_nil(snapshot.applicable_par)
+    assert is_nil(snapshot.course_handicap_unrounded)
+    assert is_nil(snapshot.course_handicap_rounded)
+  end
+
+  defp playing_attrs!(entry_id, allowance) do
+    {:ok, attrs} =
+      PlayingHandicap.calculate(fetch_snapshot!(entry_id).course_handicap_unrounded, allowance)
+
+    Map.merge(attrs, %{policy_identifier: "gls75_test", allowance_applied: true})
+  end
+
+  defp course_attrs!(basis, tee) do
+    {:ok, attrs} =
+      CourseHandicap.calculate(
+        basis,
+        tee.slope_rating,
+        tee.course_rating,
+        tee.applicable_par
+      )
+
+    attrs
+  end
+
+  defp valid_playing!(entry_id, allowance) do
+    snapshot = fetch_snapshot!(entry_id)
+
+    {:ok, attrs} =
+      PlayingHandicap.calculate(
+        snapshot.course_handicap_unrounded,
+        allowance
+      )
+
+    attrs.playing_handicap
   end
 
   defp fetch_snapshot!(entry_id) do
@@ -1065,6 +1487,7 @@ defmodule GolfScoring.Scoring.HandicapRecordsTest do
     %{
       event: event,
       round: round,
+      course: course,
       admin: admin,
       entry: entry,
       entries: entries,

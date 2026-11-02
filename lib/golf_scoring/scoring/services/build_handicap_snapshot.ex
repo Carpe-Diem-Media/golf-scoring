@@ -6,6 +6,7 @@ defmodule GolfScoring.Scoring.Services.BuildHandicapSnapshot do
   alias Ash.Changeset
   alias GolfScoring.Competition.RoundTeeProfileSnapshot
   alias GolfScoring.Repo
+  alias GolfScoring.Scoring.Calculators.CourseHandicap
   alias GolfScoring.Scoring.HandicapEntryLock
   alias GolfScoring.Scoring.HandicapRowLock
   alias GolfScoring.Scoring.HandicapSnapshot
@@ -19,6 +20,7 @@ defmodule GolfScoring.Scoring.Services.BuildHandicapSnapshot do
            {:ok, tee} <- load_tee_snapshot(entry.round_tee_profile_snapshot_id, entry.round_id),
            {:ok, unrounded} <- require_field(attrs, :course_handicap_unrounded),
            {:ok, rounded} <- require_field(attrs, :course_handicap_rounded),
+           :ok <- validate_output(snapshot, tee, unrounded, rounded),
            {:ok, built} <-
              snapshot
              |> Changeset.for_update(:build_internal, %{
@@ -36,6 +38,31 @@ defmodule GolfScoring.Scoring.Services.BuildHandicapSnapshot do
       end
     end)
     |> normalize_result()
+  end
+
+  defp validate_output(snapshot, tee, unrounded, rounded) do
+    basis =
+      case snapshot.basis_source do
+        source when source in [:official_or_preloaded, :player_declared] ->
+          snapshot.source_handicap_index
+
+        source when source in [:committee_deemed, :committee_override] ->
+          snapshot.deemed_handicap_basis
+      end
+
+    {:ok, calculated} =
+      CourseHandicap.calculate(basis, tee.slope_rating, tee.course_rating, tee.applicable_par)
+
+    case Decimal.cast(unrounded) do
+      {:ok, value} ->
+        if Decimal.equal?(value, calculated.course_handicap_unrounded) and
+             rounded === calculated.course_handicap_rounded,
+           do: :ok,
+           else: {:error, :stale_handicap_output}
+
+      :error ->
+        {:error, :stale_handicap_output}
+    end
   end
 
   defp fetch_configured_snapshot(round_entry_id) do
