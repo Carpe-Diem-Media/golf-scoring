@@ -1,0 +1,3 @@
+sloplint: clean. 0 FAIL, 0 REFLEX, 0 WARN across 0 file(s) and 2 URL(s).
+render tier not run: no puppeteer-core found locally, globally or via HALLMARK_PUPPETEER
+before: recorded 0 links, 0 fields, 0 handlers, 0 test hooks, 0 script hooks in .hallmark/before.json; --kept checks a redesign against it

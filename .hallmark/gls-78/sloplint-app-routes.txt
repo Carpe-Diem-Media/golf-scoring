@@ -1,0 +1,4 @@
+assets/css/app.css
+  FAIL 20 :1 no Hallmark stamp on the first non-empty line of any CSS | fix: The stamp comment is line 1 of the CSS; only @charset may precede it
+sloplint: 1 FAIL, 0 WARN across 1 file(s) and 2 URL(s).
+render tier not run: no puppeteer-core found locally, globally or via HALLMARK_PUPPETEER

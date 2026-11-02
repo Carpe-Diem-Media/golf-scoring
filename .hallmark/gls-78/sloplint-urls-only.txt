@@ -1,0 +1,2 @@
+sloplint: clean. 0 FAIL, 0 REFLEX, 0 WARN across 0 file(s) and 2 URL(s).
+render tier not run: no puppeteer-core found locally, globally or via HALLMARK_PUPPETEER

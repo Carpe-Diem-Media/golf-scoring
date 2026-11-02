@@ -44,12 +44,13 @@ defmodule GolfScoringWeb.Player.HomeLiveTest do
 
     {:ok, view, html} = live(conn, ~p"/player")
 
-    assert html =~ "Pat Player"
+    assert html =~ "Your player access is active"
     assert has_element?(view, "#player-application-shell")
     assert has_element?(view, "#player-shell-nav")
     assert has_element?(view, "#player-home")
     assert has_element?(view, "#player-nav-home[aria-current=\"page\"]")
     refute html =~ setup.event.id
+    refute html =~ setup.player.id
   end
 
   test "revoked grant cannot mount player home", %{conn: conn, setup: setup} do

@@ -5,7 +5,6 @@ defmodule GolfScoringWeb.AppShell do
   use GolfScoringWeb, :html
 
   alias GolfScoring.Accounts.StaffUser
-  alias Phoenix.LiveView.JS
 
   @doc """
   Staff / admin operational shell.
@@ -36,7 +35,11 @@ defmodule GolfScoringWeb.AppShell do
       |> assign(:system_admin?, system_admin?(assigns.current_staff_user))
 
     ~H"""
-    <div id="staff-application-shell" class="min-h-dvh flex flex-col bg-base-200/40">
+    <div
+      id="staff-application-shell"
+      phx-hook=".StaffMobileNav"
+      class="min-h-dvh flex flex-col bg-base-200/40"
+    >
       <header
         id="staff-shell-header"
         class="sticky top-0 z-40 border-b border-base-300 bg-base-100/95 backdrop-blur-sm"
@@ -45,12 +48,12 @@ defmodule GolfScoringWeb.AppShell do
           <button
             type="button"
             id="staff-shell-menu-toggle"
-            class="btn btn-ghost btn-square min-h-11 min-w-11 lg:hidden"
+            class="inline-flex min-h-11 min-w-11 shrink-0 items-center justify-center rounded-lg text-base-content hover:bg-base-200 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary lg:hidden"
             aria-controls={@mobile_nav_id}
             aria-expanded="false"
-            phx-click={JS.toggle(to: "##{@mobile_nav_id}", display: "flex")}
+            aria-haspopup="true"
           >
-            <span class="sr-only">Open navigation</span>
+            <span class="sr-only">Open navigation menu</span>
             <.icon name="hero-bars-3" class="size-6" />
           </button>
 
@@ -59,7 +62,12 @@ defmodule GolfScoringWeb.AppShell do
             class="flex min-h-11 items-center gap-2 rounded-lg px-2 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary"
           >
             <span class="text-base font-semibold tracking-tight text-base-content">Golf Scoring</span>
-            <span :if={@system_admin?} class="badge badge-outline badge-sm">System admin</span>
+            <span
+              :if={@system_admin?}
+              class="inline-flex items-center rounded-md border border-base-300 px-2 py-0.5 text-xs font-medium text-base-content/80"
+            >
+              System admin
+            </span>
           </.link>
 
           <div class="ml-auto flex items-center gap-2">
@@ -67,7 +75,7 @@ defmodule GolfScoringWeb.AppShell do
               href={~p"/admin/sign-out"}
               method="delete"
               id="staff-sign-out"
-              class="btn btn-ghost min-h-11 px-3 text-sm"
+              class="inline-flex min-h-11 items-center rounded-lg px-3 text-sm font-medium text-base-content hover:bg-base-200 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary"
             >
               Sign out
             </.link>
@@ -91,8 +99,20 @@ defmodule GolfScoringWeb.AppShell do
         <nav
           id={@mobile_nav_id}
           aria-label="Staff primary mobile"
-          class="hidden fixed inset-x-0 top-[3.25rem] z-30 max-h-[calc(100dvh-3.25rem)] flex-col gap-1 overflow-y-auto border-b border-base-300 bg-base-100 p-4 shadow-lg lg:hidden"
+          hidden
+          class="fixed inset-x-0 top-[3.25rem] z-30 max-h-[calc(100dvh-3.25rem)] flex-col gap-1 overflow-y-auto border-b border-base-300 bg-base-100 p-4 shadow-lg lg:hidden"
         >
+          <div class="mb-3 flex items-center justify-between gap-2">
+            <p class="text-sm font-medium text-base-content">Menu</p>
+            <button
+              type="button"
+              id="staff-shell-menu-close"
+              class="inline-flex min-h-11 min-w-11 items-center justify-center rounded-lg text-base-content hover:bg-base-200 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary"
+            >
+              <span class="sr-only">Close navigation menu</span>
+              <.icon name="hero-x-mark" class="size-5" />
+            </button>
+          </div>
           <.staff_nav_links items={@primary_nav} id_suffix="-mobile" />
           <div :if={@event_nav != []} class="mt-4 border-t border-base-300 pt-4">
             <p class="mb-2 px-3 text-sm text-base-content/70">Event workspace</p>
@@ -114,6 +134,74 @@ defmodule GolfScoringWeb.AppShell do
           {render_slot(@inner_block)}
         </main>
       </div>
+    </div>
+    <script :type={Phoenix.LiveView.ColocatedHook} name=".StaffMobileNav">
+      export default {
+        mounted() {
+          this.toggleBtn = this.el.querySelector("#staff-shell-menu-toggle")
+          this.closeBtn = this.el.querySelector("#staff-shell-menu-close")
+          this.drawer = this.el.querySelector("#staff-mobile-nav")
+
+          this.onToggle = () => this.setOpen(!this.isOpen())
+          this.onClose = () => this.setOpen(false)
+          this.onKeydown = (event) => {
+            if (event.key === "Escape" && this.isOpen()) {
+              event.preventDefault()
+              this.setOpen(false)
+              this.toggleBtn?.focus()
+            }
+          }
+
+          this.toggleBtn?.addEventListener("click", this.onToggle)
+          this.closeBtn?.addEventListener("click", this.onClose)
+          document.addEventListener("keydown", this.onKeydown)
+          this.setOpen(false)
+        },
+        destroyed() {
+          this.toggleBtn?.removeEventListener("click", this.onToggle)
+          this.closeBtn?.removeEventListener("click", this.onClose)
+          document.removeEventListener("keydown", this.onKeydown)
+        },
+        isOpen() {
+          return this.drawer && !this.drawer.hidden
+        },
+        setOpen(open) {
+          if (!this.drawer || !this.toggleBtn) return
+          this.drawer.hidden = !open
+          this.toggleBtn.setAttribute("aria-expanded", open ? "true" : "false")
+          if (open) {
+            this.closeBtn?.focus()
+          }
+        }
+      }
+    </script>
+    """
+  end
+
+  @doc """
+  Minimal player surface for denied or guest states (no authenticated navigation).
+  """
+  attr :flash, :map, required: true
+  attr :page_title, :string, required: true
+
+  slot :inner_block, required: true
+
+  def player_guest(assigns) do
+    ~H"""
+    <div id="player-access-denied-shell" class="min-h-dvh flex flex-col bg-base-100">
+      <header
+        id="player-guest-header"
+        class="border-b border-base-300 bg-base-100/95 backdrop-blur-sm"
+      >
+        <div class="mx-auto max-w-lg px-4 py-4">
+          <p class="text-sm text-base-content/70">Golf Scoring</p>
+          <h1 class="text-lg font-semibold tracking-tight text-base-content">{@page_title}</h1>
+        </div>
+      </header>
+
+      <main id="player-guest-main" class="mx-auto w-full max-w-lg flex-1 px-4 py-5">
+        {render_slot(@inner_block)}
+      </main>
     </div>
     """
   end
@@ -265,7 +353,7 @@ defmodule GolfScoringWeb.AppShell do
           <div :if={@status_badges != []} class="flex flex-wrap gap-2 pt-1">
             <span
               :for={badge <- @status_badges}
-              class="badge badge-outline badge-sm"
+              class="inline-flex items-center rounded-md border border-base-300 px-2 py-0.5 text-xs font-medium text-base-content/80"
               id={badge[:id]}
             >
               {badge.label}

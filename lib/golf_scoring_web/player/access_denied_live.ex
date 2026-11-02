@@ -5,28 +5,21 @@ defmodule GolfScoringWeb.Player.AccessDeniedLive do
 
   @impl true
   def mount(_params, _session, socket) do
-    {:ok,
-     socket
-     |> assign(:page_title, "Access denied")
-     |> assign(:current_player_access_grant, nil)}
+    {:ok, assign(socket, :page_title, "Access denied")}
   end
 
   @impl true
   def render(assigns) do
     ~H"""
     <Layouts.app flash={@flash}>
-      <AppShell.player
-        flash={@flash}
-        page_title="Access denied"
-        current_path={~p"/player/access-denied"}
-      >
+      <AppShell.player_guest flash={@flash} page_title={@page_title}>
         <section id="player-access-denied" class="space-y-4 py-6">
           <h1 class="text-2xl font-semibold tracking-tight">Access denied</h1>
           <p class="text-base text-base-content/80">
             This player link is invalid, expired, or has been revoked. Ask event staff for a new access link.
           </p>
         </section>
-      </AppShell.player>
+      </AppShell.player_guest>
     </Layouts.app>
     """
   end
