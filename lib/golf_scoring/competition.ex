@@ -10,7 +10,7 @@ defmodule GolfScoring.Competition do
   alias GolfScoring.Competition.Services.ConfigureScoringTrack
   alias GolfScoring.Competition.Services.CreateCompetitionSide
   alias GolfScoring.Competition.Services.HandoverGroupRole
-  alias GolfScoring.Competition.Services.LockScoringTracksForRound
+  alias GolfScoring.Competition.Services.OpenRound
   alias GolfScoring.Competition.Services.RevokeGroupRole
   alias GolfScoring.Competition.Services.SetSideMembership
 
@@ -23,8 +23,6 @@ defmodule GolfScoring.Competition do
     resource GolfScoring.Competition.Round do
       define :create_round, action: :create_round, args: [:event_id, :course_id]
       define :get_round_by_id, action: :read, get_by: [:id]
-      define :mark_round_ready, action: :mark_round_ready
-      define :open_scoring, action: :open_scoring
       define :close_scoring, action: :close_scoring
       define :finalize_round, action: :finalize_round
       define :reopen_round, action: :reopen_round, args: [:reason]
@@ -72,6 +70,12 @@ defmodule GolfScoring.Competition do
 
     resource GolfScoring.Competition.MysteryHoleRule
   end
+
+  def mark_round_ready(actor, event_id, round_id),
+    do: OpenRound.mark_ready(actor, event_id, round_id)
+
+  def open_round(actor, event_id, round_id),
+    do: OpenRound.run(actor, event_id, round_id)
 
   def configure_round_competition(actor, event_id, round_id, attrs) do
     ConfigureRoundCompetition.run(actor, event_id, round_id, attrs)
@@ -197,9 +201,5 @@ defmodule GolfScoring.Competition do
       scoring_track_id,
       round_hole_id
     )
-  end
-
-  def lock_scoring_tracks_for_round(round_id) do
-    LockScoringTracksForRound.run(round_id)
   end
 end

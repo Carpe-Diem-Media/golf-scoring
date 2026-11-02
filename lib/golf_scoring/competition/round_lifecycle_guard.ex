@@ -7,6 +7,7 @@ defmodule GolfScoring.Competition.RoundLifecycleGuard do
   alias GolfScoring.Accounts.EventAuthorityLock
   alias GolfScoring.Audit
   alias GolfScoring.Competition.Round
+  alias GolfScoring.Competition.Services.OpenRound
   alias GolfScoring.Repo
 
   @manager_roles [:event_admin, :competition_manager]
@@ -48,7 +49,8 @@ defmodule GolfScoring.Competition.RoundLifecycleGuard do
     with {:ok, _scope} <- EventAuthorityLock.lock_scope!(event_id, [actor_id]),
          :ok <- authorize_operation(actor_id, event_id, operation),
          {:ok, locked_round} <- lock_round(round.id),
-         {:ok, next_state} <- transition(locked_round.state, operation),
+         {:ok, next_state} <-
+           transition(locked_round.state, operation, changeset.context, locked_round.id),
          :ok <- validate_reopen_reason(changeset, operation) do
       changeset
       |> Map.put(:data, locked_round)
@@ -95,13 +97,28 @@ defmodule GolfScoring.Competition.RoundLifecycleGuard do
     end
   end
 
-  defp transition(:draft, :mark_round_ready) do
-    {:error, "cannot mark Round ready until the complete opening gate can be verified"}
+  defp transition(:draft, :mark_round_ready, context, round_id) do
+    if OpenRound.verified_gate?(
+         context,
+         round_id,
+         :mark_round_ready
+       ),
+       do: {:ok, "ready"},
+       else: {:error, "cannot mark Round ready until the complete opening gate can be verified"}
   end
 
-  defp transition(:ready, :open_scoring) do
-    {:error, "cannot open Round scoring until all hard opening invariants can be verified"}
+  defp transition(:ready, :open_scoring, context, round_id) do
+    if OpenRound.verified_gate?(
+         context,
+         round_id,
+         :open_scoring
+       ),
+       do: {:ok, "scoring_open"},
+       else:
+         {:error, "cannot open Round scoring until all hard opening invariants can be verified"}
   end
+
+  defp transition(state, operation, _context, _round_id), do: transition(state, operation)
 
   defp transition(:scoring_closed, :finalize_round) do
     {:error,

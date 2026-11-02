@@ -186,11 +186,20 @@ defmodule GolfScoring.Competition.RoundTest do
     {:ok, round} = Competition.create_round(event.id, course.id, actor: admin)
     {:ok, _} = ConfigureRoundLayout.run(admin, round.id, Enum.map(holes, & &1.id))
 
-    assert {:error, _error} = Competition.mark_round_ready(round, actor: manager)
+    assert {:error, _error} =
+             round
+             |> Ash.Changeset.for_update(:mark_round_ready, %{}, actor: manager)
+             |> Ash.update()
+
     assert round_state(round.id) == "draft"
 
     ready_round = set_round_state!(round, :ready)
-    assert {:error, _error} = Competition.open_scoring(ready_round, actor: manager)
+
+    assert {:error, _error} =
+             ready_round
+             |> Ash.Changeset.for_update(:open_scoring, %{}, actor: manager)
+             |> Ash.update()
+
     assert round_state(round.id) == "ready"
 
     scoring_open = set_round_state!(round, :scoring_open)
