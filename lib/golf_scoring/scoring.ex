@@ -1,5 +1,5 @@
 defmodule GolfScoring.Scoring do
-  @moduledoc "Handicap snapshots and competition-specific playing handicaps."
+  @moduledoc "Handicap snapshots, competition handicaps, and authoritative score records."
 
   use Ash.Domain
 
@@ -13,6 +13,9 @@ defmodule GolfScoring.Scoring do
   resources do
     resource GolfScoring.Scoring.HandicapSnapshot
     resource GolfScoring.Scoring.CompetitionHandicap
+    resource GolfScoring.Scoring.Scorecard
+    resource GolfScoring.Scoring.HoleResult
+    resource GolfScoring.Scoring.HoleSubmission
   end
 
   def confirm_handicap_input(actor, event_id, round_id, round_entry_id, attrs) do
