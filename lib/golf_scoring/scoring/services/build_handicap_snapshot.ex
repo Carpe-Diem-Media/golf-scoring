@@ -13,7 +13,7 @@ defmodule GolfScoring.Scoring.Services.BuildHandicapSnapshot do
 
   def run(round_entry_id, attrs) when is_map(attrs) do
     Repo.transaction(fn ->
-      with {:ok, entry} <- HandicapEntryLock.lock!(round_entry_id),
+      with {:ok, entry} <- HandicapEntryLock.lock_pre_open!(round_entry_id),
            {:ok, _locked} <- HandicapRowLock.lock_handicap_snapshot!(entry.id),
            {:ok, snapshot} <- fetch_configured_snapshot(entry.id),
            :ok <- assert_tee_alignment(snapshot, entry),

@@ -13,7 +13,7 @@ defmodule GolfScoring.Scoring.Services.BuildCompetitionHandicap do
 
   def run(round_entry_id, round_competition_id, attrs) when is_map(attrs) do
     Repo.transaction(fn ->
-      with {:ok, entry} <- HandicapEntryLock.lock!(round_entry_id),
+      with {:ok, entry} <- HandicapEntryLock.lock_pre_open!(round_entry_id),
            {:ok, _locked_snapshot} <- HandicapRowLock.lock_handicap_snapshot!(entry.id),
            {:ok, snapshot} <- fetch_built_snapshot(entry.id),
            {:ok, competition} <-

@@ -14,7 +14,7 @@ defmodule GolfScoring.Scoring.Services.ConfirmHandicapInputForPlayerGrant do
     Repo.transaction(fn ->
       with :ok <- PlayerAccessGrantGuard.apply_lazy_expiry_for_grant_id(Repo, grant_id),
            {:ok, grant} <- load_active_grant(grant_id),
-           {:ok, entry} <- HandicapEntryLock.lock!(round_entry_id),
+           {:ok, entry} <- HandicapEntryLock.lock_pre_open!(round_entry_id),
            :ok <- validate_grant_scope(grant, entry, round_id),
            :ok <- require_assigned_tee(entry),
            {:ok, hi} <- require_handicap_index(attrs),

@@ -22,7 +22,7 @@ defmodule GolfScoring.Scoring.Services.ConfirmHandicapInput do
     Repo.transaction(fn ->
       with {:ok, _scope} <- EventAuthorityLock.lock_scope!(event_id, [actor_id]),
            :ok <- authorize_staff(actor_id, event_id),
-           {:ok, entry} <- HandicapEntryLock.lock!(round_entry_id),
+           {:ok, entry} <- HandicapEntryLock.lock_pre_open!(round_entry_id),
            :ok <- scope_entry(entry, round_id, event_id),
            :ok <- require_assigned_tee(entry),
            {:ok, hi} <- require_handicap_index(attrs),
