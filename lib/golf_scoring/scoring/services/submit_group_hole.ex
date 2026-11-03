@@ -1301,8 +1301,9 @@ defmodule GolfScoring.Scoring.Services.SubmitGroupHole do
   defp normalize_results(_), do: {:error, :invalid_results}
 
   defp normalize_result(result) when is_map(result) do
-    with {:ok, round_entry_id} <- fetch_uuid(result, "round_entry_id", :round_entry_id) do
-      outcome = Map.get(result, "outcome") || Map.get(result, :outcome)
+    with {:ok, round_entry_id} <- fetch_uuid(result, "round_entry_id", :round_entry_id),
+         {:ok, outcome} <-
+           normalize_input_outcome(Map.get(result, "outcome") || Map.get(result, :outcome)) do
       gross = Map.get(result, "gross_strokes") || Map.get(result, :gross_strokes)
       strokes_taken = Map.get(result, "strokes_taken") || Map.get(result, :strokes_taken)
 
@@ -1317,6 +1318,14 @@ defmodule GolfScoring.Scoring.Services.SubmitGroupHole do
   end
 
   defp normalize_result(_), do: {:error, :invalid_result}
+
+  defp normalize_input_outcome(value) when value in [:holed_out, "holed_out"],
+    do: {:ok, :holed_out}
+
+  defp normalize_input_outcome(value) when value in [:picked_up, "picked_up"],
+    do: {:ok, :picked_up}
+
+  defp normalize_input_outcome(_), do: {:error, :invalid_result}
 
   defp fetch_uuid(map, string_key, atom_key) do
     value = Map.get(map, string_key) || Map.get(map, atom_key)

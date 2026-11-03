@@ -725,6 +725,8 @@ defmodule GolfScoring.Scoring.Services.SubmitGroupHoleTest do
     submissions_before = hole_submission_count_for_round!(setup.round.id)
     audits_before = audit_count_for_round!(setup.round.id)
     group_before = Ash.get!(PlayingGroup, setup.group.id, authorize?: false)
+    scorecards_before = scorecard_facts_for_round!(setup.round.id)
+    assert scorecards_before == []
 
     install_gls34_reject_submit_audit_trigger!()
 
@@ -738,6 +740,11 @@ defmodule GolfScoring.Scoring.Services.SubmitGroupHoleTest do
     assert hole_result_count_for_round!(setup.round.id) == results_before
     assert hole_submission_count_for_round!(setup.round.id) == submissions_before
     assert audit_count_for_round!(setup.round.id) == audits_before
+    assert scorecard_facts_for_round!(setup.round.id) == scorecards_before
+
+    refute Enum.any?(scorecard_facts_for_round!(setup.round.id), fn %{state: state} ->
+             state in [:in_progress, :complete, "in_progress", "complete"]
+           end)
 
     group = Ash.get!(PlayingGroup, setup.group.id, authorize?: false)
     assert group.scoring_revision == group_before.scoring_revision
@@ -749,6 +756,22 @@ defmodule GolfScoring.Scoring.Services.SubmitGroupHoleTest do
     end
 
     refute_receive {:group_hole_submitted, _}, 50
+  end
+
+  test "committed scoring race fixture cleanup removes fixture-owned catalog rows" do
+    fixture = setup_committed_scoring_race_fixture!()
+
+    assert catalog_entity_exists?(:courses, fixture.course.id)
+    assert catalog_entity_exists?(:tee_sets, fixture.tee_set.id)
+    assert catalog_entity_exists?(:tee_rating_profiles, fixture.tee_profile.id)
+    assert course_hole_count!(fixture.course.id) == 18
+
+    cleanup_committed_scoring_fixture!(fixture)
+
+    refute catalog_entity_exists?(:courses, fixture.course.id)
+    refute catalog_entity_exists?(:tee_sets, fixture.tee_set.id)
+    refute catalog_entity_exists?(:tee_rating_profiles, fixture.tee_profile.id)
+    assert course_hole_count!(fixture.course.id) == 0
   end
 
   @tag :real_concurrency
@@ -1228,6 +1251,25 @@ defmodule GolfScoring.Scoring.Services.SubmitGroupHoleTest do
              )
   end
 
+  for invalid_outcome <- ["skipped", "", "bogus"] do
+    test "string outcome #{invalid_outcome} is rejected without raising" do
+      setup = setup_submit_fixture!(2)
+      hole_id = expected_hole_id!(setup)
+
+      command =
+        string_results_command(
+          setup,
+          hole_id,
+          0,
+          unquote(invalid_outcome),
+          setup.entries
+        )
+
+      assert {:error, :invalid_result} =
+               SubmitGroupHole.run(setup.admin, setup.event.id, setup.round.id, command)
+    end
+  end
+
   test "holed_out with nil gross_strokes is rejected" do
     setup = setup_submit_fixture!(2)
     hole_id = expected_hole_id!(setup)
@@ -1474,6 +1516,12 @@ defmodule GolfScoring.Scoring.Services.SubmitGroupHoleTest do
             {"DELETE FROM round_tee_profile_snapshots WHERE round_id = $1::uuid", [round]},
             {"DELETE FROM round_holes WHERE round_id = $1::uuid", [round]},
             {"DELETE FROM rounds WHERE id = $1::uuid", [round]},
+            {"DELETE FROM tee_rating_profiles WHERE id = $1::uuid",
+             [Ecto.UUID.dump!(fixture.tee_profile.id)]},
+            {"DELETE FROM tee_sets WHERE id = $1::uuid", [Ecto.UUID.dump!(fixture.tee_set.id)]},
+            {"DELETE FROM course_holes WHERE course_id = $1::uuid",
+             [Ecto.UUID.dump!(fixture.course.id)]},
+            {"DELETE FROM courses WHERE id = $1::uuid", [Ecto.UUID.dump!(fixture.course.id)]},
             {"DELETE FROM event_staff_assignments WHERE event_id = $1::uuid", [event]},
             {"DELETE FROM player_access_grants WHERE event_id = $1::uuid", [event]},
             {"DELETE FROM events WHERE id = $1::uuid", [event]},
@@ -1732,7 +1780,11 @@ defmodule GolfScoring.Scoring.Services.SubmitGroupHoleTest do
       entries: entries,
       route: route,
       start_hole: start_hole,
-      competition: competition
+      competition: competition,
+      course: course,
+      catalog_holes: holes,
+      tee_set: white,
+      tee_profile: profile
     }
   end
 
@@ -1747,6 +1799,64 @@ defmodule GolfScoring.Scoring.Services.SubmitGroupHoleTest do
       results: results,
       captured_at: DateTime.utc_now()
     }
+  end
+
+  defp string_results_command(setup, round_hole_id, revision, invalid_outcome, entries) do
+    [first | rest] = entries
+
+    results =
+      [
+        %{
+          "round_entry_id" => first.id,
+          "outcome" => invalid_outcome,
+          "gross_strokes" => 4
+        }
+        | Enum.map(rest, fn entry ->
+            %{
+              "round_entry_id" => entry.id,
+              "outcome" => "holed_out",
+              "gross_strokes" => 4
+            }
+          end)
+      ]
+
+    %{
+      "client_submission_id" => Ecto.UUID.generate(),
+      "playing_group_id" => setup.group.id,
+      "round_hole_id" => round_hole_id,
+      "expected_group_score_revision" => revision,
+      "results" => results,
+      "captured_at" => DateTime.utc_now()
+    }
+  end
+
+  defp scorecard_facts_for_round!(round_id) do
+    Scorecard
+    |> Ash.Query.filter(round_id == ^round_id)
+    |> Ash.read!(authorize?: false)
+    |> Enum.map(fn card ->
+      %{id: card.id, round_entry_id: card.round_entry_id, state: card.state}
+    end)
+    |> Enum.sort_by(& &1.id)
+  end
+
+  defp catalog_entity_exists?(table, id)
+       when table in [:courses, :tee_sets, :tee_rating_profiles] do
+    Repo.query!(
+      "SELECT exists(SELECT 1 FROM #{table} WHERE id = $1::uuid)",
+      [Ecto.UUID.dump!(id)]
+    ).rows
+    |> hd()
+    |> hd()
+  end
+
+  defp course_hole_count!(course_id) do
+    Repo.query!(
+      "SELECT count(*)::int FROM course_holes WHERE course_id = $1::uuid",
+      [Ecto.UUID.dump!(course_id)]
+    ).rows
+    |> hd()
+    |> hd()
   end
 
   defp holed_out_results(entries, strokes, overrides \\ %{}) do

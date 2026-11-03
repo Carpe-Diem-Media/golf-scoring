@@ -375,6 +375,21 @@ defmodule GolfScoring.LockProtocolTest do
     end
   end
 
+  test "committed representative fixture cleanup removes fixture-owned course catalog rows" do
+    fixture =
+      Sandbox.unboxed_run(Repo, fn ->
+        setup_representative_fixture!()
+      end)
+
+    course_id = fixture.round.course_id
+    assert course_catalog_exists?(course_id)
+
+    cleanup_committed_representative_fixture!(fixture)
+
+    refute course_catalog_exists?(course_id)
+    assert course_hole_count_for_course!(course_id) == 0
+  end
+
   test "score_row locks scorecards in stable UUID order with row facts" do
     fixture = setup_representative_fixture!()
 
@@ -571,6 +586,7 @@ defmodule GolfScoring.LockProtocolTest do
       side: side,
       side_result: side_result,
       mystery_rule: rule,
+      player: player,
       admin: admin
     }
   end
@@ -613,9 +629,14 @@ defmodule GolfScoring.LockProtocolTest do
             {"DELETE FROM round_competitions WHERE round_id = $1::uuid", [round]},
             {"DELETE FROM round_holes WHERE round_id = $1::uuid", [round]},
             {"DELETE FROM rounds WHERE id = $1::uuid", [round]},
+            {"DELETE FROM course_holes WHERE course_id = $1::uuid",
+             [Ecto.UUID.dump!(fixture.round.course_id)]},
+            {"DELETE FROM courses WHERE id = $1::uuid",
+             [Ecto.UUID.dump!(fixture.round.course_id)]},
             {"DELETE FROM event_staff_assignments WHERE event_id = $1::uuid", [event]},
             {"DELETE FROM events WHERE id = $1::uuid", [event]},
-            {"DELETE FROM staff_users WHERE id = $1::uuid", [staff]}
+            {"DELETE FROM staff_users WHERE id = $1::uuid", [staff]},
+            {"DELETE FROM players WHERE id = $1::uuid", [Ecto.UUID.dump!(fixture.player.id)]}
           ] do
         Repo.query!(sql, args)
       end
@@ -761,6 +782,24 @@ defmodule GolfScoring.LockProtocolTest do
       "INSERT INTO event_staff_assignments (event_id, staff_user_id, role, status) VALUES ($1::uuid, $2::uuid, 'event_admin', 'active')",
       [Ecto.UUID.dump!(event.id), Ecto.UUID.dump!(staff.id)]
     )
+  end
+
+  defp course_catalog_exists?(course_id) do
+    Repo.query!(
+      "SELECT exists(SELECT 1 FROM courses WHERE id = $1::uuid)",
+      [Ecto.UUID.dump!(course_id)]
+    ).rows
+    |> hd()
+    |> hd()
+  end
+
+  defp course_hole_count_for_course!(course_id) do
+    Repo.query!(
+      "SELECT count(*)::int FROM course_holes WHERE course_id = $1::uuid",
+      [Ecto.UUID.dump!(course_id)]
+    ).rows
+    |> hd()
+    |> hd()
   end
 
   defp create_course!(event, admin) do
