@@ -38,7 +38,7 @@ defmodule GolfScoringWeb.AppShell do
     <div
       id="staff-application-shell"
       phx-hook=".StaffMobileNav"
-      class="min-h-dvh flex flex-col bg-base-200/40"
+      class="min-h-dvh flex flex-col bg-base-100"
     >
       <header
         id="staff-shell-header"
@@ -120,7 +120,7 @@ defmodule GolfScoringWeb.AppShell do
           </div>
         </nav>
 
-        <main id="staff-shell-main" class="min-w-0 flex-1 px-4 py-6 sm:px-6 lg:px-0">
+        <main id="staff-shell-main" class="min-w-0 flex-1 px-4 py-8 sm:px-6 lg:py-10 lg:px-0">
           <.staff_page_header
             eyebrow={@eyebrow}
             page_title={@page_title}
@@ -199,7 +199,7 @@ defmodule GolfScoringWeb.AppShell do
         </div>
       </header>
 
-      <main id="player-guest-main" class="mx-auto w-full max-w-lg flex-1 px-4 py-5">
+      <main id="player-guest-main" class="mx-auto w-full max-w-lg flex-1 px-4 py-8">
         {render_slot(@inner_block)}
       </main>
     </div>
@@ -242,7 +242,7 @@ defmodule GolfScoringWeb.AppShell do
         </div>
       </header>
 
-      <main id="player-shell-main" class="mx-auto w-full max-w-lg flex-1 px-4 py-5">
+      <main id="player-shell-main" class="mx-auto w-full max-w-lg flex-1 px-4 py-8">
         {render_slot(@inner_block)}
       </main>
 
@@ -252,7 +252,7 @@ defmodule GolfScoringWeb.AppShell do
         class="fixed inset-x-0 bottom-0 z-40 border-t border-base-300 bg-base-100/95 backdrop-blur-sm"
       >
         <ul class="mx-auto grid max-w-lg grid-cols-3 gap-1 px-2 py-2">
-          <li :for={item <- @nav}>
+          <li :for={item <- @nav} class="min-w-0">
             <.player_nav_item item={item} />
           </li>
         </ul>
@@ -326,7 +326,7 @@ defmodule GolfScoringWeb.AppShell do
 
   defp staff_page_header(assigns) do
     ~H"""
-    <header id="staff-page-header" class="mb-8 space-y-3">
+    <header id="staff-page-header" class="mb-10 space-y-3">
       <nav :if={@breadcrumbs != []} id="staff-breadcrumbs" aria-label="Breadcrumb">
         <ol class="flex flex-wrap items-center gap-2 text-sm text-base-content/70">
           <li :for={{crumb, idx} <- Enum.with_index(@breadcrumbs)}>

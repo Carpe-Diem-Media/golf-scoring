@@ -13,9 +13,8 @@ defmodule GolfScoringWeb.Player.AccessDeniedLive do
     ~H"""
     <Layouts.app flash={@flash}>
       <AppShell.player_guest flash={@flash} page_title={@page_title}>
-        <section id="player-access-denied" class="space-y-4 py-6">
-          <h1 class="text-2xl font-semibold tracking-tight">Access denied</h1>
-          <p class="text-base text-base-content/80">
+        <section id="player-access-denied" class="max-w-prose space-y-6">
+          <p class="text-base leading-relaxed text-base-content/80">
             This player link is invalid, expired, or has been revoked. Ask event staff for a new access link.
           </p>
         </section>

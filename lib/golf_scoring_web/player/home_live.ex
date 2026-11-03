@@ -20,7 +20,7 @@ defmodule GolfScoringWeb.Player.HomeLive do
         page_title={@page_title}
         current_path={@current_path}
       >
-        <section id="player-home" class="space-y-6">
+        <section id="player-home" class="space-y-10">
           <div class="space-y-2">
             <h2 class="text-xl font-semibold tracking-tight">Welcome</h2>
             <p class="text-sm text-base-content/80">

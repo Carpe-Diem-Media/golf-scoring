@@ -1,0 +1,21 @@
+Hallmark layout audit (DESIGN.md locked system)
+
+Command:
+node ~/.agents/skills/hallmark/scripts/sloplint.mjs \
+  lib/golf_scoring_web/components/app_shell.ex \
+  lib/golf_scoring_web/components/core_components.ex \
+  lib/golf_scoring_web/player/access_denied_live.ex \
+  lib/golf_scoring_web/player/home_live.ex \
+  --genre modern-minimal --scope app --render \
+  --url http://127.0.0.1:4102/player/access-denied \
+  --url http://127.0.0.1:4102/player
+
+Result: PASS — 0 FAIL, 0 REFLEX, 0 WARN (see layout-audit-render.txt)
+
+Layout adjustments applied (DESIGN.md § Layout):
+- White canvas staff shell (bg-base-100)
+- 40px section rhythm (mb-10, py-8/py-10, space-y-10)
+- overflow-x: clip on html/body
+- Capped measure on access denied copy (max-w-prose)
+- Removed duplicate h1 on player access denied
+- min-w-0 on player nav grid cells

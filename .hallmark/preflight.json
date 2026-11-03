@@ -1,0 +1,20 @@
+{
+  "scanned": "2026-11-03",
+  "findings": {
+    "design_system": "DESIGN.md (locked): capped containers, 40px section rhythm (spacing.2xl), white canvas, 16px card padding",
+    "framework": "Phoenix LiveView + Tailwind v4 + daisyUI theme tokens in assets/css/app.css",
+    "fonts": "System / theme defaults (not Raleway migration in this pass)",
+    "palette": "daisyUI light/dark base-* tokens; DESIGN.md colors documented for future token mapping"
+  },
+  "preserve": [
+    "AppShell routes, nav wiring, LiveView hooks",
+    "max-w-7xl staff / max-w-lg player containers",
+    "Existing daisyUI component usage"
+  ],
+  "introduce": [
+    "overflow-x: clip on html/body (Hallmark gate 34)",
+    "40px vertical rhythm on shell mains and page sections",
+    "min-w-0 on player bottom-nav grid cells",
+    "Single page title in player guest header (removed duplicate h1)"
+  ]
+}
