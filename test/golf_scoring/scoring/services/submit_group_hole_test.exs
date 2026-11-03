@@ -10,6 +10,7 @@ defmodule GolfScoring.Scoring.Services.SubmitGroupHoleTest do
   alias GolfScoring.Audit.AuditEvent
   alias GolfScoring.Competition
   alias GolfScoring.Competition.Event
+  alias GolfScoring.Competition.GroupRoleAssignment
   alias GolfScoring.Competition.Player
   alias GolfScoring.Competition.PlayingGroup
   alias GolfScoring.Competition.Round
@@ -19,7 +20,6 @@ defmodule GolfScoring.Scoring.Services.SubmitGroupHoleTest do
   alias GolfScoring.Competition.Services.ConfigureRoundCompetition
   alias GolfScoring.Competition.Services.ConfigureRoundLayout
   alias GolfScoring.Competition.Services.SnapshotRoundTeeProfiles
-  alias GolfScoring.Competition.GroupRoleAssignment
   alias GolfScoring.GolfCatalog
   alias GolfScoring.Repo
   alias GolfScoring.Scoring

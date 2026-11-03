@@ -39,9 +39,8 @@ defmodule GolfScoring.Scoring.Services.SubmitGroupHole do
   defp run_transaction(actor, event_id, round_id, cmd) do
     result =
       Repo.transaction(fn ->
-        with {:ok, outcome} <- execute(actor, event_id, round_id, cmd) do
-          outcome
-        else
+        case execute(actor, event_id, round_id, cmd) do
+          {:ok, outcome} -> outcome
           {:error, reason} -> Repo.rollback(reason)
         end
       end)
@@ -252,13 +251,17 @@ defmodule GolfScoring.Scoring.Services.SubmitGroupHole do
 
   defp advance_entries(entries, first_hole?, final_hole?) do
     Enum.reduce_while(entries, :ok, fn entry, :ok ->
-      with :ok <- if(first_hole?, do: mark_entry_active(entry.id), else: :ok),
-           :ok <- if(final_hole?, do: mark_entry_completed(entry.id), else: :ok) do
-        {:cont, :ok}
-      else
+      case advance_entry_participation(entry.id, first_hole?, final_hole?) do
+        :ok -> {:cont, :ok}
         {:error, reason} -> {:halt, {:error, reason}}
       end
     end)
+  end
+
+  defp advance_entry_participation(entry_id, first_hole?, final_hole?) do
+    with :ok <- if(first_hole?, do: mark_entry_active(entry_id), else: :ok) do
+      if final_hole?, do: mark_entry_completed(entry_id), else: :ok
+    end
   end
 
   defp mark_entry_active(entry_id) do
@@ -287,9 +290,8 @@ defmodule GolfScoring.Scoring.Services.SubmitGroupHole do
     group = Ash.get!(PlayingGroup, group_id, authorize?: false)
 
     with :ok <- if(first_hole?, do: mark_group_playing(group), else: :ok),
-         :ok <- increment_revision(group),
-         :ok <- if(final_hole?, do: mark_group_finished(group_id), else: :ok) do
-      :ok
+         :ok <- increment_revision(group) do
+      if final_hole?, do: mark_group_finished(group_id), else: :ok
     end
   end
 
@@ -761,18 +763,24 @@ defmodule GolfScoring.Scoring.Services.SubmitGroupHole do
   defp invalid_result_shape?(_), do: true
 
   defp validate_outcomes(entries, cmd, round_hole_id, round_id) do
-    competition = load_primary_competition(round_id)
+    case load_primary_competition(round_id) do
+      {:ok, competition} ->
+        validate_all_outcomes(entries, cmd, round_hole_id, competition)
 
-    with {:ok, competition} <- competition do
-      Enum.reduce_while(entries, :ok, fn entry, :ok ->
-        result = Enum.find(cmd.results, &(&1.round_entry_id == entry.id))
-
-        case validate_one_outcome(entry, result, round_hole_id, competition) do
-          :ok -> {:cont, :ok}
-          {:error, reason} -> {:halt, {:error, reason}}
-        end
-      end)
+      {:error, reason} ->
+        {:error, reason}
     end
+  end
+
+  defp validate_all_outcomes(entries, cmd, round_hole_id, competition) do
+    Enum.reduce_while(entries, :ok, fn entry, :ok ->
+      result = Enum.find(cmd.results, &(&1.round_entry_id == entry.id))
+
+      case validate_one_outcome(entry, result, round_hole_id, competition) do
+        :ok -> {:cont, :ok}
+        {:error, reason} -> {:halt, {:error, reason}}
+      end
+    end)
   end
 
   defp load_primary_competition(round_id) do
@@ -797,10 +805,10 @@ defmodule GolfScoring.Scoring.Services.SubmitGroupHole do
         end
 
       :picked_up ->
-        if not is_nil(result.gross_strokes) do
-          {:error, :picked_up_with_gross}
-        else
+        if is_nil(result.gross_strokes) do
           validate_pickup(entry, result, round_hole_id, competition)
+        else
+          {:error, :picked_up_with_gross}
         end
     end
   end
