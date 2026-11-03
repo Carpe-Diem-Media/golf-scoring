@@ -117,6 +117,26 @@ defmodule GolfScoring.Competition.RoundEntry do
       accept [:round_tee_profile_snapshot_id]
       require_atomic? false
     end
+
+    update :mark_participation_active_internal do
+      public? false
+      accept []
+      require_atomic? false
+      atomic_upgrade? false
+
+      change {GolfScoring.Competition.RoundEntryScoringLifecycleGuard,
+              operation: :mark_participation_active}
+    end
+
+    update :mark_participation_completed_internal do
+      public? false
+      accept []
+      require_atomic? false
+      atomic_upgrade? false
+
+      change {GolfScoring.Competition.RoundEntryScoringLifecycleGuard,
+              operation: :mark_participation_completed}
+    end
   end
 
   policies do

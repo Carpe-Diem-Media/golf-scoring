@@ -26,6 +26,7 @@ defmodule GolfScoring.LockProtocol do
     :group_role_assignment,
     :competition_side,
     :competition_side_result,
+    :score_row,
     :mystery_hole_rule
   ]
 
@@ -151,6 +152,8 @@ defmodule GolfScoring.LockProtocol do
   defp lock_class(:competition_side_result, ids),
     do: lock_rows(ids, &lock_competition_side_result/1)
 
+  defp lock_class(:score_row, ids), do: lock_rows(ids, &lock_scorecard/1)
+
   defp lock_class(:mystery_hole_rule, ids), do: lock_rows(ids, &lock_mystery_hole_rule/1)
 
   defp lock_rows(ids, lock_fun) do
@@ -183,19 +186,33 @@ defmodule GolfScoring.LockProtocol do
   defp lock_playing_group(playing_group_id) do
     case Repo.query!(
            """
-           SELECT id::text, round_id::text
+           SELECT id::text, round_id::text, state, scoring_revision, starting_round_hole_id::text
            FROM playing_groups
            WHERE id = $1::uuid
            FOR UPDATE
            """,
            [Ecto.UUID.dump!(playing_group_id)]
          ).rows do
-      [[id, round_id]] ->
-        {:ok, %{id: Ecto.UUID.cast!(id), round_id: Ecto.UUID.cast!(round_id)}}
+      [[id, round_id, state, scoring_revision, starting_round_hole_id]] ->
+        {:ok,
+         %{
+           id: Ecto.UUID.cast!(id),
+           round_id: Ecto.UUID.cast!(round_id),
+           state: state,
+           scoring_revision: scoring_revision,
+           starting_round_hole_id: cast_optional_uuid(starting_round_hole_id)
+         }}
 
       [] ->
         {:error, :playing_group_not_found}
     end
+  end
+
+  defp cast_optional_uuid(nil), do: nil
+
+  defp cast_optional_uuid(value) do
+    {:ok, uuid} = Ecto.UUID.cast(value)
+    uuid
   end
 
   defp lock_group_role_assignment(assignment_id) do
@@ -270,6 +287,30 @@ defmodule GolfScoring.LockProtocol do
 
       [] ->
         {:error, :competition_side_result_not_found}
+    end
+  end
+
+  defp lock_scorecard(scorecard_id) do
+    case Repo.query!(
+           """
+           SELECT id::text, round_id::text, round_entry_id::text, state
+           FROM scorecards
+           WHERE id = $1::uuid
+           FOR UPDATE
+           """,
+           [Ecto.UUID.dump!(scorecard_id)]
+         ).rows do
+      [[id, round_id, round_entry_id, state]] ->
+        {:ok,
+         %{
+           id: Ecto.UUID.cast!(id),
+           round_id: Ecto.UUID.cast!(round_id),
+           round_entry_id: Ecto.UUID.cast!(round_entry_id),
+           state: state
+         }}
+
+      [] ->
+        {:error, :scorecard_not_found}
     end
   end
 

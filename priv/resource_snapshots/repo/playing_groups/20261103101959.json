@@ -1,0 +1,259 @@
+{
+  "attributes": [
+    {
+      "allow_nil?": false,
+      "default": "fragment(\"gen_random_uuid()\")",
+      "generated?": false,
+      "precision": null,
+      "primary_key?": true,
+      "references": null,
+      "scale": null,
+      "size": null,
+      "source": "id",
+      "type": "uuid"
+    },
+    {
+      "allow_nil?": false,
+      "default": "\"not_started\"",
+      "generated?": false,
+      "precision": null,
+      "primary_key?": false,
+      "references": null,
+      "scale": null,
+      "size": null,
+      "source": "state",
+      "type": "text"
+    },
+    {
+      "allow_nil?": true,
+      "default": "nil",
+      "generated?": false,
+      "precision": null,
+      "primary_key?": false,
+      "references": null,
+      "scale": null,
+      "size": null,
+      "source": "starting_position",
+      "type": "bigint"
+    },
+    {
+      "allow_nil?": false,
+      "default": "0",
+      "generated?": false,
+      "precision": null,
+      "primary_key?": false,
+      "references": null,
+      "scale": null,
+      "size": null,
+      "source": "scoring_revision",
+      "type": "bigint"
+    },
+    {
+      "allow_nil?": false,
+      "default": "fragment(\"(now() AT TIME ZONE 'utc')\")",
+      "generated?": false,
+      "precision": null,
+      "primary_key?": false,
+      "references": null,
+      "scale": null,
+      "size": null,
+      "source": "inserted_at",
+      "type": "utc_datetime_usec"
+    },
+    {
+      "allow_nil?": false,
+      "default": "fragment(\"(now() AT TIME ZONE 'utc')\")",
+      "generated?": false,
+      "precision": null,
+      "primary_key?": false,
+      "references": null,
+      "scale": null,
+      "size": null,
+      "source": "updated_at",
+      "type": "utc_datetime_usec"
+    },
+    {
+      "allow_nil?": false,
+      "default": "nil",
+      "generated?": false,
+      "precision": null,
+      "primary_key?": false,
+      "references": {
+        "deferrable": false,
+        "destination_attribute": "id",
+        "destination_attribute_default": null,
+        "destination_attribute_generated": null,
+        "index?": false,
+        "index_where": null,
+        "match_tenant?": false,
+        "match_type": null,
+        "match_with": null,
+        "multitenancy": {
+          "attribute": null,
+          "global": null,
+          "strategy": null
+        },
+        "name": "playing_groups_round_id_fkey",
+        "on_delete": "restrict",
+        "on_update": null,
+        "primary_key?": true,
+        "schema": "public",
+        "table": "rounds"
+      },
+      "scale": null,
+      "size": null,
+      "source": "round_id",
+      "type": "uuid"
+    },
+    {
+      "allow_nil?": true,
+      "default": "nil",
+      "generated?": false,
+      "precision": null,
+      "primary_key?": false,
+      "references": {
+        "deferrable": false,
+        "destination_attribute": "id",
+        "destination_attribute_default": null,
+        "destination_attribute_generated": null,
+        "index?": false,
+        "index_where": null,
+        "match_tenant?": false,
+        "match_type": null,
+        "match_with": {
+          "round_id": "round_id"
+        },
+        "multitenancy": {
+          "attribute": null,
+          "global": null,
+          "strategy": null
+        },
+        "name": "playing_groups_starting_round_hole_id_fkey",
+        "on_delete": "restrict",
+        "on_update": null,
+        "primary_key?": true,
+        "schema": "public",
+        "table": "round_holes"
+      },
+      "scale": null,
+      "size": null,
+      "source": "starting_round_hole_id",
+      "type": "uuid"
+    }
+  ],
+  "base_filter": null,
+  "check_constraints": [
+    {
+      "attribute": [
+        "state"
+      ],
+      "base_filter": null,
+      "check": "state IN ('not_started', 'playing', 'attention_required', 'finished_playing')",
+      "name": "playing_groups_state_must_be_valid"
+    },
+    {
+      "attribute": [
+        "starting_position"
+      ],
+      "base_filter": null,
+      "check": "starting_position IS NULL OR starting_position > 0",
+      "name": "playing_groups_starting_position_must_be_positive"
+    },
+    {
+      "attribute": [
+        "starting_round_hole_id"
+      ],
+      "base_filter": null,
+      "check": "(starting_round_hole_id IS NULL AND starting_position IS NULL) OR (starting_round_hole_id IS NOT NULL AND starting_position IS NOT NULL)",
+      "name": "playing_groups_start_assignment_must_be_complete"
+    },
+    {
+      "attribute": [
+        "scoring_revision"
+      ],
+      "base_filter": null,
+      "check": "scoring_revision >= 0",
+      "name": "playing_groups_scoring_revision_non_negative"
+    }
+  ],
+  "create_table_options": null,
+  "custom_indexes": [
+    {
+      "all_tenants?": false,
+      "concurrently": false,
+      "error_fields": [
+        "round_id"
+      ],
+      "fields": [
+        {
+          "type": "atom",
+          "value": "round_id"
+        }
+      ],
+      "include": null,
+      "include_base_filter?": true,
+      "message": null,
+      "name": null,
+      "nulls_distinct": true,
+      "prefix": null,
+      "table": null,
+      "unique": false,
+      "using": null,
+      "where": null
+    }
+  ],
+  "custom_statements": [],
+  "has_create_action": true,
+  "hash": "A77999EC94AA3C84906E9D2D84486A4443193CDFBC68A6582DD17F9E4639B3F3",
+  "identities": [
+    {
+      "all_tenants?": false,
+      "base_filter": null,
+      "index_name": "playing_groups_unique_id_per_round_index",
+      "keys": [
+        {
+          "type": "atom",
+          "value": "id"
+        },
+        {
+          "type": "atom",
+          "value": "round_id"
+        }
+      ],
+      "name": "unique_id_per_round",
+      "nils_distinct?": true,
+      "where": null
+    },
+    {
+      "all_tenants?": false,
+      "base_filter": null,
+      "index_name": "playing_groups_unique_start_slot_index",
+      "keys": [
+        {
+          "type": "atom",
+          "value": "round_id"
+        },
+        {
+          "type": "atom",
+          "value": "starting_round_hole_id"
+        },
+        {
+          "type": "atom",
+          "value": "starting_position"
+        }
+      ],
+      "name": "unique_start_slot_per_round",
+      "nils_distinct?": true,
+      "where": null
+    }
+  ],
+  "multitenancy": {
+    "attribute": null,
+    "global": null,
+    "strategy": null
+  },
+  "repo": "Elixir.GolfScoring.Repo",
+  "schema": null,
+  "table": "playing_groups",
+  "temporal": null
+}

@@ -9,6 +9,7 @@ defmodule GolfScoring.Scoring do
   alias GolfScoring.Scoring.Services.ConfirmHandicapInput
   alias GolfScoring.Scoring.Services.ConfirmHandicapInputForPlayerGrant
   alias GolfScoring.Scoring.Services.OverrideHandicapBasis
+  alias GolfScoring.Scoring.Services.SubmitGroupHole
 
   resources do
     resource GolfScoring.Scoring.HandicapSnapshot
@@ -45,5 +46,9 @@ defmodule GolfScoring.Scoring do
 
   def build_competition_handicap(round_entry_id, round_competition_id, attrs) do
     BuildCompetitionHandicap.run(round_entry_id, round_competition_id, attrs)
+  end
+
+  def submit_group_hole(actor, event_id, round_id, command) do
+    SubmitGroupHole.run(actor, event_id, round_id, command)
   end
 end

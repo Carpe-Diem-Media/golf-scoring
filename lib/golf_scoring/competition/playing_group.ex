@@ -36,6 +36,10 @@ defmodule GolfScoring.Competition.PlayingGroup do
                        check:
                          "(starting_round_hole_id IS NULL AND starting_position IS NULL) OR (starting_round_hole_id IS NOT NULL AND starting_position IS NOT NULL)",
                        message: "starting hole and position must both be set or both be unset"
+
+      check_constraint :scoring_revision, "playing_groups_scoring_revision_non_negative",
+        check: "scoring_revision >= 0",
+        message: "scoring revision must be non-negative"
     end
 
     identity_index_names unique_start_slot_per_round: "playing_groups_unique_start_slot_index"
@@ -104,6 +108,14 @@ defmodule GolfScoring.Competition.PlayingGroup do
       change {GolfScoring.Competition.PlayingGroupLifecycleGuard,
               operation: :clear_group_attention}
     end
+
+    update :increment_scoring_revision_internal do
+      public? false
+      accept []
+      require_atomic? false
+      atomic_upgrade? false
+      change GolfScoring.Competition.Changes.IncrementPlayingGroupScoringRevision
+    end
   end
 
   policies do
@@ -131,6 +143,14 @@ defmodule GolfScoring.Competition.PlayingGroup do
       allow_nil? true
       public? false
       constraints min: 1
+    end
+
+    attribute :scoring_revision, :integer do
+      allow_nil? false
+      public? false
+      writable? false
+      default 0
+      constraints min: 0
     end
 
     timestamps()

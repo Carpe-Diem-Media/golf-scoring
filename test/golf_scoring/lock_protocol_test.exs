@@ -297,14 +297,142 @@ defmodule GolfScoring.LockProtocolTest do
   test "future lock classes are rejected without querying their tables" do
     missing_id = Ecto.UUID.generate()
 
-    assert {:error, {:lock_class_not_yet_available, :score_row}} =
+    assert {:error, {:lock_class_not_yet_available, :verification_row}} =
              transaction_error(fn ->
-               LockProtocol.acquire!(score_row: [missing_id])
+               LockProtocol.acquire!(verification_row: [missing_id])
              end)
 
     refute future_table_sql_fragment?("hole_results")
     refute future_table_sql_fragment?("score_queries")
     refute future_table_sql_fragment?("mystery_reveals")
+  end
+
+  test "lock_protocol score_row blocking fixture cleans up committed scorecard" do
+    {card_a, fixture} =
+      Sandbox.unboxed_run(Repo, fn ->
+        fixture = setup_representative_fixture!()
+
+        card =
+          GolfScoring.Scoring.Scorecard
+          |> Changeset.for_create(:create_internal, %{
+            round_id: fixture.round.id,
+            round_entry_id: fixture.assignment.round_entry_id
+          })
+          |> Ash.create!(authorize?: false)
+
+        {card, fixture}
+      end)
+
+    parent = self()
+
+    try do
+      blocker =
+        Task.async(fn ->
+          Sandbox.unboxed_run(Repo, fn ->
+            Repo.transaction(fn ->
+              assert {:ok, _} = LockProtocol.acquire!(score_row: [card_a.id])
+              send(parent, {:gls34_score_row_held, pg_backend_pid()})
+
+              receive do
+                :gls34_release_score_row -> :released
+              after
+                15_000 -> Repo.rollback(:gls34_blocker_timeout)
+              end
+            end)
+          end)
+        end)
+
+      assert_receive {:gls34_score_row_held, _blocker_backend}, 5_000
+
+      waiter =
+        Task.async(fn ->
+          Sandbox.unboxed_run(Repo, fn ->
+            send(parent, {:gls34_score_row_waiter_ready, pg_backend_pid()})
+
+            Repo.transaction(fn ->
+              case LockProtocol.acquire!(score_row: [card_a.id]) do
+                {:ok, _} = ok ->
+                  send(parent, :gls34_score_row_waiter_acquired)
+                  ok
+
+                {:error, reason} ->
+                  Repo.rollback(reason)
+              end
+            end)
+          end)
+        end)
+
+      assert_receive {:gls34_score_row_waiter_ready, waiter_backend}, 5_000
+      await_lock_waiters!([waiter_backend])
+      refute_received_message(:gls34_score_row_waiter_acquired, 200)
+
+      send(blocker.pid, :gls34_release_score_row)
+      assert {:ok, _} = Task.await(blocker, 10_000)
+      assert {:ok, {:ok, %{acquired: [_]}}} = Task.await(waiter, 10_000)
+      assert_received_message(:gls34_score_row_waiter_acquired, 5_000)
+    after
+      cleanup_committed_representative_fixture!(fixture)
+    end
+  end
+
+  test "committed representative fixture cleanup removes fixture-owned course catalog rows" do
+    fixture =
+      Sandbox.unboxed_run(Repo, fn ->
+        setup_representative_fixture!()
+      end)
+
+    course_id = fixture.round.course_id
+    assert course_catalog_exists?(course_id)
+
+    cleanup_committed_representative_fixture!(fixture)
+
+    refute course_catalog_exists?(course_id)
+    assert course_hole_count_for_course!(course_id) == 0
+  end
+
+  test "score_row locks scorecards in stable UUID order with row facts" do
+    fixture = setup_representative_fixture!()
+
+    card_a =
+      GolfScoring.Scoring.Scorecard
+      |> Changeset.for_create(:create_internal, %{
+        round_id: fixture.round.id,
+        round_entry_id: fixture.assignment.round_entry_id
+      })
+      |> Ash.create!(authorize?: false)
+
+    player = create_player!()
+
+    {:ok, entry} =
+      Competition.add_round_entry(fixture.event.id, fixture.round.id, player.id,
+        actor: fixture.admin
+      )
+
+    card_b =
+      GolfScoring.Scoring.Scorecard
+      |> Changeset.for_create(:create_internal, %{
+        round_id: fixture.round.id,
+        round_entry_id: entry.id
+      })
+      |> Ash.create!(authorize?: false)
+
+    [first_id, second_id] = sorted_group_ids(card_a.id, card_b.id)
+
+    assert {:ok, result} =
+             transaction_ok(fn ->
+               LockProtocol.acquire!(score_row: [card_b.id, card_a.id])
+             end)
+
+    assert Enum.map(result.acquired, & &1.class) == [:score_row, :score_row]
+    assert Enum.map(result.acquired, & &1.id) == [first_id, second_id]
+    assert Enum.all?(result.acquired, &match?(%{row: %{state: _}}, &1))
+  end
+
+  test "missing scorecard id returns scorecard_not_found" do
+    assert {:error, :scorecard_not_found} =
+             transaction_error(fn ->
+               LockProtocol.acquire!(score_row: [Ecto.UUID.generate()])
+             end)
   end
 
   test "documented total relation order includes future classes after current rows" do
@@ -322,7 +450,8 @@ defmodule GolfScoring.LockProtocolTest do
            ]
 
     assert :round in LockProtocol.implemented_lock_classes()
-    refute :score_row in LockProtocol.implemented_lock_classes()
+    assert :score_row in LockProtocol.implemented_lock_classes()
+    refute :verification_row in LockProtocol.implemented_lock_classes()
   end
 
   defp transaction_error(fun) do
@@ -456,7 +585,9 @@ defmodule GolfScoring.LockProtocolTest do
       assignment: assignment,
       side: side,
       side_result: side_result,
-      mystery_rule: rule
+      mystery_rule: rule,
+      player: player,
+      admin: admin
     }
   end
 
@@ -474,6 +605,41 @@ defmodule GolfScoring.LockProtocolTest do
         admin_id: admin.id,
         course_id: course.id
       }
+    end)
+  end
+
+  defp cleanup_committed_representative_fixture!(fixture) do
+    Sandbox.unboxed_run(Repo, fn ->
+      round = Ecto.UUID.dump!(fixture.round.id)
+      event = Ecto.UUID.dump!(fixture.event.id)
+      group = Ecto.UUID.dump!(fixture.group.id)
+      staff = Ecto.UUID.dump!(fixture.admin.id)
+      side = Ecto.UUID.dump!(fixture.side.id)
+      track = Ecto.UUID.dump!(fixture.mystery_rule.scoring_track_id)
+
+      for {sql, args} <- [
+            {"DELETE FROM scorecards WHERE round_id = $1::uuid", [round]},
+            {"DELETE FROM mystery_hole_rules WHERE scoring_track_id = $1::uuid", [track]},
+            {"DELETE FROM scoring_tracks WHERE round_id = $1::uuid", [round]},
+            {"DELETE FROM competition_side_results WHERE competition_side_id = $1::uuid", [side]},
+            {"DELETE FROM competition_sides WHERE round_id = $1::uuid", [round]},
+            {"DELETE FROM group_role_assignments WHERE playing_group_id = $1::uuid", [group]},
+            {"DELETE FROM round_entries WHERE round_id = $1::uuid", [round]},
+            {"DELETE FROM playing_groups WHERE id = $1::uuid", [group]},
+            {"DELETE FROM round_competitions WHERE round_id = $1::uuid", [round]},
+            {"DELETE FROM round_holes WHERE round_id = $1::uuid", [round]},
+            {"DELETE FROM rounds WHERE id = $1::uuid", [round]},
+            {"DELETE FROM course_holes WHERE course_id = $1::uuid",
+             [Ecto.UUID.dump!(fixture.round.course_id)]},
+            {"DELETE FROM courses WHERE id = $1::uuid",
+             [Ecto.UUID.dump!(fixture.round.course_id)]},
+            {"DELETE FROM event_staff_assignments WHERE event_id = $1::uuid", [event]},
+            {"DELETE FROM events WHERE id = $1::uuid", [event]},
+            {"DELETE FROM staff_users WHERE id = $1::uuid", [staff]},
+            {"DELETE FROM players WHERE id = $1::uuid", [Ecto.UUID.dump!(fixture.player.id)]}
+          ] do
+        Repo.query!(sql, args)
+      end
     end)
   end
 
@@ -616,6 +782,24 @@ defmodule GolfScoring.LockProtocolTest do
       "INSERT INTO event_staff_assignments (event_id, staff_user_id, role, status) VALUES ($1::uuid, $2::uuid, 'event_admin', 'active')",
       [Ecto.UUID.dump!(event.id), Ecto.UUID.dump!(staff.id)]
     )
+  end
+
+  defp course_catalog_exists?(course_id) do
+    Repo.query!(
+      "SELECT exists(SELECT 1 FROM courses WHERE id = $1::uuid)",
+      [Ecto.UUID.dump!(course_id)]
+    ).rows
+    |> hd()
+    |> hd()
+  end
+
+  defp course_hole_count_for_course!(course_id) do
+    Repo.query!(
+      "SELECT count(*)::int FROM course_holes WHERE course_id = $1::uuid",
+      [Ecto.UUID.dump!(course_id)]
+    ).rows
+    |> hd()
+    |> hd()
   end
 
   defp create_course!(event, admin) do

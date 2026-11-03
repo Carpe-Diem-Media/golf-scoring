@@ -47,6 +47,24 @@ defmodule GolfScoring.Scoring.Scorecard do
 
       accept [:round_id, :round_entry_id]
     end
+
+    update :mark_in_progress_internal do
+      public? false
+      accept []
+      require_atomic? false
+      atomic_upgrade? false
+
+      change {GolfScoring.Scoring.ScorecardScoringLifecycleGuard, operation: :mark_in_progress}
+    end
+
+    update :mark_complete_internal do
+      public? false
+      accept []
+      require_atomic? false
+      atomic_upgrade? false
+
+      change {GolfScoring.Scoring.ScorecardScoringLifecycleGuard, operation: :mark_complete}
+    end
   end
 
   attributes do
