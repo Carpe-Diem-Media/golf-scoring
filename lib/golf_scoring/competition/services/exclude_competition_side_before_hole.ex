@@ -182,18 +182,18 @@ defmodule GolfScoring.Competition.Services.ExcludeCompetitionSideBeforeHole do
              reason
            ),
          :ok <-
-           write_audit(
-             actor_id,
-             event_id,
-             round_id,
-             round_competition_id,
-             side_id,
-             playing_group_id,
-             effective_hole_id,
-             effective_index,
-             reason,
-             excluded.id
-           ),
+           write_audit(%{
+             actor_id: actor_id,
+             event_id: event_id,
+             round_id: round_id,
+             round_competition_id: round_competition_id,
+             side_id: side_id,
+             playing_group_id: playing_group_id,
+             effective_hole_id: effective_hole_id,
+             effective_index: effective_index,
+             reason: reason,
+             result_id: excluded.id
+           }),
          {:ok, reveal_result} <-
            recheck_affected_rules(round_id, round_competition_id, route, effective_index) do
       {:ok,
@@ -491,18 +491,18 @@ defmodule GolfScoring.Competition.Services.ExcludeCompetitionSideBeforeHole do
     end
   end
 
-  defp write_audit(
-         actor_id,
-         event_id,
-         round_id,
-         round_competition_id,
-         side_id,
-         playing_group_id,
-         effective_hole_id,
-         effective_index,
-         reason,
-         result_id
-       ) do
+  defp write_audit(%{
+         actor_id: actor_id,
+         event_id: event_id,
+         round_id: round_id,
+         round_competition_id: round_competition_id,
+         side_id: side_id,
+         playing_group_id: playing_group_id,
+         effective_hole_id: effective_hole_id,
+         effective_index: effective_index,
+         reason: reason,
+         result_id: result_id
+       }) do
     attrs = %{
       actor_staff_user_id: actor_id,
       action: "exclude_competition_side_before_hole",

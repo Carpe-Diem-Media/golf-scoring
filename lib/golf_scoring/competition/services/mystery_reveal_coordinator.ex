@@ -204,32 +204,33 @@ defmodule GolfScoring.Competition.Services.MysteryRevealCoordinator do
         {:error, :ambiguous_mystery_reveal_cohort}
 
       true ->
-        group_ids =
-          rows
-          |> Enum.map(fn row -> row |> Enum.at(6) |> Ecto.UUID.cast!() end)
-          |> Enum.uniq()
-          |> Enum.sort_by(&Ecto.UUID.dump!/1)
+        side_ids_by_group = cohort_side_ids_by_group(rows)
+        group_ids = Enum.sort_by(Map.keys(side_ids_by_group), &Ecto.UUID.dump!/1)
 
-        side_ids_by_group =
-          rows
-          |> Enum.group_by(fn row -> row |> Enum.at(6) |> Ecto.UUID.cast!() end)
-          |> Map.new(fn {group_id, group_rows} ->
-            side_ids =
-              group_rows
-              |> Enum.map(fn row -> row |> hd() |> Ecto.UUID.cast!() end)
-              |> Enum.uniq()
-              |> Enum.sort_by(&Ecto.UUID.dump!/1)
-
-            {group_id, side_ids}
-          end)
-
-        if group_ids == [] or Enum.any?(group_ids, &(Map.get(side_ids_by_group, &1, []) == [])) do
+        if group_ids == [] or Enum.any?(Map.values(side_ids_by_group), &(&1 == [])) do
           {:error, :empty_mystery_reveal_cohort}
         else
           {:ok, %{group_ids: group_ids, side_ids_by_group: side_ids_by_group}}
         end
     end
   end
+
+  defp cohort_side_ids_by_group(rows) do
+    rows
+    |> Enum.group_by(&cohort_group_id/1)
+    |> Map.new(fn {group_id, group_rows} ->
+      side_ids =
+        group_rows
+        |> Enum.map(&cohort_side_id/1)
+        |> Enum.uniq()
+        |> Enum.sort_by(&Ecto.UUID.dump!/1)
+
+      {group_id, side_ids}
+    end)
+  end
+
+  defp cohort_group_id(row), do: row |> Enum.at(6) |> Ecto.UUID.cast!()
+  defp cohort_side_id([side_id | _rest]), do: Ecto.UUID.cast!(side_id)
 
   defp ambiguous_membership_row?(
          [
@@ -440,11 +441,24 @@ defmodule GolfScoring.Competition.Services.MysteryRevealCoordinator do
   end
 
   defp valid_exclusion_row?(row, round_id, round_competition_id, group_id, start_play_order) do
+    valid_excluded_side?(row, round_id, round_competition_id, group_id) and
+      valid_effective_hole?(row, round_id) and
+      valid_effective_play_index?(row, start_play_order)
+  end
+
+  defp valid_excluded_side?(row, round_id, round_competition_id, group_id) do
     row.state == "excluded" and row.side_round_id == round_id and
       row.side_competition_id == round_competition_id and row.excluded_group_id == group_id and
-      not is_nil(row.effective_hole_id) and row.effective_round_id == round_id and
-      row.preplay_confirmed? == true and is_integer(row.effective_play_index) and
-      row.effective_play_index in 0..17 and is_integer(row.effective_play_order) and
+      row.preplay_confirmed? == true
+  end
+
+  defp valid_effective_hole?(row, round_id) do
+    not is_nil(row.effective_hole_id) and row.effective_round_id == round_id
+  end
+
+  defp valid_effective_play_index?(row, start_play_order) do
+    is_integer(row.effective_play_index) and row.effective_play_index in 0..17 and
+      is_integer(row.effective_play_order) and
       Integer.mod(row.effective_play_order - start_play_order, @scheduled_holes) ==
         row.effective_play_index
   end

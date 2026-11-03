@@ -1,6 +1,8 @@
 defmodule GolfScoring.Competition.CompetitionSideResultLifecycleGuard do
   @moduledoc "Guards CompetitionSideResult transitions; only the pre-play coordinator can exclude a provisional result."
 
+  alias GolfScoring.Competition.Services.ExcludeCompetitionSideBeforeHole
+
   use Ash.Resource.Change
 
   @future_dependency_message "cannot transition CompetitionSideResult until required scoring, verification and readiness evidence is implemented"
@@ -54,17 +56,35 @@ defmodule GolfScoring.Competition.CompetitionSideResultLifecycleGuard do
   end
 
   defp valid_exclusion_evidence?(context, evidence, result) do
-    is_map(evidence) and is_map(result) and
-      GolfScoring.Competition.Services.ExcludeCompetitionSideBeforeHole.verified_exclusion?(
-        context,
-        result.id,
-        result.competition_side_id
-      ) and result.state in [:provisional, "provisional"] and
-      is_binary(evidence.reason) and String.trim(evidence.reason) != "" and
-      match?(%DateTime{}, evidence.excluded_at) and
-      is_integer(evidence.effective_play_index) and evidence.effective_play_index in 0..17 and
-      evidence.preplay_confirmed? == true
+    verified_coordinator_transaction?(context, evidence, result) and
+      provisional_result?(result) and valid_exclusion_provenance?(evidence)
   end
+
+  defp verified_coordinator_transaction?(context, evidence, result)
+       when is_map(evidence) and is_map(result) do
+    ExcludeCompetitionSideBeforeHole.verified_exclusion?(
+      context,
+      result.id,
+      result.competition_side_id
+    )
+  end
+
+  defp verified_coordinator_transaction?(_context, _evidence, _result), do: false
+
+  defp provisional_result?(%{state: state}), do: state in [:provisional, "provisional"]
+  defp provisional_result?(_result), do: false
+
+  defp valid_exclusion_provenance?(%{
+         reason: reason,
+         excluded_at: %DateTime{},
+         effective_play_index: index,
+         preplay_confirmed?: true
+       })
+       when is_binary(reason) and index in 0..17 do
+    String.trim(reason) != ""
+  end
+
+  defp valid_exclusion_provenance?(_evidence), do: false
 
   defp transition_message(:mark_review_required),
     do: "#{@future_dependency_message} for mark_review_required"
