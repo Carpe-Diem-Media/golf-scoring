@@ -307,17 +307,20 @@ defmodule GolfScoring.LockProtocolTest do
     refute future_table_sql_fragment?("mystery_reveals")
   end
 
-  test "score_row second transaction blocks until the first releases" do
-    card_a =
+  test "lock_protocol score_row blocking fixture cleans up committed scorecard" do
+    {card_a, fixture} =
       Sandbox.unboxed_run(Repo, fn ->
         fixture = setup_representative_fixture!()
 
-        GolfScoring.Scoring.Scorecard
-        |> Changeset.for_create(:create_internal, %{
-          round_id: fixture.round.id,
-          round_entry_id: fixture.assignment.round_entry_id
-        })
-        |> Ash.create!(authorize?: false)
+        card =
+          GolfScoring.Scoring.Scorecard
+          |> Changeset.for_create(:create_internal, %{
+            round_id: fixture.round.id,
+            round_entry_id: fixture.assignment.round_entry_id
+          })
+          |> Ash.create!(authorize?: false)
+
+        {card, fixture}
       end)
 
     parent = self()
@@ -368,7 +371,7 @@ defmodule GolfScoring.LockProtocolTest do
       assert {:ok, {:ok, %{acquired: [_]}}} = Task.await(waiter, 10_000)
       assert_received_message(:gls34_score_row_waiter_acquired, 5_000)
     after
-      :ok
+      cleanup_committed_representative_fixture!(fixture)
     end
   end
 
@@ -586,6 +589,36 @@ defmodule GolfScoring.LockProtocolTest do
         admin_id: admin.id,
         course_id: course.id
       }
+    end)
+  end
+
+  defp cleanup_committed_representative_fixture!(fixture) do
+    Sandbox.unboxed_run(Repo, fn ->
+      round = Ecto.UUID.dump!(fixture.round.id)
+      event = Ecto.UUID.dump!(fixture.event.id)
+      group = Ecto.UUID.dump!(fixture.group.id)
+      staff = Ecto.UUID.dump!(fixture.admin.id)
+      side = Ecto.UUID.dump!(fixture.side.id)
+      track = Ecto.UUID.dump!(fixture.mystery_rule.scoring_track_id)
+
+      for {sql, args} <- [
+            {"DELETE FROM scorecards WHERE round_id = $1::uuid", [round]},
+            {"DELETE FROM mystery_hole_rules WHERE scoring_track_id = $1::uuid", [track]},
+            {"DELETE FROM scoring_tracks WHERE round_id = $1::uuid", [round]},
+            {"DELETE FROM competition_side_results WHERE competition_side_id = $1::uuid", [side]},
+            {"DELETE FROM competition_sides WHERE round_id = $1::uuid", [round]},
+            {"DELETE FROM group_role_assignments WHERE playing_group_id = $1::uuid", [group]},
+            {"DELETE FROM round_entries WHERE round_id = $1::uuid", [round]},
+            {"DELETE FROM playing_groups WHERE id = $1::uuid", [group]},
+            {"DELETE FROM round_competitions WHERE round_id = $1::uuid", [round]},
+            {"DELETE FROM round_holes WHERE round_id = $1::uuid", [round]},
+            {"DELETE FROM rounds WHERE id = $1::uuid", [round]},
+            {"DELETE FROM event_staff_assignments WHERE event_id = $1::uuid", [event]},
+            {"DELETE FROM events WHERE id = $1::uuid", [event]},
+            {"DELETE FROM staff_users WHERE id = $1::uuid", [staff]}
+          ] do
+        Repo.query!(sql, args)
+      end
     end)
   end
 

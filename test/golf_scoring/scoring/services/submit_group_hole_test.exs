@@ -19,6 +19,7 @@ defmodule GolfScoring.Scoring.Services.SubmitGroupHoleTest do
   alias GolfScoring.Competition.Services.AssignPlayingGroupStart
   alias GolfScoring.Competition.Services.ConfigureRoundCompetition
   alias GolfScoring.Competition.Services.ConfigureRoundLayout
+  alias GolfScoring.Competition.Services.HandoverGroupRole
   alias GolfScoring.Competition.Services.SnapshotRoundTeeProfiles
   alias GolfScoring.GolfCatalog
   alias GolfScoring.Repo
@@ -29,6 +30,9 @@ defmodule GolfScoring.Scoring.Services.SubmitGroupHoleTest do
   alias GolfScoring.Scoring.HoleSubmission
   alias GolfScoring.Scoring.Scorecard
   alias GolfScoring.Scoring.Services.SubmitGroupHole
+
+  @advisory_submit_audit 9_034_034
+  @advisory_handover_audit 9_034_035
 
   @password "GLS-34 synthetic staff passphrase 2026"
 
@@ -710,110 +714,597 @@ defmodule GolfScoring.Scoring.Services.SubmitGroupHoleTest do
              SubmitGroupHole.run(grant, setup.event.id, setup.round.id, command)
   end
 
-  test "post-write injected failure rolls back all scoring artifacts" do
+  test "late submit_group_hole audit failure rolls back all scoring artifacts" do
     setup = setup_submit_fixture!(2)
     hole_id = expected_hole_id!(setup)
     command = base_command(setup, hole_id, 0, holed_out_results(setup.entries, 4))
 
     Phoenix.PubSub.subscribe(GolfScoring.PubSub, "round:#{setup.round.id}")
 
-    Process.put(:gls34_inject_failure_after_hole_results, true)
-
-    try do
-      assert {:error, :gls34_injected_test_failure} =
-               SubmitGroupHole.run(setup.admin, setup.event.id, setup.round.id, command)
-    after
-      Process.delete(:gls34_inject_failure_after_hole_results)
-    end
-
     results_before = hole_result_count_for_round!(setup.round.id)
     submissions_before = hole_submission_count_for_round!(setup.round.id)
-    audits_before = audit_count!()
+    audits_before = audit_count_for_round!(setup.round.id)
+    group_before = Ash.get!(PlayingGroup, setup.group.id, authorize?: false)
 
-    Process.put(:gls34_inject_failure_after_hole_results, true)
+    install_gls34_reject_submit_audit_trigger!()
 
     try do
-      assert {:error, :gls34_injected_test_failure} =
+      assert {:error, _} =
                SubmitGroupHole.run(setup.admin, setup.event.id, setup.round.id, command)
     after
-      Process.delete(:gls34_inject_failure_after_hole_results)
+      remove_gls34_reject_submit_audit_trigger!()
     end
 
     assert hole_result_count_for_round!(setup.round.id) == results_before
     assert hole_submission_count_for_round!(setup.round.id) == submissions_before
-    assert audit_count!() == audits_before
+    assert audit_count_for_round!(setup.round.id) == audits_before
+
     group = Ash.get!(PlayingGroup, setup.group.id, authorize?: false)
-    assert group.scoring_revision == 0
-    assert group.state == :not_started
+    assert group.scoring_revision == group_before.scoring_revision
+    assert group.state == group_before.state
+
+    for entry <- setup.entries do
+      assert Ash.get!(RoundEntry, entry.id, authorize?: false).participation_status ==
+               :not_started
+    end
+
     refute_receive {:group_hole_submitted, _}, 50
   end
 
   @tag :real_concurrency
   test "simultaneous submissions serialize on the playing group lock" do
-    setup =
+    fixture =
       Sandbox.unboxed_run(Repo, fn ->
         setup_submit_fixture!(2)
       end)
 
-    hole_id = expected_hole_id!(setup)
+    try do
+      hole_id = expected_hole_id!(fixture)
+      parent = self()
+      staff_id = fixture.admin.id
+
+      Sandbox.unboxed_run(Repo, fn ->
+        install_gls34_submit_audit_barrier_trigger!()
+      end)
+
+      lock_holder =
+        Task.async(fn ->
+          Sandbox.unboxed_run(Repo, fn ->
+            Repo.query!("SELECT pg_advisory_lock($1)", [@advisory_submit_audit])
+            send(parent, {:gls34_advisory_held, pg_backend_pid!()})
+
+            receive do
+              :gls34_release_advisory ->
+                Repo.query!("SELECT pg_advisory_unlock($1)", [@advisory_submit_audit])
+            end
+          end)
+        end)
+
+      assert_receive {:gls34_advisory_held, _}, 5_000
+
+      deadline = System.monotonic_time(:millisecond) + 15_000
+
+      task_a =
+        Task.async(fn ->
+          Sandbox.unboxed_run(Repo, fn ->
+            Sandbox.allow(Repo, parent, self())
+            submit_a_pid = pg_backend_pid!()
+            send(parent, {:gls34_submit_a_pid, submit_a_pid})
+
+            SubmitGroupHole.run(
+              %{id: staff_id},
+              fixture.event.id,
+              fixture.round.id,
+              base_command(fixture, hole_id, 0, holed_out_results(fixture.entries, 4))
+            )
+          end)
+        end)
+
+      assert_receive {:gls34_submit_a_pid, submit_a_pid}, 10_000
+      await_backend_advisory_wait!(submit_a_pid, deadline)
+
+      task_b =
+        Task.async(fn ->
+          Sandbox.unboxed_run(Repo, fn ->
+            Sandbox.allow(Repo, parent, self())
+            submit_b_pid = pg_backend_pid!()
+            send(parent, {:gls34_submit_b_pid, submit_b_pid})
+
+            SubmitGroupHole.run(
+              %{id: staff_id},
+              fixture.event.id,
+              fixture.round.id,
+              base_command(fixture, hole_id, 0, holed_out_results(fixture.entries, 5))
+            )
+          end)
+        end)
+
+      assert_receive {:gls34_submit_b_pid, submit_b_pid}, 10_000
+
+      await_blocked_by!(
+        submit_b_pid,
+        submit_a_pid,
+        System.monotonic_time(:millisecond) + 10_000
+      )
+
+      send(lock_holder.pid, :gls34_release_advisory)
+
+      results = [Task.await(task_a, 20_000), Task.await(task_b, 20_000)]
+      Task.await(lock_holder, 10_000)
+
+      oks = Enum.count(results, &match?({:ok, _}, &1))
+      errors = Enum.count(results, &match?({:error, _}, &1))
+
+      assert oks == 1, "expected one acceptance, got #{inspect(results)}"
+      assert errors == 1
+      assert hole_result_count_for_round!(fixture.round.id) == 2
+      assert hole_submission_count_for_round!(fixture.round.id) == 1
+      assert Ash.get!(PlayingGroup, fixture.group.id, authorize?: false).scoring_revision == 1
+    after
+      Sandbox.unboxed_run(Repo, fn ->
+        remove_gls34_submit_audit_barrier_trigger!()
+      end)
+
+      cleanup_committed_scoring_fixture!(fixture)
+    end
+  end
+
+  @tag :real_concurrency
+  test "SubmitGroupHole holds shared locks before HandoverGroupRole proceeds (case A)" do
+    fixture = setup_committed_scoring_race_fixture!()
     parent = self()
-    start_ref = make_ref()
-    staff_id = setup.admin.id
+    deadline = System.monotonic_time(:millisecond) + 15_000
 
-    task_a =
-      Task.async(fn ->
-        Sandbox.unboxed_run(Repo, fn ->
-          Sandbox.allow(Repo, parent, self())
-          send(parent, {start_ref, :ready_a})
+    Sandbox.unboxed_run(Repo, fn ->
+      install_gls34_submit_audit_barrier_trigger!()
+    end)
 
-          receive do
-            ^start_ref -> :go
-          end
+    try do
+      lock_holder =
+        Task.async(fn ->
+          Sandbox.unboxed_run(Repo, fn ->
+            Repo.query!("SELECT pg_advisory_lock($1)", [@advisory_submit_audit])
+            send(parent, {:gls34_advisory_held, pg_backend_pid!()})
 
-          SubmitGroupHole.run(
-            %{id: staff_id},
-            setup.event.id,
-            setup.round.id,
-            base_command(setup, hole_id, 0, holed_out_results(setup.entries, 4))
-          )
+            receive do
+              :gls34_release_advisory ->
+                Repo.query!("SELECT pg_advisory_unlock($1)", [@advisory_submit_audit])
+            end
+          end)
         end)
+
+      assert_receive {:gls34_advisory_held, _}, 5_000
+
+      submit =
+        Task.async(fn ->
+          Sandbox.unboxed_run(Repo, fn ->
+            submit_pid = pg_backend_pid!()
+            send(parent, {:gls34_submit_started, submit_pid})
+            player_submit_command!(fixture)
+          end)
+        end)
+
+      assert_receive {:gls34_submit_started, submit_pid}, 10_000
+      await_backend_advisory_wait!(submit_pid, deadline)
+
+      handover =
+        Task.async(fn ->
+          Sandbox.unboxed_run(Repo, fn ->
+            handover_pid = pg_backend_pid!()
+            send(parent, {:gls34_handover_started, handover_pid})
+
+            HandoverGroupRole.run(
+              fixture.admin,
+              fixture.event.id,
+              fixture.round.id,
+              fixture.group.id,
+              fixture.successor_entry_id,
+              :primary_scorer
+            )
+          end)
+        end)
+
+      assert_receive {:gls34_handover_started, handover_pid}, 10_000
+
+      await_blocked_by!(
+        handover_pid,
+        submit_pid,
+        System.monotonic_time(:millisecond) + 10_000
+      )
+
+      send(lock_holder.pid, :gls34_release_advisory)
+
+      assert {:ok, _receipt} = Task.await(submit, 20_000)
+      assert {:ok, successor} = Task.await(handover, 20_000)
+      Task.await(lock_holder, 10_000)
+
+      assert successor.round_entry_id == fixture.successor_entry_id
+      assert successor.assignment_version == fixture.assignment_version + 1
+      assert hole_submission_count_for_round!(fixture.round.id) == 1
+      assert hole_result_count_for_round!(fixture.round.id) == 2
+      assert Ash.get!(PlayingGroup, fixture.group.id, authorize?: false).scoring_revision == 1
+
+      handed_over =
+        GroupRoleAssignment
+        |> Ash.get!(fixture.assignment_id, authorize?: false)
+
+      assert handed_over.state == :handed_over
+    after
+      Sandbox.unboxed_run(Repo, fn ->
+        remove_gls34_submit_audit_barrier_trigger!()
       end)
 
-    task_b =
-      Task.async(fn ->
-        Sandbox.unboxed_run(Repo, fn ->
-          Sandbox.allow(Repo, parent, self())
-          send(parent, {start_ref, :ready_b})
+      cleanup_committed_scoring_fixture!(fixture)
+    end
+  end
 
-          receive do
-            ^start_ref -> :go
-          end
+  @tag :real_concurrency
+  test "HandoverGroupRole blocks stale SubmitGroupHole after authority changes (case B)" do
+    fixture = setup_committed_scoring_race_fixture!()
+    parent = self()
+    deadline = System.monotonic_time(:millisecond) + 15_000
 
-          SubmitGroupHole.run(
-            %{id: staff_id},
-            setup.event.id,
-            setup.round.id,
-            base_command(setup, hole_id, 0, holed_out_results(setup.entries, 5))
-          )
+    Sandbox.unboxed_run(Repo, fn ->
+      install_gls34_handover_audit_barrier_trigger!()
+    end)
+
+    try do
+      lock_holder =
+        Task.async(fn ->
+          Sandbox.unboxed_run(Repo, fn ->
+            Repo.query!("SELECT pg_advisory_lock($1)", [@advisory_handover_audit])
+            send(parent, {:gls34_handover_lock_held, pg_backend_pid!()})
+
+            receive do
+              :gls34_release_handover_advisory ->
+                Repo.query!("SELECT pg_advisory_unlock($1)", [@advisory_handover_audit])
+            end
+          end)
         end)
+
+      assert_receive {:gls34_handover_lock_held, _}, 5_000
+
+      handover =
+        Task.async(fn ->
+          Sandbox.unboxed_run(Repo, fn ->
+            handover_pid = pg_backend_pid!()
+            send(parent, {:gls34_handover_started, handover_pid})
+
+            HandoverGroupRole.run(
+              fixture.admin,
+              fixture.event.id,
+              fixture.round.id,
+              fixture.group.id,
+              fixture.successor_entry_id,
+              :primary_scorer
+            )
+          end)
+        end)
+
+      assert_receive {:gls34_handover_started, handover_pid}, 10_000
+      await_backend_advisory_wait!(handover_pid, deadline)
+
+      submit =
+        Task.async(fn ->
+          Sandbox.unboxed_run(Repo, fn ->
+            submit_pid = pg_backend_pid!()
+            send(parent, {:gls34_submit_started, submit_pid})
+            player_submit_command!(fixture)
+          end)
+        end)
+
+      assert_receive {:gls34_submit_started, submit_pid}, 10_000
+
+      await_blocked_by!(
+        submit_pid,
+        handover_pid,
+        System.monotonic_time(:millisecond) + 10_000
+      )
+
+      send(lock_holder.pid, :gls34_release_handover_advisory)
+
+      assert {:ok, successor} = Task.await(handover, 20_000)
+      assert {:error, :stale_role_assignment} = Task.await(submit, 20_000)
+      Task.await(lock_holder, 10_000)
+
+      assert successor.assignment_version == fixture.assignment_version + 1
+      assert hole_submission_count_for_round!(fixture.round.id) == 0
+      assert hole_result_count_for_round!(fixture.round.id) == 0
+      assert Ash.get!(PlayingGroup, fixture.group.id, authorize?: false).scoring_revision == 0
+    after
+      Sandbox.unboxed_run(Repo, fn ->
+        remove_gls34_handover_audit_barrier_trigger!()
       end)
 
-    assert_receive {^start_ref, :ready_a}, 5_000
-    assert_receive {^start_ref, :ready_b}, 5_000
-    send(task_a.pid, start_ref)
-    send(task_b.pid, start_ref)
+      cleanup_committed_scoring_fixture!(fixture)
+    end
+  end
 
-    results = [Task.await(task_a, 20_000), Task.await(task_b, 20_000)]
-    oks = Enum.count(results, &match?({:ok, _}, &1))
-    errors = Enum.count(results, &match?({:error, _}, &1))
+  test "withdrawn participant is excluded from the next required result set" do
+    setup = setup_submit_fixture!(2)
+    hole_id = expected_hole_id!(setup)
 
-    assert oks == 1,
-           "expected one acceptance, got #{inspect(results)}"
+    assert {:ok, _} =
+             SubmitGroupHole.run(
+               setup.admin,
+               setup.event.id,
+               setup.round.id,
+               base_command(setup, hole_id, 0, holed_out_results(setup.entries, 4))
+             )
 
-    assert errors == 1
-    assert hole_result_count_for_round!(setup.round.id) == 2
-    assert hole_submission_count_for_round!(setup.round.id) == 1
-    assert Ash.get!(PlayingGroup, setup.group.id, authorize?: false).scoring_revision == 1
+    [withdrawn, active] = setup.entries
+
+    set_participation_status!(withdrawn.id, :withdrawn)
+
+    hole_two = hole_at_revision!(setup, 1)
+    active_only = holed_out_results([active], 4)
+
+    assert {:ok, _} =
+             SubmitGroupHole.run(
+               setup.admin,
+               setup.event.id,
+               setup.round.id,
+               base_command(setup, hole_two, 1, active_only)
+             )
+
+    assert hole_result_count_for_entry!(withdrawn.id) == 1
+    assert hole_result_count_for_entry!(active.id) == 2
+    assert Ash.get!(PlayingGroup, setup.group.id, authorize?: false).scoring_revision == 2
+  end
+
+  test "disqualified participant is excluded from the next required result set" do
+    setup = setup_submit_fixture!(2)
+    hole_id = expected_hole_id!(setup)
+
+    assert {:ok, _} =
+             SubmitGroupHole.run(
+               setup.admin,
+               setup.event.id,
+               setup.round.id,
+               base_command(setup, hole_id, 0, holed_out_results(setup.entries, 4))
+             )
+
+    [disqualified, active] = setup.entries
+    set_participation_status!(disqualified.id, :disqualified)
+
+    hole_two = hole_at_revision!(setup, 1)
+
+    assert {:ok, _} =
+             SubmitGroupHole.run(
+               setup.admin,
+               setup.event.id,
+               setup.round.id,
+               base_command(setup, hole_two, 1, holed_out_results([active], 4))
+             )
+
+    assert hole_result_count_for_entry!(disqualified.id) == 1
+    assert hole_result_count_for_entry!(active.id) == 2
+  end
+
+  test "forged progression context cannot bypass durable scorecard completion guard" do
+    setup = setup_submit_fixture!(2)
+    entry = hd(setup.entries)
+
+    card =
+      Scorecard
+      |> Changeset.for_create(:create_internal, %{
+        round_id: setup.round.id,
+        round_entry_id: entry.id
+      })
+      |> Ash.create!(authorize?: false)
+
+    batch = make_ref()
+
+    previous =
+      Process.put({GolfScoring.Scoring.Services.SubmitGroupHole, :progression_batch}, batch)
+
+    ctx = %{
+      submit_group_hole_progression: %{
+        playing_group_id: setup.group.id,
+        operation: :mark_complete,
+        record_id: card.id,
+        batch: batch
+      }
+    }
+
+    try do
+      assert {:error, %Ash.Error.Invalid{}} =
+               card
+               |> Changeset.for_update(:mark_complete_internal, %{})
+               |> Ash.Changeset.set_context(ctx)
+               |> Ash.update(authorize?: false)
+
+      group = Ash.get!(PlayingGroup, setup.group.id, authorize?: false)
+
+      assert {:error, %Ash.Error.Invalid{}} =
+               group
+               |> Changeset.for_update(:mark_group_finished, %{})
+               |> Ash.Changeset.set_context(
+                 Map.put(ctx, :submit_group_hole_progression, %{
+                   playing_group_id: setup.group.id,
+                   operation: :mark_group_finished,
+                   record_id: setup.group.id,
+                   batch: batch
+                 })
+               )
+               |> Ash.update(authorize?: false)
+    after
+      if previous,
+        do:
+          Process.put(
+            {GolfScoring.Scoring.Services.SubmitGroupHole, :progression_batch},
+            previous
+          ),
+        else: Process.delete({GolfScoring.Scoring.Services.SubmitGroupHole, :progression_batch})
+    end
+  end
+
+  test "round not in scoring_open rejects without mutation" do
+    setup = setup_submit_fixture!(2)
+    set_round_state!(setup.round, :ready)
+    hole_id = expected_hole_id!(setup)
+
+    assert {:error, {:invalid_round_state, "ready"}} =
+             SubmitGroupHole.run(
+               setup.admin,
+               setup.event.id,
+               setup.round.id,
+               base_command(setup, hole_id, 0, holed_out_results(setup.entries, 4))
+             )
+
+    assert hole_submission_count_for_round!(setup.round.id) == 0
+  end
+
+  test "playing group in attention_required rejects without mutation" do
+    setup = setup_submit_fixture!(2)
+
+    Repo.query!("UPDATE playing_groups SET state = 'attention_required' WHERE id = $1::uuid", [
+      Ecto.UUID.dump!(setup.group.id)
+    ])
+
+    hole_id = expected_hole_id!(setup)
+
+    assert {:error, {:invalid_group_state, :attention_required}} =
+             SubmitGroupHole.run(
+               setup.admin,
+               setup.event.id,
+               setup.round.id,
+               base_command(setup, hole_id, 0, holed_out_results(setup.entries, 4))
+             )
+
+    assert hole_submission_count_for_round!(setup.round.id) == 0
+  end
+
+  test "duplicate round_entry_id in results is rejected" do
+    setup = setup_submit_fixture!(2)
+    hole_id = expected_hole_id!(setup)
+    entry = hd(setup.entries)
+
+    results = [
+      %{round_entry_id: entry.id, outcome: :holed_out, gross_strokes: 4},
+      %{round_entry_id: entry.id, outcome: :holed_out, gross_strokes: 5}
+    ]
+
+    assert {:error, :duplicate_result_entry} =
+             SubmitGroupHole.run(
+               setup.admin,
+               setup.event.id,
+               setup.round.id,
+               base_command(setup, hole_id, 0, results)
+             )
+  end
+
+  test "blank outcome is rejected" do
+    setup = setup_submit_fixture!(2)
+    hole_id = expected_hole_id!(setup)
+    [bad | _] = setup.entries
+
+    results =
+      holed_out_results(setup.entries, 4, %{bad.id => %{outcome: nil}})
+
+    assert {:error, :invalid_result} =
+             SubmitGroupHole.run(
+               setup.admin,
+               setup.event.id,
+               setup.round.id,
+               base_command(setup, hole_id, 0, results)
+             )
+  end
+
+  test "unsupported outcome is rejected" do
+    setup = setup_submit_fixture!(2)
+    hole_id = expected_hole_id!(setup)
+    [bad | _] = setup.entries
+
+    results =
+      holed_out_results(setup.entries, 4, %{bad.id => %{outcome: :skipped}})
+
+    assert {:error, :invalid_result} =
+             SubmitGroupHole.run(
+               setup.admin,
+               setup.event.id,
+               setup.round.id,
+               base_command(setup, hole_id, 0, results)
+             )
+  end
+
+  test "holed_out with nil gross_strokes is rejected" do
+    setup = setup_submit_fixture!(2)
+    hole_id = expected_hole_id!(setup)
+    [bad | _] = setup.entries
+
+    results =
+      holed_out_results(setup.entries, 4, %{bad.id => %{gross_strokes: nil}})
+
+    assert {:error, :invalid_gross_strokes} =
+             SubmitGroupHole.run(
+               setup.admin,
+               setup.event.id,
+               setup.round.id,
+               base_command(setup, hole_id, 0, results)
+             )
+  end
+
+  test "holed_out with zero gross_strokes is rejected" do
+    setup = setup_submit_fixture!(2)
+    hole_id = expected_hole_id!(setup)
+    [bad | _] = setup.entries
+
+    results =
+      holed_out_results(setup.entries, 4, %{bad.id => %{gross_strokes: 0}})
+
+    assert {:error, :invalid_gross_strokes} =
+             SubmitGroupHole.run(
+               setup.admin,
+               setup.event.id,
+               setup.round.id,
+               base_command(setup, hole_id, 0, results)
+             )
+  end
+
+  test "unassigned staff user is forbidden" do
+    setup = setup_submit_fixture!(2)
+    stranger = create_staff_user!()
+    hole_id = expected_hole_id!(setup)
+
+    assert {:error, :forbidden} =
+             SubmitGroupHole.run(
+               stranger,
+               setup.event.id,
+               setup.round.id,
+               base_command(setup, hole_id, 0, holed_out_results(setup.entries, 4))
+             )
+  end
+
+  test "player submit rejects nil role_assignment_version" do
+    setup = setup_submit_fixture!(2)
+    scorer = hd(setup.entries)
+
+    assert {:ok, %{grant: grant}} =
+             Accounts.issue_player_access(setup.admin, setup.event.id, scorer.player_id)
+
+    hole_id = expected_hole_id!(setup)
+    command = base_command(setup, hole_id, 0, holed_out_results(setup.entries, 4))
+
+    assert {:error, :role_assignment_version_required} =
+             SubmitGroupHole.run(grant, setup.event.id, setup.round.id, command)
+  end
+
+  test "player submit rejects zero role_assignment_version" do
+    setup = setup_submit_fixture!(2)
+    scorer = hd(setup.entries)
+
+    assert {:ok, %{grant: grant}} =
+             Accounts.issue_player_access(setup.admin, setup.event.id, scorer.player_id)
+
+    hole_id = expected_hole_id!(setup)
+
+    command =
+      base_command(setup, hole_id, 0, holed_out_results(setup.entries, 4))
+      |> Map.put(:role_assignment_version, 0)
+
+    assert {:error, :role_assignment_version_required} =
+             SubmitGroupHole.run(grant, setup.event.id, setup.round.id, command)
   end
 
   defp setup_shotgun_fixture!(start_play_order) do
@@ -924,6 +1415,227 @@ defmodule GolfScoring.Scoring.Services.SubmitGroupHoleTest do
         strokes_taken: taken
       }
     end)
+  end
+
+  defp setup_committed_scoring_race_fixture! do
+    Sandbox.unboxed_run(Repo, fn ->
+      setup = setup_submit_fixture!(2)
+      [scorer, successor] = setup.entries
+
+      {:ok, %{grant: grant}} =
+        Accounts.issue_player_access(setup.admin, setup.event.id, scorer.player_id)
+
+      assignment =
+        GroupRoleAssignment
+        |> Ash.Query.filter(
+          playing_group_id == ^setup.group.id and round_entry_id == ^scorer.id and
+            role == :primary_scorer and state == :active
+        )
+        |> Ash.read_one!(authorize?: false)
+
+      Map.merge(setup, %{
+        scorer_entry_id: scorer.id,
+        successor_entry_id: successor.id,
+        grant: grant,
+        assignment_id: assignment.id,
+        assignment_version: assignment.assignment_version
+      })
+    end)
+  end
+
+  defp player_submit_command!(fixture) do
+    command =
+      base_command(fixture, expected_hole_id!(fixture), 0, holed_out_results(fixture.entries, 4))
+      |> Map.put(:role_assignment_version, fixture.assignment_version)
+
+    SubmitGroupHole.run(fixture.grant, fixture.event.id, fixture.round.id, command)
+  end
+
+  defp cleanup_committed_scoring_fixture!(fixture) do
+    Sandbox.unboxed_run(Repo, fn ->
+      round = Ecto.UUID.dump!(fixture.round.id)
+      event = Ecto.UUID.dump!(fixture.event.id)
+      group = Ecto.UUID.dump!(fixture.group.id)
+      staff = Ecto.UUID.dump!(fixture.admin.id)
+
+      for table_query <- [
+            {"DELETE FROM hole_results WHERE round_id = $1::uuid", [round]},
+            {"DELETE FROM hole_submissions WHERE round_id = $1::uuid", [round]},
+            {"DELETE FROM audit_events WHERE context->>'round_id' = $1", [fixture.round.id]},
+            {"DELETE FROM scorecards WHERE round_id = $1::uuid", [round]},
+            {"DELETE FROM competition_handicaps WHERE round_id = $1::uuid", [round]},
+            {"DELETE FROM handicap_snapshots WHERE round_id = $1::uuid", [round]},
+            {"DELETE FROM group_role_assignments WHERE playing_group_id = $1::uuid", [group]},
+            {"DELETE FROM round_entries WHERE round_id = $1::uuid", [round]},
+            {"DELETE FROM playing_groups WHERE id = $1::uuid", [group]},
+            {"DELETE FROM round_competitions WHERE round_id = $1::uuid", [round]},
+            {"DELETE FROM round_tee_hole_snapshots WHERE round_tee_profile_snapshot_id IN (SELECT id FROM round_tee_profile_snapshots WHERE round_id = $1::uuid)",
+             [round]},
+            {"DELETE FROM round_tee_profile_snapshots WHERE round_id = $1::uuid", [round]},
+            {"DELETE FROM round_holes WHERE round_id = $1::uuid", [round]},
+            {"DELETE FROM rounds WHERE id = $1::uuid", [round]},
+            {"DELETE FROM event_staff_assignments WHERE event_id = $1::uuid", [event]},
+            {"DELETE FROM player_access_grants WHERE event_id = $1::uuid", [event]},
+            {"DELETE FROM events WHERE id = $1::uuid", [event]},
+            {"DELETE FROM staff_users WHERE id = $1::uuid", [staff]}
+          ] do
+        {sql, args} = table_query
+        Repo.query!(sql, args)
+      end
+
+      for entry <- fixture.entries do
+        Repo.query!("DELETE FROM players WHERE id = $1::uuid", [Ecto.UUID.dump!(entry.player_id)])
+      end
+    end)
+  end
+
+  defp pg_backend_pid! do
+    Repo.query!("SELECT pg_backend_pid()").rows |> hd() |> hd()
+  end
+
+  defp await_blocked_by!(waiting_pid, blocking_pid, deadline) do
+    [[blocked?]] =
+      Repo.query!(
+        "SELECT $1::integer = ANY(pg_blocking_pids($2::integer))",
+        [blocking_pid, waiting_pid]
+      ).rows
+
+    cond do
+      blocked? ->
+        :ok
+
+      System.monotonic_time(:millisecond) >= deadline ->
+        flunk("expected PostgreSQL blocking between #{waiting_pid} and #{blocking_pid}")
+
+      true ->
+        Process.sleep(5)
+        await_blocked_by!(waiting_pid, blocking_pid, deadline)
+    end
+  end
+
+  defp await_backend_advisory_wait!(backend_pid, deadline) do
+    {wait_type, wait_event} =
+      Sandbox.unboxed_run(Repo, fn ->
+        case Repo.query!(
+               "SELECT wait_event_type, wait_event FROM pg_stat_activity WHERE pid = $1",
+               [backend_pid]
+             ).rows do
+          [[wait_type, wait_event]] -> {wait_type, wait_event}
+          _ -> {nil, nil}
+        end
+      end)
+
+    cond do
+      wait_type == "Lock" and wait_event == "advisory" ->
+        :ok
+
+      System.monotonic_time(:millisecond) >= deadline ->
+        flunk(
+          "expected backend #{backend_pid} to wait on advisory lock before proceeding, got wait_event_type=#{inspect(wait_type)} wait_event=#{inspect(wait_event)}"
+        )
+
+      true ->
+        Process.sleep(5)
+        await_backend_advisory_wait!(backend_pid, deadline)
+    end
+  end
+
+  defp install_gls34_reject_submit_audit_trigger! do
+    Repo.query!("""
+    CREATE OR REPLACE FUNCTION gls34_reject_submit_group_hole_audit() RETURNS trigger
+    LANGUAGE plpgsql AS $$
+    BEGIN
+      IF NEW.action = 'submit_group_hole' THEN
+        RAISE EXCEPTION 'gls34 simulated submit_group_hole audit failure';
+      END IF;
+      RETURN NEW;
+    END;
+    $$
+    """)
+
+    Repo.query!("""
+    CREATE TRIGGER gls34_reject_submit_group_hole_audit
+    BEFORE INSERT ON audit_events
+    FOR EACH ROW EXECUTE FUNCTION gls34_reject_submit_group_hole_audit()
+    """)
+  end
+
+  defp remove_gls34_reject_submit_audit_trigger! do
+    Repo.query!("DROP TRIGGER IF EXISTS gls34_reject_submit_group_hole_audit ON audit_events")
+    Repo.query!("DROP FUNCTION IF EXISTS gls34_reject_submit_group_hole_audit()")
+  end
+
+  defp install_gls34_submit_audit_barrier_trigger! do
+    Repo.query!("""
+    CREATE OR REPLACE FUNCTION gls34_barrier_submit_group_hole_audit() RETURNS trigger
+    LANGUAGE plpgsql AS $$
+    BEGIN
+      IF NEW.action = 'submit_group_hole' THEN
+        PERFORM pg_advisory_lock(9034034);
+        PERFORM pg_advisory_unlock(9034034);
+      END IF;
+      RETURN NEW;
+    END;
+    $$
+    """)
+
+    Repo.query!("""
+    CREATE TRIGGER gls34_barrier_submit_group_hole_audit
+    BEFORE INSERT ON audit_events
+    FOR EACH ROW EXECUTE FUNCTION gls34_barrier_submit_group_hole_audit()
+    """)
+  end
+
+  defp remove_gls34_submit_audit_barrier_trigger! do
+    Repo.query!("DROP TRIGGER IF EXISTS gls34_barrier_submit_group_hole_audit ON audit_events")
+    Repo.query!("DROP FUNCTION IF EXISTS gls34_barrier_submit_group_hole_audit()")
+  end
+
+  defp install_gls34_handover_audit_barrier_trigger! do
+    Repo.query!("""
+    CREATE OR REPLACE FUNCTION gls34_barrier_handover_group_role_audit() RETURNS trigger
+    LANGUAGE plpgsql AS $$
+    BEGIN
+      IF NEW.action = 'handover_group_role' THEN
+        PERFORM pg_advisory_lock(9034035);
+        PERFORM pg_advisory_unlock(9034035);
+      END IF;
+      RETURN NEW;
+    END;
+    $$
+    """)
+
+    Repo.query!("""
+    CREATE TRIGGER gls34_barrier_handover_group_role_audit
+    BEFORE INSERT ON audit_events
+    FOR EACH ROW EXECUTE FUNCTION gls34_barrier_handover_group_role_audit()
+    """)
+  end
+
+  defp remove_gls34_handover_audit_barrier_trigger! do
+    Repo.query!("DROP TRIGGER IF EXISTS gls34_barrier_handover_group_role_audit ON audit_events")
+    Repo.query!("DROP FUNCTION IF EXISTS gls34_barrier_handover_group_role_audit()")
+  end
+
+  defp set_participation_status!(entry_id, status) do
+    Repo.query!("UPDATE round_entries SET participation_status = $1 WHERE id = $2::uuid", [
+      Atom.to_string(status),
+      Ecto.UUID.dump!(entry_id)
+    ])
+  end
+
+  defp hole_result_count_for_entry!(entry_id) do
+    Repo.query!(
+      """
+      SELECT count(*)::int
+      FROM hole_results hr
+      INNER JOIN scorecards sc ON sc.id = hr.scorecard_id
+      WHERE sc.round_entry_id = $1::uuid
+      """,
+      [Ecto.UUID.dump!(entry_id)]
+    ).rows
+    |> hd()
+    |> hd()
   end
 
   defp setup_submit_fixture!(player_count) do
@@ -1037,10 +1749,25 @@ defmodule GolfScoring.Scoring.Services.SubmitGroupHoleTest do
     }
   end
 
-  defp holed_out_results(entries, strokes) do
+  defp holed_out_results(entries, strokes, overrides \\ %{}) do
     Enum.map(entries, fn entry ->
       %{round_entry_id: entry.id, outcome: :holed_out, gross_strokes: strokes}
+      |> Map.merge(Map.get(overrides, entry.id, %{}))
     end)
+  end
+
+  defp audit_count_for_round!(round_id) do
+    round_id = to_string(round_id)
+
+    Repo.query!(
+      """
+      SELECT count(*)::int FROM audit_events
+      WHERE action = 'submit_group_hole' AND context->>'round_id' = $1
+      """,
+      [round_id]
+    ).rows
+    |> hd()
+    |> hd()
   end
 
   defp audit_count! do

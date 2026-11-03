@@ -50,16 +50,23 @@ defmodule GolfScoring.Competition.RoundEntryScoringLifecycleGuard do
   defp require_progression(context, operation, %RoundEntry{id: entry_id}) do
     playing_group_id = entry_playing_group_id(entry_id)
 
-    if playing_group_id &&
-         SubmitGroupHole.verified_progression?(
-           context,
-           playing_group_id,
-           operation,
-           entry_id
-         ) do
-      :ok
-    else
-      {:error, "participation lifecycle requires verified SubmitGroupHole progression"}
+    cond do
+      is_nil(playing_group_id) ->
+        {:error, "participation lifecycle requires verified SubmitGroupHole progression"}
+
+      not SubmitGroupHole.verified_progression?(
+        context,
+        playing_group_id,
+        operation,
+        entry_id
+      ) ->
+        {:error, "participation lifecycle requires verified SubmitGroupHole progression"}
+
+      not SubmitGroupHole.round_entry_lifecycle_evidence?(operation, entry_id) ->
+        {:error, "participation lifecycle lacks durable scoring evidence"}
+
+      true ->
+        :ok
     end
   end
 

@@ -50,16 +50,23 @@ defmodule GolfScoring.Scoring.ScorecardScoringLifecycleGuard do
   defp require_progression(context, operation, scorecard) do
     playing_group_id = scorecard_playing_group_id(scorecard)
 
-    if playing_group_id &&
-         SubmitGroupHole.verified_progression?(
-           context,
-           playing_group_id,
-           operation,
-           scorecard.id
-         ) do
-      :ok
-    else
-      {:error, "scorecard lifecycle requires verified SubmitGroupHole progression"}
+    cond do
+      is_nil(playing_group_id) ->
+        {:error, "scorecard lifecycle requires verified SubmitGroupHole progression"}
+
+      not SubmitGroupHole.verified_progression?(
+        context,
+        playing_group_id,
+        operation,
+        scorecard.id
+      ) ->
+        {:error, "scorecard lifecycle requires verified SubmitGroupHole progression"}
+
+      not SubmitGroupHole.scorecard_lifecycle_evidence?(operation, scorecard.id) ->
+        {:error, "scorecard lifecycle lacks durable scoring evidence"}
+
+      true ->
+        :ok
     end
   end
 

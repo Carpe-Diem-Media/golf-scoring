@@ -61,10 +61,15 @@ defmodule GolfScoring.Competition.PlayingGroupLifecycleGuard do
 
   defp require_progression(context, operation, group)
        when operation in [:mark_group_playing, :mark_group_finished] do
-    if SubmitGroupHole.verified_progression?(context, group.id, operation, group.id) do
-      :ok
-    else
-      {:error, "PlayingGroup lifecycle requires verified SubmitGroupHole progression"}
+    cond do
+      not SubmitGroupHole.verified_progression?(context, group.id, operation, group.id) ->
+        {:error, "PlayingGroup lifecycle requires verified SubmitGroupHole progression"}
+
+      not SubmitGroupHole.playing_group_lifecycle_evidence?(operation, group.id) ->
+        {:error, "PlayingGroup lifecycle lacks durable scoring evidence"}
+
+      true ->
+        :ok
     end
   end
 

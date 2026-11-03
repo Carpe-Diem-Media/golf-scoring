@@ -44,6 +44,135 @@ defmodule GolfScoring.Scoring.Services.SubmitGroupHole do
       ) and (is_nil(record_id) or progression[:record_id] == record_id)
   end
 
+  @doc false
+  def scorecard_lifecycle_evidence?(:mark_in_progress, scorecard_id),
+    do: hole_result_count_for_scorecard(scorecard_id) >= 1
+
+  def scorecard_lifecycle_evidence?(:mark_complete, scorecard_id),
+    do: hole_result_count_for_scorecard(scorecard_id) == @scheduled_holes
+
+  def scorecard_lifecycle_evidence?(_, _), do: false
+
+  @doc false
+  def round_entry_lifecycle_evidence?(:mark_participation_active, entry_id) do
+    case scorecard_id_for_entry(entry_id) do
+      scorecard_id when not is_nil(scorecard_id) ->
+        hole_result_count_for_scorecard(scorecard_id) >= 1
+
+      _ ->
+        false
+    end
+  end
+
+  def round_entry_lifecycle_evidence?(:mark_participation_completed, entry_id) do
+    case scorecard_id_for_entry(entry_id) do
+      scorecard_id when not is_nil(scorecard_id) ->
+        hole_result_count_for_scorecard(scorecard_id) == @scheduled_holes
+
+      _ ->
+        false
+    end
+  end
+
+  def round_entry_lifecycle_evidence?(_, _), do: false
+
+  @doc false
+  def playing_group_lifecycle_evidence?(:mark_group_playing, playing_group_id) do
+    required_count = required_participant_count(playing_group_id)
+    accounted_count = required_entries_with_hole_results_count(playing_group_id)
+    required_count > 0 and accounted_count == required_count
+  end
+
+  def playing_group_lifecycle_evidence?(:mark_group_finished, playing_group_id) do
+    case Repo.get(PlayingGroup, playing_group_id) do
+      %{scoring_revision: 18} ->
+        outstanding_incomplete_participants?(playing_group_id) == false
+
+      _ ->
+        false
+    end
+  end
+
+  def playing_group_lifecycle_evidence?(_, _), do: false
+
+  defp hole_result_count_for_scorecard(scorecard_id) do
+    Repo.query!(
+      "SELECT count(*)::int FROM hole_results WHERE scorecard_id = $1::uuid",
+      [Ecto.UUID.dump!(scorecard_id)]
+    ).rows
+    |> hd()
+    |> hd()
+  end
+
+  defp scorecard_id_for_entry(entry_id) do
+    case Repo.query!(
+           "SELECT id::text FROM scorecards WHERE round_entry_id = $1::uuid LIMIT 1",
+           [Ecto.UUID.dump!(entry_id)]
+         ).rows do
+      [[id]] -> Ecto.UUID.cast!(id)
+      [] -> nil
+    end
+  end
+
+  defp required_participant_count(playing_group_id) do
+    Repo.query!(
+      """
+      SELECT count(*)::int FROM round_entries
+      WHERE playing_group_id = $1::uuid
+        AND registration_status = ANY($2::text[])
+        AND participation_status = ANY($3::text[])
+      """,
+      [
+        Ecto.UUID.dump!(playing_group_id),
+        @required_registration,
+        @required_participation
+      ]
+    ).rows
+    |> hd()
+    |> hd()
+  end
+
+  defp required_entries_with_hole_results_count(playing_group_id) do
+    Repo.query!(
+      """
+      SELECT count(DISTINCT re.id)::int
+      FROM round_entries re
+      INNER JOIN scorecards sc ON sc.round_entry_id = re.id
+      INNER JOIN hole_results hr ON hr.scorecard_id = sc.id
+      WHERE re.playing_group_id = $1::uuid
+        AND re.registration_status = ANY($2::text[])
+        AND re.participation_status = ANY($3::text[])
+      """,
+      [
+        Ecto.UUID.dump!(playing_group_id),
+        @required_registration,
+        @required_participation
+      ]
+    ).rows
+    |> hd()
+    |> hd()
+  end
+
+  defp outstanding_incomplete_participants?(playing_group_id) do
+    Repo.query!(
+      """
+      SELECT exists(
+        SELECT 1 FROM round_entries
+        WHERE playing_group_id = $1::uuid
+          AND registration_status = ANY($2::text[])
+          AND participation_status = ANY($3::text[])
+      )
+      """,
+      [
+        Ecto.UUID.dump!(playing_group_id),
+        @required_registration,
+        @required_participation
+      ]
+    ).rows
+    |> hd()
+    |> hd()
+  end
+
   @spec run(term(), Ecto.UUID.t(), Ecto.UUID.t(), command()) ::
           {:ok, HoleSubmission.t()} | {:error, term()}
   def run(actor, event_id, round_id, command) when is_map(command) do
@@ -81,9 +210,9 @@ defmodule GolfScoring.Scoring.Services.SubmitGroupHole do
 
   defp execute(actor, event_id, round_id, cmd) do
     with {:ok, actor_ctx} <- resolve_actor(actor, event_id),
+         :ok <- validate_command_shape(actor_ctx, cmd),
          {:ok, locked} <- lock_gameplay_scope(round_id, cmd.playing_group_id),
          {:ok, actor_ctx} <- finalize_actor_context(actor_ctx, cmd, locked),
-         :ok <- validate_command_shape(actor_ctx, cmd),
          :ok <- validate_round(locked.round, event_id) do
       continue_after_idempotency_check(actor_ctx, cmd, locked, event_id, round_id)
     end
@@ -209,7 +338,6 @@ defmodule GolfScoring.Scoring.Services.SubmitGroupHole do
 
     with_progression_batch(fn ->
       with :ok <- write_hole_results(entries, scorecards, round_id, round_hole_id, cmd.results),
-           :ok <- inject_test_failure_after_hole_results(),
            :ok <- advance_scorecards(scorecards, final_hole?, group_id),
            :ok <- advance_entries(entries, first_hole?, final_hole?, group_id),
            :ok <- advance_group(group, first_hole?, final_hole?),
@@ -240,12 +368,6 @@ defmodule GolfScoring.Scoring.Services.SubmitGroupHole do
         do: Process.put(@progression_batch_key, previous),
         else: Process.delete(@progression_batch_key)
     end
-  end
-
-  defp inject_test_failure_after_hole_results do
-    if Process.get(:gls34_inject_failure_after_hole_results),
-      do: {:error, :gls34_injected_test_failure},
-      else: :ok
   end
 
   defp progression_context(playing_group_id, operation, record_id) do
@@ -830,14 +952,14 @@ defmodule GolfScoring.Scoring.Services.SubmitGroupHole do
     result_ids = Enum.map(results, & &1.round_entry_id)
 
     cond do
+      duplicate?(result_ids) ->
+        {:error, :duplicate_result_entry}
+
       length(results) != length(entries) ->
         {:error, :results_count_mismatch}
 
       MapSet.new(result_ids) != entry_ids ->
         {:error, :results_participant_mismatch}
-
-      duplicate?(result_ids) ->
-        {:error, :duplicate_result_entry}
 
       Enum.any?(results, &invalid_result_shape?/1) ->
         {:error, :invalid_result}
