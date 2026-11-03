@@ -30,7 +30,7 @@ defmodule GolfScoringWeb.Player.AccessControllerTest do
 
     refute get_resp_header(conn, "location") |> Enum.join("") =~ token
     refute conn.resp_body =~ token
-    assert redirected_to(conn) == "/"
+    assert redirected_to(conn) == ~p"/player"
   end
 
   test "signed session stores grant reference only", %{conn: conn, setup: setup} do

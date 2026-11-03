@@ -70,13 +70,22 @@ defmodule GolfScoringWeb.CoreComponents do
       <div class={[
         "alert w-80 sm:w-96 max-w-80 sm:max-w-96 text-wrap",
         @kind == :info && "alert-info",
-        @kind == :error && "alert-error"
+        @kind == :error &&
+          "alert-error !bg-error-content !text-base-content !bg-none !opacity-100 !shadow-none"
       ]}>
         <.icon :if={@kind == :info} name="hero-information-circle" class="size-5 shrink-0" />
-        <.icon :if={@kind == :error} name="hero-exclamation-circle" class="size-5 shrink-0" />
-        <div>
-          <p :if={@title} class="font-semibold">{@title}</p>
-          <p>{msg}</p>
+        <.icon
+          :if={@kind == :error}
+          name="hero-exclamation-circle"
+          class="size-5 shrink-0 !text-base-content"
+        />
+        <div class={
+          @kind == :error && "min-w-0 bg-error-content text-base-content [&_p]:!text-base-content"
+        }>
+          <p :if={@title} class={["font-semibold", @kind == :error && "!text-base-content"]}>
+            {@title}
+          </p>
+          <p class={@kind == :error && "!text-base-content"}>{msg}</p>
         </div>
         <div class="flex-1" />
         <button type="button" class="group self-start cursor-pointer" aria-label="close">

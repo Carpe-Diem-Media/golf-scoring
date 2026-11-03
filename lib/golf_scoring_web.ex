@@ -83,6 +83,7 @@ defmodule GolfScoringWeb do
       import GolfScoringWeb.CoreComponents
 
       # Common modules used in templates
+      alias GolfScoringWeb.AppShell
       alias GolfScoringWeb.Layouts
       alias Phoenix.LiveView.JS
 

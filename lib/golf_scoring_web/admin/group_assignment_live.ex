@@ -42,8 +42,10 @@ defmodule GolfScoringWeb.Admin.GroupAssignmentLive do
       socket =
         socket
         |> assign(:current_staff_user, fresh)
-        |> assign(:page_title, "Group assignment")
+        |> assign(:page_title, "Groups and sides")
+        |> assign(:current_path, ~p"/admin/events/#{event_uuid}/rounds/#{round_uuid}/groups")
         |> assign(:event_id, event_uuid)
+        |> assign(:round_id, round_uuid)
         |> assign(:round, round)
         |> assign(:can_mutate, pre_open?(round))
         |> refresh_assignments(round)
@@ -310,222 +312,229 @@ defmodule GolfScoringWeb.Admin.GroupAssignmentLive do
   def render(assigns) do
     ~H"""
     <Layouts.app flash={@flash}>
-      <section id="group-assignment" class="space-y-6">
-        <header class="space-y-2">
-          <p class="text-sm font-medium text-base-content/70">
-            Event {@event_id} · Round {@round.id}
-          </p>
-          <h1 class="text-2xl font-semibold tracking-tight">
-            Round setup: groups and competition sides
-          </h1>
-          <p id="round-state" class="text-sm text-base-content/70">State: {@round.state}</p>
-          <p class="text-sm text-base-content/60">
+      <AppShell.staff
+        flash={@flash}
+        page_title={@page_title}
+        eyebrow="Event workspace"
+        current_staff_user={@current_staff_user}
+        current_path={@current_path}
+        event_id={@event_id}
+        round_id={@round_id}
+        status_badges={[%{id: "round-state-badge", label: "Round #{@round.state}"}]}
+        breadcrumbs={[
+          %{label: "Dashboard", href: ~p"/admin"},
+          %{label: "Round setup", href: ~p"/admin/events/#{@event_id}/rounds/#{@round_id}/setup"},
+          %{label: "Groups"}
+        ]}
+      >
+        <section id="group-assignment" class="space-y-6">
+          <p id="round-state" class="sr-only">State: {@round.state}</p>
+          <p class="text-sm text-base-content/70">
             Physical Playing Groups are separate from Competition Sides.
           </p>
-        </header>
+          <section
+            id="competition-sides-section"
+            class="rounded-2xl border border-primary/30 bg-base-100 p-4 space-y-4"
+          >
+            <header class="space-y-1">
+              <h2 class="text-lg font-semibold">Competition sides</h2>
+              <p class="text-sm text-base-content/70">
+                Configure competitive sides for the primary RoundCompetition (not physical groups).
+              </p>
+            </header>
 
-        <section
-          id="competition-sides-section"
-          class="rounded-2xl border border-primary/30 bg-base-100 p-4 space-y-4"
-        >
-          <header class="space-y-1">
-            <h2 class="text-lg font-semibold">Competition sides</h2>
-            <p class="text-sm text-base-content/70">
-              Configure competitive sides for the primary RoundCompetition (not physical groups).
-            </p>
-          </header>
-
-          <%= if is_nil(@round_competition) and @can_mutate do %>
-            <button
-              id="configure-round-competition-button"
-              type="button"
-              phx-click="configure_competition"
-              class="btn btn-outline btn-sm"
-            >
-              Configure primary competition
-            </button>
-          <% end %>
-
-          <%= if @round_competition do %>
-            <p id="round-competition-summary" class="text-sm">
-              Policy: {@round_competition.scoring_policy_identifier} · Solo sides permitted: {@round_competition.solo_sides_permitted}
-            </p>
-
-            <%= if @can_mutate and not @round_competition.solo_sides_permitted do %>
+            <%= if is_nil(@round_competition) and @can_mutate do %>
               <button
-                id="enable-solo-sides-button"
+                id="configure-round-competition-button"
                 type="button"
-                phx-click="enable_solo_sides"
+                phx-click="configure_competition"
                 class="btn btn-outline btn-sm"
               >
-                Enable intentional solo sides
+                Configure primary competition
               </button>
             <% end %>
 
-            <%= if @can_mutate do %>
-              <div class="flex flex-wrap gap-2">
+            <%= if @round_competition do %>
+              <p id="round-competition-summary" class="text-sm">
+                Policy: {@round_competition.scoring_policy_identifier} · Solo sides permitted: {@round_competition.solo_sides_permitted}
+              </p>
+
+              <%= if @can_mutate and not @round_competition.solo_sides_permitted do %>
                 <button
-                  id="create-competition-side-partnership"
+                  id="enable-solo-sides-button"
                   type="button"
-                  phx-click="create_competition_side"
-                  phx-value-formation="partnership"
-                  class="btn btn-sm btn-outline"
+                  phx-click="enable_solo_sides"
+                  class="btn btn-outline btn-sm"
                 >
-                  Add partnership side
+                  Enable intentional solo sides
                 </button>
-                <%= if @round_competition.solo_sides_permitted do %>
+              <% end %>
+
+              <%= if @can_mutate do %>
+                <div class="flex flex-wrap gap-2">
                   <button
-                    id="create-competition-side-solo"
+                    id="create-competition-side-partnership"
                     type="button"
                     phx-click="create_competition_side"
-                    phx-value-formation="solo"
+                    phx-value-formation="partnership"
                     class="btn btn-sm btn-outline"
                   >
-                    Add intentional solo side
+                    Add partnership side
                   </button>
-                <% end %>
+                  <%= if @round_competition.solo_sides_permitted do %>
+                    <button
+                      id="create-competition-side-solo"
+                      type="button"
+                      phx-click="create_competition_side"
+                      phx-value-formation="solo"
+                      class="btn btn-sm btn-outline"
+                    >
+                      Add intentional solo side
+                    </button>
+                  <% end %>
+                </div>
+              <% end %>
+
+              <div id="competition-side-list" class="space-y-3">
+                <article
+                  :for={side <- @competition_sides}
+                  id={"competition-side-#{side.id}"}
+                  class="rounded-xl border border-base-300 p-3 space-y-2"
+                >
+                  <p class="font-medium">
+                    Side {String.slice(side.id, 0, 8)} · Formation: {side.formation}
+                  </p>
+                  <p id={"competition-side-result-#{side.id}"} class="text-sm text-base-content/70">
+                    SideResult: {side.result_state}
+                  </p>
+                  <ul id={"competition-side-members-#{side.id}"} class="text-sm list-disc pl-5">
+                    <li :for={member_id <- side.member_ids}>Entry {member_id}</li>
+                  </ul>
+
+                  <%= if @can_mutate do %>
+                    <.form
+                      id={"set-side-membership-form-#{side.id}"}
+                      for={%{}}
+                      phx-submit="set_side_membership"
+                      class="flex flex-wrap gap-2 items-end"
+                    >
+                      <input type="hidden" name="side[side_id]" value={side.id} />
+                      <.input
+                        id={"set-side-membership-entries-#{side.id}"}
+                        name="side[entry_ids]"
+                        type="text"
+                        label="Current starter entry IDs (comma-separated)"
+                        value={Enum.join(side.member_ids, ",")}
+                      />
+                      <button type="submit" class="btn btn-sm btn-outline">Save side membership</button>
+                    </.form>
+                  <% end %>
+                </article>
+              </div>
+            <% end %>
+          </section>
+
+          <section id="physical-playing-groups-section" class="space-y-4">
+            <h2 class="text-lg font-semibold">Physical playing groups</h2>
+            <%= if @can_mutate do %>
+              <div class="flex gap-3">
+                <button
+                  id="create-playing-group-button"
+                  type="button"
+                  phx-click="create_group"
+                  class="btn btn-primary btn-sm"
+                >
+                  Create empty group
+                </button>
               </div>
             <% end %>
 
-            <div id="competition-side-list" class="space-y-3">
+            <div id="unassigned-entries" class="rounded-2xl border border-base-300 bg-base-100 p-4">
+              <h2 class="text-lg font-semibold">Unassigned entries</h2>
+              <ul class="mt-2 space-y-1 text-sm">
+                <li :for={entry <- @unassigned_entries} id={"unassigned-entry-#{entry.id}"}>
+                  Entry {entry.id}
+                </li>
+              </ul>
+            </div>
+
+            <div id="group-list" class="space-y-4">
               <article
-                :for={side <- @competition_sides}
-                id={"competition-side-#{side.id}"}
-                class="rounded-xl border border-base-300 p-3 space-y-2"
+                :for={group <- @groups}
+                id={"playing-group-#{group.id}"}
+                class="rounded-2xl border border-base-300 bg-base-100 p-4 space-y-3"
               >
-                <p class="font-medium">
-                  Side {String.slice(side.id, 0, 8)} · Formation: {side.formation}
+                <header class="flex flex-wrap items-baseline justify-between gap-2">
+                  <h2 class="font-semibold">Group {String.slice(group.id, 0, 8)}</h2>
+                  <p id={"group-member-count-#{group.id}"} class="text-sm text-base-content/70">
+                    Members: {group.member_count} / {PlayingGroupReadiness.setup_capacity_max()}
+                    <%= if not group.setup_complete? do %>
+                      <span id={"group-incomplete-#{group.id}"} class="text-warning">
+                        · Incomplete setup
+                      </span>
+                    <% end %>
+                  </p>
+                </header>
+
+                <p id={"group-start-label-#{group.id}"} class="text-sm">
+                  Start: {group.start_label}
                 </p>
-                <p id={"competition-side-result-#{side.id}"} class="text-sm text-base-content/70">
-                  SideResult: {side.result_state}
-                </p>
-                <ul id={"competition-side-members-#{side.id}"} class="text-sm list-disc pl-5">
-                  <li :for={member_id <- side.member_ids}>Entry {member_id}</li>
+
+                <ul id={"group-members-#{group.id}"} class="text-sm list-disc pl-5">
+                  <li :for={member_id <- group.member_ids}>Entry {member_id}</li>
                 </ul>
 
                 <%= if @can_mutate do %>
                   <.form
-                    id={"set-side-membership-form-#{side.id}"}
+                    id={"assign-entry-form-#{group.id}"}
                     for={%{}}
-                    phx-submit="set_side_membership"
+                    phx-submit="assign_entry"
                     class="flex flex-wrap gap-2 items-end"
                   >
-                    <input type="hidden" name="side[side_id]" value={side.id} />
+                    <input type="hidden" name="assignment[group_id]" value={group.id} />
                     <.input
-                      id={"set-side-membership-entries-#{side.id}"}
-                      name="side[entry_ids]"
-                      type="text"
-                      label="Current starter entry IDs (comma-separated)"
-                      value={Enum.join(side.member_ids, ",")}
+                      id={"assign-entry-select-#{group.id}"}
+                      name="assignment[entry_id]"
+                      type="select"
+                      label="Assign entry"
+                      value=""
+                      options={movable_entry_options(@eligible_starters, group.id)}
+                      prompt="Select entry"
                     />
-                    <button type="submit" class="btn btn-sm btn-outline">Save side membership</button>
+                    <button type="submit" class="btn btn-sm btn-outline">Assign</button>
+                  </.form>
+
+                  <.form
+                    id={"assign-start-form-#{group.id}"}
+                    for={%{}}
+                    phx-submit="assign_start"
+                    class="flex flex-wrap gap-2 items-end"
+                  >
+                    <input type="hidden" name="start[group_id]" value={group.id} />
+                    <.input
+                      id={"assign-start-hole-#{group.id}"}
+                      name="start[round_hole_id]"
+                      type="select"
+                      label="Starting hole"
+                      value=""
+                      options={@round_hole_options}
+                      prompt="Select hole"
+                    />
+                    <.input
+                      id={"assign-start-position-#{group.id}"}
+                      name="start[position]"
+                      type="number"
+                      label="Position"
+                      value=""
+                    />
+                    <button type="submit" class="btn btn-sm btn-outline">Save start</button>
                   </.form>
                 <% end %>
               </article>
             </div>
-          <% end %>
+          </section>
         </section>
-
-        <section id="physical-playing-groups-section" class="space-y-4">
-          <h2 class="text-lg font-semibold">Physical playing groups</h2>
-          <%= if @can_mutate do %>
-            <div class="flex gap-3">
-              <button
-                id="create-playing-group-button"
-                type="button"
-                phx-click="create_group"
-                class="btn btn-primary btn-sm"
-              >
-                Create empty group
-              </button>
-            </div>
-          <% end %>
-
-          <div id="unassigned-entries" class="rounded-2xl border border-base-300 bg-base-100 p-4">
-            <h2 class="text-lg font-semibold">Unassigned entries</h2>
-            <ul class="mt-2 space-y-1 text-sm">
-              <li :for={entry <- @unassigned_entries} id={"unassigned-entry-#{entry.id}"}>
-                Entry {entry.id}
-              </li>
-            </ul>
-          </div>
-
-          <div id="group-list" class="space-y-4">
-            <article
-              :for={group <- @groups}
-              id={"playing-group-#{group.id}"}
-              class="rounded-2xl border border-base-300 bg-base-100 p-4 space-y-3"
-            >
-              <header class="flex flex-wrap items-baseline justify-between gap-2">
-                <h2 class="font-semibold">Group {String.slice(group.id, 0, 8)}</h2>
-                <p id={"group-member-count-#{group.id}"} class="text-sm text-base-content/70">
-                  Members: {group.member_count} / {PlayingGroupReadiness.setup_capacity_max()}
-                  <%= if not group.setup_complete? do %>
-                    <span id={"group-incomplete-#{group.id}"} class="text-warning">
-                      · Incomplete setup
-                    </span>
-                  <% end %>
-                </p>
-              </header>
-
-              <p id={"group-start-label-#{group.id}"} class="text-sm">
-                Start: {group.start_label}
-              </p>
-
-              <ul id={"group-members-#{group.id}"} class="text-sm list-disc pl-5">
-                <li :for={member_id <- group.member_ids}>Entry {member_id}</li>
-              </ul>
-
-              <%= if @can_mutate do %>
-                <.form
-                  id={"assign-entry-form-#{group.id}"}
-                  for={%{}}
-                  phx-submit="assign_entry"
-                  class="flex flex-wrap gap-2 items-end"
-                >
-                  <input type="hidden" name="assignment[group_id]" value={group.id} />
-                  <.input
-                    id={"assign-entry-select-#{group.id}"}
-                    name="assignment[entry_id]"
-                    type="select"
-                    label="Assign entry"
-                    value=""
-                    options={movable_entry_options(@eligible_starters, group.id)}
-                    prompt="Select entry"
-                  />
-                  <button type="submit" class="btn btn-sm btn-outline">Assign</button>
-                </.form>
-
-                <.form
-                  id={"assign-start-form-#{group.id}"}
-                  for={%{}}
-                  phx-submit="assign_start"
-                  class="flex flex-wrap gap-2 items-end"
-                >
-                  <input type="hidden" name="start[group_id]" value={group.id} />
-                  <.input
-                    id={"assign-start-hole-#{group.id}"}
-                    name="start[round_hole_id]"
-                    type="select"
-                    label="Starting hole"
-                    value=""
-                    options={@round_hole_options}
-                    prompt="Select hole"
-                  />
-                  <.input
-                    id={"assign-start-position-#{group.id}"}
-                    name="start[position]"
-                    type="number"
-                    label="Position"
-                    value=""
-                  />
-                  <button type="submit" class="btn btn-sm btn-outline">Save start</button>
-                </.form>
-              <% end %>
-            </article>
-          </div>
-        </section>
-      </section>
+      </AppShell.staff>
     </Layouts.app>
     """
   end

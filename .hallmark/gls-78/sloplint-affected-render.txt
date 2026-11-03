@@ -1,0 +1,5 @@
+render tier: 5 screenshots in /home/jcschoeman96/projects/current/golf-scoring/.worktrees/ux-role-aware-app-shell/.hallmark/shots (1280x800, 1440x900, 1920x1080 folds; 1440 and 375 full pages)
+http://127.0.0.1:4102/player/access-denied
+  FAIL 26a :1 [1440px] nothing shows keyboard focus on body "Golf Scoring
+     " | fix: Give every control a :focus-visible ring; never remove an outline without putting one back
+sloplint: 1 FAIL, 0 WARN across 0 file(s) and 1 URL(s).

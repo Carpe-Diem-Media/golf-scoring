@@ -27,7 +27,10 @@ defmodule GolfScoringWeb.Admin.DashboardEventCreationTest do
 
     events_before = event_count()
 
-    {:ok, view, _html} = live(conn, "/admin")
+    {:ok, view, html} = live(conn, "/admin")
+    assert html =~ ~s(id="staff-application-shell")
+    assert has_element?(view, "#staff-shell-nav")
+    assert has_element?(view, "#staff-nav-dashboard[aria-current=\"page\"]")
     assert has_element?(view, "#create-event-button")
     assert render_click(element(view, "#create-event-button")) =~ "Event created"
 
@@ -40,7 +43,7 @@ defmodule GolfScoringWeb.Admin.DashboardEventCreationTest do
       |> Ash.read_one!(authorize?: false)
 
     assert event.state == :draft
-    assert has_element?(view, "#last-created-event", event.id)
+    assert has_element?(view, "#last-created-event[data-event-id=\"#{event.id}\"]")
 
     assert [assignment] =
              EventStaffAssignment

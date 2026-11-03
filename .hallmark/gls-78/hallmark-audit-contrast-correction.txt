@@ -1,0 +1,19 @@
+Hallmark audit (GLS-78 contrast correction) — SKILL.md Step 7 §2 + redesign.md audit scope
+
+Procedure:
+1. Render sweep (Step 7 §1) on affected app targets with --scope app --genre modern-minimal.
+2. Walk judged gates (gates.md §5) against render screenshots in .hallmark/shots/ for http://127.0.0.1:4102/player/access-denied.
+3. Confirm sloplint Floor 0 FAIL; review REFLEX/WARN (none reported).
+
+Audit command (same targets/URL as render gate):
+node ~/.agents/skills/hallmark/scripts/sloplint.mjs \
+  lib/golf_scoring_web/components/app_shell.ex \
+  lib/golf_scoring_web/components/core_components.ex \
+  lib/golf_scoring_web/player/access_denied_live.ex \
+  lib/golf_scoring_web/player/home_live.ex \
+  --genre modern-minimal --scope app --render \
+  --url http://127.0.0.1:4102/player/access-denied
+
+Environment: MIX_ENV=test server PORT=4102 PHX_SERVER=true; TIDEWAVE_MATCHES=0 on served HTML.
+
+Result: PASS — sloplint clean (0 FAIL, 0 REFLEX, 0 WARN). Gate 40 reconnect/disconnect error flash copy readable at 1280px after CoreComponents.flash error presentation fix. No open §5 findings on reviewed screenshots.
