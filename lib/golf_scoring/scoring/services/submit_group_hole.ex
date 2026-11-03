@@ -11,6 +11,7 @@ defmodule GolfScoring.Scoring.Services.SubmitGroupHole do
   alias GolfScoring.Audit
   alias GolfScoring.Competition.PlayingGroup
   alias GolfScoring.Competition.RoundEntry
+  alias GolfScoring.Competition.Services.MysteryRevealCoordinator
   alias GolfScoring.LockProtocol
   alias GolfScoring.Repo
   alias GolfScoring.Scoring.Calculators.StrokeAllocation
@@ -196,8 +197,15 @@ defmodule GolfScoring.Scoring.Services.SubmitGroupHole do
       {:ok, %{receipt: receipt, idempotent_retry?: true}} ->
         {:ok, receipt}
 
-      {:ok, %{receipt: receipt, idempotent_retry?: false, broadcast: payload}} ->
+      {:ok,
+       %{
+         receipt: receipt,
+         idempotent_retry?: false,
+         broadcast: payload,
+         reveal_created?: reveal_created?
+       }} ->
         broadcast!(payload)
+        if reveal_created?, do: broadcast_mystery_reveal_changed!(payload.round_id)
         {:ok, receipt}
 
       {:error, reason} ->
@@ -263,7 +271,9 @@ defmodule GolfScoring.Scoring.Services.SubmitGroupHole do
              scorecards,
              expected_hole_id,
              event_id
-           ) do
+           ),
+         {:ok, reveal_result} <-
+           MysteryRevealCoordinator.recheck(round_id, expected_hole_id) do
       broadcast_payload = %{
         round_id: round_id,
         playing_group_id: cmd.playing_group_id,
@@ -272,7 +282,13 @@ defmodule GolfScoring.Scoring.Services.SubmitGroupHole do
         scoring_revision: locked.group.scoring_revision + 1
       }
 
-      {:ok, %{receipt: receipt, idempotent_retry?: false, broadcast: broadcast_payload}}
+      {:ok,
+       %{
+         receipt: receipt,
+         idempotent_retry?: false,
+         broadcast: broadcast_payload,
+         reveal_created?: reveal_result.created?
+       }}
     end
   end
 
@@ -635,6 +651,14 @@ defmodule GolfScoring.Scoring.Services.SubmitGroupHole do
       GolfScoring.PubSub,
       "round:#{payload.round_id}",
       {:group_hole_submitted, payload}
+    )
+  end
+
+  defp broadcast_mystery_reveal_changed!(round_id) do
+    Phoenix.PubSub.broadcast(
+      GolfScoring.PubSub,
+      "round:#{round_id}",
+      {:mystery_reveal_changed, %{round_id: round_id}}
     )
   end
 

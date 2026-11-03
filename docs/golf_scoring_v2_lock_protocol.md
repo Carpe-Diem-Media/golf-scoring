@@ -23,7 +23,7 @@ Acquire **only** in this order (caller input order is ignored):
 | 7 | `:verification_row` | (future verification rows) | no — class reserved |
 | 8 | `:query_row` | (future query rows) | no — class reserved |
 | 9 | `:mystery_hole_rule` | `mystery_hole_rules` | yes |
-| 10 | `:mystery_reveal` | (future `mystery_reveals`) | no — class reserved |
+| 10 | `:mystery_reveal` | `mystery_reveals` | no — class remains reserved |
 
 ### Why this order
 
@@ -102,6 +102,8 @@ Event/staff rows are **not** part of the shared gameplay list. Always take **eve
 ## Future row policy
 
 V1 `:score_row` locks **`scorecards`** rows by Scorecard UUID (GLS-34). `:verification_row`, `:query_row`, and `:mystery_reveal` remain reserved; requests for unimplemented classes return `{:error, {:lock_class_not_yet_available, class}}`.
+
+GLS-35 creates `MysteryReveal` only while holding its `MysteryHoleRule` row lock. The unique database constraint on `mystery_hole_rule_id` backs that serialization. GLS-35 does not acquire or implement `:mystery_reveal`; any later direct-lock consumer must first reconcile its needs with this total order.
 
 ## Consumer contract (adopt later — not implemented in GLS-30)
 

@@ -20,6 +20,7 @@ defmodule GolfScoring.Scoring.Services.SubmitGroupHoleTest do
   alias GolfScoring.Competition.Services.ConfigureRoundCompetition
   alias GolfScoring.Competition.Services.ConfigureRoundLayout
   alias GolfScoring.Competition.Services.HandoverGroupRole
+  alias GolfScoring.Competition.Services.MysteryRevealCoordinator
   alias GolfScoring.Competition.Services.SnapshotRoundTeeProfiles
   alias GolfScoring.GolfCatalog
   alias GolfScoring.Repo
@@ -33,6 +34,7 @@ defmodule GolfScoring.Scoring.Services.SubmitGroupHoleTest do
 
   @advisory_submit_audit 9_034_034
   @advisory_handover_audit 9_034_035
+  @advisory_mystery_reveal_insert 9_035_036
 
   @password "GLS-34 synthetic staff passphrase 2026"
 
@@ -90,6 +92,7 @@ defmodule GolfScoring.Scoring.Services.SubmitGroupHoleTest do
 
   test "identical retry is idempotent (same receipt, no extra audit, hole results, or pubsub)" do
     setup = setup_submit_fixture!(2)
+    mystery = configure_single_group_mystery!(setup)
     hole_id = expected_hole_id!(setup)
     command = base_command(setup, hole_id, 0, holed_out_results(setup.entries, 5))
 
@@ -99,10 +102,14 @@ defmodule GolfScoring.Scoring.Services.SubmitGroupHoleTest do
              SubmitGroupHole.run(setup.admin, setup.event.id, setup.round.id, command)
 
     assert_receive {:group_hole_submitted, _}
+    assert_receive {:mystery_reveal_changed, payload}
+    assert payload == %{round_id: setup.round.id}
 
     audits_before = audit_count!()
     results_before = hole_result_count!()
     submissions_before = hole_submission_count!()
+    reveals_before = mystery_reveal_count_for_rule!(mystery.rule.id)
+    group_before = Ash.get!(PlayingGroup, setup.group.id, authorize?: false)
 
     assert {:ok, second} =
              SubmitGroupHole.run(setup.admin, setup.event.id, setup.round.id, command)
@@ -111,7 +118,246 @@ defmodule GolfScoring.Scoring.Services.SubmitGroupHoleTest do
     assert audit_count!() == audits_before
     assert hole_result_count!() == results_before
     assert hole_submission_count!() == submissions_before
+    assert mystery_reveal_count_for_rule!(mystery.rule.id) == reveals_before
+
+    assert Ash.get!(PlayingGroup, setup.group.id, authorize?: false).scoring_revision ==
+             group_before.scoring_revision
+
     refute_receive {:group_hole_submitted, _}, 50
+    refute_receive {:mystery_reveal_changed, _}, 50
+  end
+
+  test "MysteryReveal is hidden by row absence and unique per rule with no PlayingGroup foreign key" do
+    setup = setup_submit_fixture!(2)
+    mystery = configure_single_group_mystery!(setup)
+
+    assert [[true]] =
+             Repo.query!("SELECT to_regclass('public.mystery_reveals') IS NOT NULL").rows
+
+    assert mystery_reveal_count_for_rule!(mystery.rule.id) == 0
+
+    Repo.query!(
+      "INSERT INTO mystery_reveals (mystery_hole_rule_id) VALUES ($1::uuid)",
+      [Ecto.UUID.dump!(mystery.rule.id)]
+    )
+
+    assert mystery_reveal_count_for_rule!(mystery.rule.id) == 1
+
+    duplicate =
+      assert_raise Postgrex.Error, fn ->
+        Repo.query!(
+          "INSERT INTO mystery_reveals (mystery_hole_rule_id) VALUES ($1::uuid)",
+          [Ecto.UUID.dump!(mystery.rule.id)]
+        )
+      end
+
+    assert duplicate.postgres.code == :unique_violation
+    assert duplicate.postgres.constraint == "mystery_reveals_unique_mystery_hole_rule_index"
+
+    assert [[0]] =
+             Repo.query!("""
+             SELECT count(*)::int
+             FROM information_schema.columns
+             WHERE table_schema = 'public'
+               AND table_name = 'mystery_reveals'
+               AND column_name = 'playing_group_id'
+             """).rows
+
+    assert [[0]] =
+             Repo.query!("""
+             SELECT count(*)::int
+             FROM pg_constraint
+             WHERE conrelid = 'public.mystery_reveals'::regclass
+               AND contype = 'f'
+               AND confrelid = 'public.playing_groups'::regclass
+             """).rows
+  end
+
+  test "ordinary accepted submission without a MysteryHoleRule does not emit a reveal refresh" do
+    setup = setup_submit_fixture!(2)
+    hole_id = expected_hole_id!(setup)
+
+    Phoenix.PubSub.subscribe(GolfScoring.PubSub, "round:#{setup.round.id}")
+
+    assert {:ok, _} =
+             SubmitGroupHole.run(
+               setup.admin,
+               setup.event.id,
+               setup.round.id,
+               base_command(setup, hole_id, 0, holed_out_results(setup.entries, 4))
+             )
+
+    assert_receive {:group_hole_submitted, _}
+    refute_receive {:mystery_reveal_changed, _}, 50
+  end
+
+  test "single-group Mystery cohort reveals after the accepted target-hole submission" do
+    setup = setup_submit_fixture!(2)
+    mystery = configure_single_group_mystery!(setup)
+
+    Phoenix.PubSub.subscribe(GolfScoring.PubSub, "round:#{setup.round.id}")
+
+    assert {:ok, _} =
+             SubmitGroupHole.run(
+               setup.admin,
+               setup.event.id,
+               setup.round.id,
+               base_command(
+                 setup,
+                 setup.start_hole.id,
+                 0,
+                 holed_out_results(setup.entries, 4)
+               )
+             )
+
+    assert_receive {:group_hole_submitted, _}
+    assert_receive {:mystery_reveal_changed, payload}
+    assert payload == %{round_id: setup.round.id}
+    assert mystery_reveal_count_for_rule!(mystery.rule.id) == 1
+  end
+
+  test "coordinator leaves a required group hidden without an accepted submission" do
+    setup = setup_submit_fixture!(2)
+    mystery = configure_single_group_mystery!(setup)
+
+    assert {:ok, %{created?: false}} =
+             Repo.transaction(fn ->
+               assert {:ok, %{created?: false}} =
+                        MysteryRevealCoordinator.recheck(
+                          setup.round.id,
+                          setup.start_hole.id
+                        )
+
+               %{created?: false}
+             end)
+
+    assert mystery_reveal_count_for_rule!(mystery.rule.id) == 0
+  end
+
+  test "multiple-group cohort waits for the last required group submission" do
+    setup = setup_two_group_mystery_fixture!()
+    group_b = Map.merge(setup, %{group: setup.group_b, entries: setup.entries_b})
+
+    Phoenix.PubSub.subscribe(GolfScoring.PubSub, "round:#{setup.round.id}")
+
+    assert {:ok, _} =
+             SubmitGroupHole.run(
+               setup.admin,
+               setup.event.id,
+               setup.round.id,
+               base_command(
+                 setup,
+                 setup.start_hole.id,
+                 0,
+                 holed_out_results(setup.entries, 4)
+               )
+             )
+
+    assert_receive {:group_hole_submitted, _}
+    refute_receive {:mystery_reveal_changed, _}, 50
+    assert mystery_reveal_count_for_rule!(setup.mystery.rule.id) == 0
+
+    assert {:ok, _} =
+             SubmitGroupHole.run(
+               group_b.admin,
+               group_b.event.id,
+               group_b.round.id,
+               base_command(
+                 group_b,
+                 setup.start_hole.id,
+                 0,
+                 holed_out_results(group_b.entries, 5)
+               )
+             )
+
+    assert_receive {:group_hole_submitted, _}
+    assert_receive {:mystery_reveal_changed, payload}
+    assert payload == %{round_id: setup.round.id}
+    assert mystery_reveal_count_for_rule!(setup.mystery.rule.id) == 1
+  end
+
+  test "coordinator recheck after reveal is an idempotent no-op" do
+    setup = setup_submit_fixture!(2)
+    mystery = configure_single_group_mystery!(setup)
+    hole_id = setup.start_hole.id
+
+    assert {:ok, _} =
+             SubmitGroupHole.run(
+               setup.admin,
+               setup.event.id,
+               setup.round.id,
+               base_command(setup, hole_id, 0, holed_out_results(setup.entries, 4))
+             )
+
+    assert mystery_reveal_count_for_rule!(mystery.rule.id) == 1
+
+    assert {:ok, %{created?: false}} =
+             Repo.transaction(fn ->
+               assert {:ok, %{created?: false}} =
+                        MysteryRevealCoordinator.recheck(setup.round.id, hole_id)
+
+               %{created?: false}
+             end)
+
+    assert mystery_reveal_count_for_rule!(mystery.rule.id) == 1
+  end
+
+  test "committed reveal remains readable when no PubSub subscriber observes it" do
+    setup = setup_submit_fixture!(2)
+    mystery = configure_single_group_mystery!(setup)
+
+    assert {:ok, _} =
+             SubmitGroupHole.run(
+               setup.admin,
+               setup.event.id,
+               setup.round.id,
+               base_command(
+                 setup,
+                 setup.start_hole.id,
+                 0,
+                 holed_out_results(setup.entries, 4)
+               )
+             )
+
+    assert mystery_reveal_count_for_rule!(mystery.rule.id) == 1
+  end
+
+  test "late MysteryReveal insert failure rolls back the new submission and emits no PubSub" do
+    setup = setup_submit_fixture!(2)
+    mystery = configure_single_group_mystery!(setup)
+    force_mystery_reveal_insert_failure!()
+
+    Phoenix.PubSub.subscribe(GolfScoring.PubSub, "round:#{setup.round.id}")
+
+    assert {:error, _reason} =
+             SubmitGroupHole.run(
+               setup.admin,
+               setup.event.id,
+               setup.round.id,
+               base_command(
+                 setup,
+                 setup.start_hole.id,
+                 0,
+                 holed_out_results(setup.entries, 4)
+               )
+             )
+
+    assert hole_result_count_for_round!(setup.round.id) == 0
+    assert hole_submission_count_for_round!(setup.round.id) == 0
+    assert audit_count_for_round!(setup.round.id) == 0
+    assert scorecard_facts_for_round!(setup.round.id) == []
+    assert mystery_reveal_count_for_rule!(mystery.rule.id) == 0
+    group = Ash.get!(PlayingGroup, setup.group.id, authorize?: false)
+    assert group.scoring_revision == 0
+    assert group.state == :not_started
+
+    for entry <- setup.entries do
+      assert Ash.get!(RoundEntry, entry.id, authorize?: false).participation_status ==
+               :not_started
+    end
+
+    refute_receive {:group_hole_submitted, _}, 50
+    refute_receive {:mystery_reveal_changed, _}, 50
   end
 
   test "stale expected_group_score_revision is rejected" do
@@ -772,6 +1018,233 @@ defmodule GolfScoring.Scoring.Services.SubmitGroupHoleTest do
     refute catalog_entity_exists?(:tee_sets, fixture.tee_set.id)
     refute catalog_entity_exists?(:tee_rating_profiles, fixture.tee_profile.id)
     assert course_hole_count!(fixture.course.id) == 0
+  end
+
+  @tag :real_concurrency
+  test "concurrent final-group submissions produce exactly one global reveal" do
+    fixture =
+      Sandbox.unboxed_run(Repo, fn ->
+        setup = setup_two_group_mystery_fixture!()
+        scorer_a = hd(setup.entries)
+        scorer_b = hd(setup.entries_b)
+        grant_a = issue_group_scorer_grant!(setup, scorer_a)
+        grant_b = issue_group_scorer_grant!(setup, scorer_b)
+
+        Map.merge(setup, %{
+          grant_a: grant_a,
+          grant_b: grant_b,
+          assignment_a: active_primary_assignment!(setup.group.id),
+          assignment_b: active_primary_assignment!(setup.group_b.id)
+        })
+      end)
+
+    try do
+      setup_a = fixture
+      setup_b = Map.merge(fixture, %{group: fixture.group_b, entries: fixture.entries_b})
+      parent = self()
+
+      Phoenix.PubSub.subscribe(GolfScoring.PubSub, "round:#{fixture.round.id}")
+
+      task_a =
+        Task.async(fn ->
+          Sandbox.unboxed_run(Repo, fn ->
+            pid = pg_backend_pid!()
+            send(parent, {:gls35_submit_ready, :group_a, pid})
+            receive do: (:gls35_submit_go -> :ok)
+
+            command =
+              base_command(
+                setup_a,
+                fixture.start_hole.id,
+                0,
+                holed_out_results(setup_a.entries, 4)
+              )
+              |> Map.put(:role_assignment_version, fixture.assignment_a.assignment_version)
+
+            SubmitGroupHole.run(fixture.grant_a, fixture.event.id, fixture.round.id, command)
+          end)
+        end)
+
+      task_b =
+        Task.async(fn ->
+          Sandbox.unboxed_run(Repo, fn ->
+            pid = pg_backend_pid!()
+            send(parent, {:gls35_submit_ready, :group_b, pid})
+            receive do: (:gls35_submit_go -> :ok)
+
+            command =
+              base_command(
+                setup_b,
+                fixture.start_hole.id,
+                0,
+                holed_out_results(setup_b.entries, 5)
+              )
+              |> Map.put(:role_assignment_version, fixture.assignment_b.assignment_version)
+
+            SubmitGroupHole.run(fixture.grant_b, fixture.event.id, fixture.round.id, command)
+          end)
+        end)
+
+      assert_receive {:gls35_submit_ready, :group_a, pid_a}, 10_000
+      assert_receive {:gls35_submit_ready, :group_b, pid_b}, 10_000
+      refute pid_a == pid_b
+      send(task_a.pid, :gls35_submit_go)
+      send(task_b.pid, :gls35_submit_go)
+
+      results = [Task.await(task_a, 20_000), Task.await(task_b, 20_000)]
+
+      assert Enum.all?(results, &match?({:ok, _}, &1))
+      assert hole_submission_count_for_round!(fixture.round.id) == 2
+      assert mystery_reveal_count_for_rule!(fixture.mystery.rule.id) == 1
+
+      assert_receive {:mystery_reveal_changed, %{round_id: round_id}}
+      assert round_id == fixture.round.id
+      refute_receive {:mystery_reveal_changed, _}, 50
+    after
+      cleanup_committed_scoring_fixture!(fixture)
+    end
+  end
+
+  @tag :real_concurrency
+  test "a recheck waits for the accepted final submission and observes its reveal" do
+    fixture =
+      Sandbox.unboxed_run(Repo, fn -> setup_two_group_mystery_fixture!() end)
+
+    parent = self()
+    Process.delete(:gls35_final_reveal_barrier_task)
+    Process.delete(:gls35_final_reveal_tasks)
+
+    try do
+      Sandbox.unboxed_run(Repo, fn -> remove_gls35_reveal_insert_barrier_trigger!() end)
+
+      Phoenix.PubSub.subscribe(GolfScoring.PubSub, "round:#{fixture.round.id}")
+
+      setup_a = fixture
+      setup_b = Map.merge(fixture, %{group: fixture.group_b, entries: fixture.entries_b})
+
+      assert {:ok, _} =
+               Sandbox.unboxed_run(Repo, fn ->
+                 SubmitGroupHole.run(
+                   fixture.admin,
+                   fixture.event.id,
+                   fixture.round.id,
+                   base_command(
+                     setup_a,
+                     fixture.start_hole.id,
+                     0,
+                     holed_out_results(setup_a.entries, 4)
+                   )
+                 )
+               end)
+
+      assert_receive {:group_hole_submitted, _}
+      refute_receive {:mystery_reveal_changed, _}, 50
+
+      assert 0 ==
+               Sandbox.unboxed_run(Repo, fn ->
+                 mystery_reveal_count_for_rule!(fixture.mystery.rule.id)
+               end)
+
+      Sandbox.unboxed_run(Repo, fn -> install_gls35_reveal_insert_barrier_trigger!() end)
+
+      lock_holder =
+        Task.async(fn ->
+          Sandbox.unboxed_run(Repo, fn ->
+            Repo.transaction(fn ->
+              Repo.query!(
+                "SELECT pg_advisory_xact_lock($1)",
+                [@advisory_mystery_reveal_insert]
+              )
+
+              send(parent, {:gls35_reveal_barrier_held, pg_backend_pid!()})
+              receive do: (:gls35_release_reveal_barrier -> :ok)
+            end)
+          end)
+        end)
+
+      Process.put(:gls35_final_reveal_barrier_task, lock_holder)
+      assert_receive {:gls35_reveal_barrier_held, _lock_pid}, 5_000
+
+      final_submit =
+        Task.async(fn ->
+          Sandbox.unboxed_run(Repo, fn ->
+            pid = pg_backend_pid!()
+            send(parent, {:gls35_final_submit_started, pid})
+
+            SubmitGroupHole.run(
+              fixture.admin,
+              fixture.event.id,
+              fixture.round.id,
+              base_command(
+                setup_b,
+                fixture.start_hole.id,
+                0,
+                holed_out_results(setup_b.entries, 5)
+              )
+            )
+          end)
+        end)
+
+      Process.put(:gls35_final_reveal_tasks, [final_submit])
+      assert_receive {:gls35_final_submit_started, submit_pid}, 10_000
+      await_backend_advisory_wait!(submit_pid, System.monotonic_time(:millisecond) + 10_000)
+
+      recheck =
+        Task.async(fn ->
+          Sandbox.unboxed_run(Repo, fn ->
+            pid = pg_backend_pid!()
+            send(parent, {:gls35_final_recheck_started, pid})
+
+            Repo.transaction(fn ->
+              MysteryRevealCoordinator.recheck(fixture.round.id, fixture.start_hole.id)
+            end)
+          end)
+        end)
+
+      Process.put(:gls35_final_reveal_tasks, [final_submit, recheck])
+      assert_receive {:gls35_final_recheck_started, recheck_pid}, 10_000
+      refute submit_pid == recheck_pid
+      await_blocked_by!(recheck_pid, submit_pid, System.monotonic_time(:millisecond) + 10_000)
+
+      send(lock_holder.pid, :gls35_release_reveal_barrier)
+
+      assert {:ok, receipt} = Task.await(final_submit, 20_000)
+      assert receipt.playing_group_id == fixture.group_b.id
+      Process.put(:gls35_final_reveal_tasks, [recheck])
+      assert {:ok, {:ok, %{created?: false}}} = Task.await(recheck, 20_000)
+
+      Process.delete(:gls35_final_reveal_tasks)
+      Task.await(lock_holder, 10_000)
+      Process.delete(:gls35_final_reveal_barrier_task)
+
+      Sandbox.unboxed_run(Repo, fn -> remove_gls35_reveal_insert_barrier_trigger!() end)
+
+      assert mystery_reveal_count_for_rule!(fixture.mystery.rule.id) == 1
+
+      assert_receive {:group_hole_submitted, %{playing_group_id: group_id}}
+      assert group_id == fixture.group_b.id
+      assert_receive {:mystery_reveal_changed, %{round_id: round_id}}
+      assert round_id == fixture.round.id
+      refute_receive {:mystery_reveal_changed, _}, 50
+    after
+      if lock_holder = Process.delete(:gls35_final_reveal_barrier_task) do
+        send(lock_holder.pid, :gls35_release_reveal_barrier)
+        Task.shutdown(lock_holder, 10_000)
+      end
+
+      for task <- Process.delete(:gls35_final_reveal_tasks) || [] do
+        try do
+          Task.shutdown(task, 10_000)
+        rescue
+          _ -> :ok
+        catch
+          :exit, _ -> :ok
+        end
+      end
+
+      Sandbox.unboxed_run(Repo, fn -> remove_gls35_reveal_insert_barrier_trigger!() end)
+      cleanup_committed_scoring_fixture!(fixture)
+    end
   end
 
   @tag :real_concurrency
@@ -1493,12 +1966,32 @@ defmodule GolfScoring.Scoring.Services.SubmitGroupHoleTest do
     SubmitGroupHole.run(fixture.grant, fixture.event.id, fixture.round.id, command)
   end
 
+  defp issue_group_scorer_grant!(fixture, scorer_entry) do
+    assert {:ok, %{grant: grant}} =
+             Accounts.issue_player_access(
+               fixture.admin,
+               fixture.event.id,
+               scorer_entry.player_id
+             )
+
+    grant
+  end
+
+  defp active_primary_assignment!(playing_group_id) do
+    GroupRoleAssignment
+    |> Ash.Query.filter(playing_group_id == ^playing_group_id and role == :primary_scorer)
+    |> Ash.read_one!(authorize?: false)
+  end
+
   defp cleanup_committed_scoring_fixture!(fixture) do
     Sandbox.unboxed_run(Repo, fn ->
       round = Ecto.UUID.dump!(fixture.round.id)
       event = Ecto.UUID.dump!(fixture.event.id)
-      group = Ecto.UUID.dump!(fixture.group.id)
       staff = Ecto.UUID.dump!(fixture.admin.id)
+
+      player_ids =
+        Repo.query!("SELECT player_id::text FROM round_entries WHERE round_id = $1::uuid", [round]).rows
+        |> Enum.map(fn [id] -> Ecto.UUID.cast!(id) end)
 
       for table_query <- [
             {"DELETE FROM hole_results WHERE round_id = $1::uuid", [round]},
@@ -1507,9 +2000,18 @@ defmodule GolfScoring.Scoring.Services.SubmitGroupHoleTest do
             {"DELETE FROM scorecards WHERE round_id = $1::uuid", [round]},
             {"DELETE FROM competition_handicaps WHERE round_id = $1::uuid", [round]},
             {"DELETE FROM handicap_snapshots WHERE round_id = $1::uuid", [round]},
-            {"DELETE FROM group_role_assignments WHERE playing_group_id = $1::uuid", [group]},
+            {"DELETE FROM mystery_reveals WHERE mystery_hole_rule_id IN (SELECT id FROM mystery_hole_rules WHERE round_id = $1::uuid)",
+             [round]},
+            {"DELETE FROM mystery_hole_rules WHERE round_id = $1::uuid", [round]},
+            {"DELETE FROM scoring_tracks WHERE round_id = $1::uuid", [round]},
+            {"DELETE FROM competition_side_results WHERE competition_side_id IN (SELECT id FROM competition_sides WHERE round_id = $1::uuid)",
+             [round]},
+            {"DELETE FROM competition_side_memberships WHERE round_id = $1::uuid", [round]},
+            {"DELETE FROM competition_sides WHERE round_id = $1::uuid", [round]},
+            {"DELETE FROM group_role_assignments WHERE playing_group_id IN (SELECT id FROM playing_groups WHERE round_id = $1::uuid)",
+             [round]},
             {"DELETE FROM round_entries WHERE round_id = $1::uuid", [round]},
-            {"DELETE FROM playing_groups WHERE id = $1::uuid", [group]},
+            {"DELETE FROM playing_groups WHERE round_id = $1::uuid", [round]},
             {"DELETE FROM round_competitions WHERE round_id = $1::uuid", [round]},
             {"DELETE FROM round_tee_hole_snapshots WHERE round_tee_profile_snapshot_id IN (SELECT id FROM round_tee_profile_snapshots WHERE round_id = $1::uuid)",
              [round]},
@@ -1531,8 +2033,8 @@ defmodule GolfScoring.Scoring.Services.SubmitGroupHoleTest do
         Repo.query!(sql, args)
       end
 
-      for entry <- fixture.entries do
-        Repo.query!("DELETE FROM players WHERE id = $1::uuid", [Ecto.UUID.dump!(entry.player_id)])
+      for player_id <- player_ids do
+        Repo.query!("DELETE FROM players WHERE id = $1::uuid", [Ecto.UUID.dump!(player_id)])
       end
     end)
   end
@@ -1586,6 +2088,37 @@ defmodule GolfScoring.Scoring.Services.SubmitGroupHoleTest do
         Process.sleep(5)
         await_backend_advisory_wait!(backend_pid, deadline)
     end
+  end
+
+  defp remove_gls35_reveal_insert_barrier_trigger! do
+    Repo.query!("""
+    DROP TRIGGER IF EXISTS gls35_wait_before_mystery_reveal_insert_trigger
+    ON mystery_reveals
+    """)
+
+    Repo.query!("DROP FUNCTION IF EXISTS gls35_wait_before_mystery_reveal_insert()")
+  end
+
+  defp install_gls35_reveal_insert_barrier_trigger! do
+    remove_gls35_reveal_insert_barrier_trigger!()
+
+    Repo.query!("""
+    CREATE FUNCTION gls35_wait_before_mystery_reveal_insert()
+    RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+    BEGIN
+      PERFORM pg_advisory_xact_lock(#{@advisory_mystery_reveal_insert});
+      RETURN NEW;
+    END;
+    $$
+    """)
+
+    Repo.query!("""
+    CREATE TRIGGER gls35_wait_before_mystery_reveal_insert_trigger
+    BEFORE INSERT ON mystery_reveals
+    FOR EACH ROW EXECUTE FUNCTION gls35_wait_before_mystery_reveal_insert()
+    """)
   end
 
   defp install_gls34_reject_submit_audit_trigger! do
@@ -1784,8 +2317,173 @@ defmodule GolfScoring.Scoring.Services.SubmitGroupHoleTest do
       course: course,
       catalog_holes: holes,
       tee_set: white,
-      tee_profile: profile
+      tee_profile: profile,
+      tee_snapshot: tee
     }
+  end
+
+  defp configure_single_group_mystery!(setup) do
+    configure_mystery_for_groups!(setup, [{setup.group, setup.entries}])
+  end
+
+  defp configure_mystery_for_groups!(setup, group_entries) do
+    set_round_state!(setup.round, :draft)
+
+    for {_group, entries} <- group_entries do
+      {:ok, side} =
+        Competition.create_competition_side(
+          setup.admin,
+          setup.event.id,
+          setup.round.id,
+          setup.competition.id,
+          :partnership
+        )
+
+      assert {:ok, _} =
+               Competition.set_side_membership(
+                 setup.admin,
+                 setup.event.id,
+                 setup.round.id,
+                 setup.competition.id,
+                 side.id,
+                 Enum.map(entries, & &1.id)
+               )
+    end
+
+    assert {:ok, track} =
+             Competition.configure_scoring_track(
+               setup.admin,
+               setup.event.id,
+               setup.round.id,
+               setup.competition.id,
+               %{
+                 track_type: :mystery,
+                 name: "GLS-35 Mystery",
+                 is_primary: true,
+                 visibility_policy_identifier: "staff_only_v1",
+                 aggregation_policy_identifier: "mystery_v1",
+                 tie_break_policy_identifier: "mystery_holes_then_countback_v1"
+               }
+             )
+
+    assert {:ok, rule} =
+             Competition.configure_mystery_hole_rule(
+               setup.admin,
+               setup.event.id,
+               setup.round.id,
+               track.id,
+               setup.start_hole.id,
+               :best
+             )
+
+    set_round_state!(setup.round, :scoring_open)
+    %{track: track, rule: rule}
+  end
+
+  defp add_player_entries_to_group!(setup, group, player_count) do
+    entries =
+      for _ <- 1..player_count do
+        player = create_player!()
+
+        assert {:ok, entry} =
+                 Competition.add_round_entry(setup.event.id, setup.round.id, player.id,
+                   actor: setup.admin
+                 )
+
+        assert {:ok, _} =
+                 AssignEntryToGroup.run(
+                   setup.admin,
+                   setup.event.id,
+                   setup.round.id,
+                   entry.id,
+                   group.id
+                 )
+
+        assert {:ok, _} =
+                 Competition.assign_round_tee(
+                   setup.admin,
+                   setup.event.id,
+                   setup.round.id,
+                   entry.id,
+                   setup.tee_snapshot.id
+                 )
+
+        assert {:ok, _} =
+                 Scoring.confirm_handicap_input(
+                   setup.admin,
+                   setup.event.id,
+                   setup.round.id,
+                   entry.id,
+                   %{
+                     source_handicap_index: D.new("10.0")
+                   }
+                 )
+
+        {:ok, attrs} =
+          CourseHandicap.calculate(
+            D.new("10.0"),
+            setup.tee_snapshot.slope_rating,
+            setup.tee_snapshot.course_rating,
+            setup.tee_snapshot.applicable_par
+          )
+
+        {:ok, snapshot} = Scoring.build_handicap_snapshot(entry.id, attrs)
+        {:ok, playing} = PlayingHandicap.calculate(snapshot.course_handicap_unrounded, 100)
+
+        assert {:ok, _} =
+                 Scoring.build_competition_handicap(
+                   entry.id,
+                   setup.competition.id,
+                   Map.merge(playing, %{
+                     policy_identifier: "whs_golfrsa_2026_v1",
+                     allowance_applied: true
+                   })
+                 )
+
+        entry
+      end
+
+    [scorer | _] = entries
+
+    assert {:ok, _} =
+             Competition.assign_primary_scorer(
+               setup.admin,
+               setup.event.id,
+               setup.round.id,
+               group.id,
+               scorer.id
+             )
+
+    entries
+  end
+
+  defp setup_two_group_mystery_fixture! do
+    setup = setup_submit_fixture!(2)
+    set_round_state!(setup.round, :draft)
+
+    assert {:ok, group_b} =
+             Competition.create_playing_group(setup.event.id, setup.round.id, actor: setup.admin)
+
+    assert {:ok, _} =
+             AssignPlayingGroupStart.run(
+               setup.admin,
+               setup.event.id,
+               setup.round.id,
+               group_b.id,
+               setup.start_hole.id,
+               2
+             )
+
+    entries_b = add_player_entries_to_group!(setup, group_b, 2)
+
+    mystery =
+      configure_mystery_for_groups!(setup, [{setup.group, setup.entries}, {group_b, entries_b}])
+
+    Map.merge(setup, %{
+      group_b: group_b,
+      entries_b: entries_b,
+      mystery: mystery
+    })
   end
 
   defp expected_hole_id!(%{start_hole: start_hole}), do: start_hole.id
@@ -1900,6 +2598,34 @@ defmodule GolfScoring.Scoring.Services.SubmitGroupHoleTest do
     |> Ash.Query.filter(round_id == ^round_id)
     |> Ash.read!(authorize?: false)
     |> length()
+  end
+
+  defp mystery_reveal_count_for_rule!(rule_id) do
+    Repo.query!(
+      "SELECT count(*)::int FROM mystery_reveals WHERE mystery_hole_rule_id = $1::uuid",
+      [Ecto.UUID.dump!(rule_id)]
+    ).rows
+    |> hd()
+    |> hd()
+  end
+
+  defp force_mystery_reveal_insert_failure! do
+    Repo.query!("""
+    CREATE OR REPLACE FUNCTION gls35_fail_mystery_reveal_insert()
+    RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+    BEGIN
+      RAISE EXCEPTION 'GLS-35 forced late MysteryReveal insert failure';
+    END;
+    $$
+    """)
+
+    Repo.query!("""
+    CREATE TRIGGER gls35_fail_mystery_reveal_insert_trigger
+    BEFORE INSERT ON mystery_reveals
+    FOR EACH ROW EXECUTE FUNCTION gls35_fail_mystery_reveal_insert()
+    """)
   end
 
   defp hole_result_count_for_round!(round_id) do
