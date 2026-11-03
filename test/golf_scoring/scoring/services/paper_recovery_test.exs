@@ -10,8 +10,8 @@ defmodule GolfScoring.Scoring.Services.PaperRecoveryTest do
   alias GolfScoring.Competition.PlayingGroup
   alias GolfScoring.Competition.RoundEntry
   alias GolfScoring.Repo
+  alias GolfScoring.Scoring.Services.PaperRecoveryFixtures
   alias GolfScoring.Scoring.Services.SubmitGroupHole
-  alias GolfScoring.Scoring.Services.SubmitGroupHoleTest
 
   @password "GLS-79 synthetic staff passphrase 2026"
 
@@ -26,7 +26,7 @@ defmodule GolfScoring.Scoring.Services.PaperRecoveryTest do
   end
 
   test "active Event Admin can use paper recovery and the receipt records the provenance" do
-    setup = SubmitGroupHoleTest.setup_submit_fixture!(2)
+    setup = PaperRecoveryFixtures.setup_submit_fixture!(2)
     command = command(setup, setup.group.id, setup.entries, setup.start_hole.id, 0)
 
     assert function_exported?(SubmitGroupHole, :run_paper_recovery, 5)
@@ -44,7 +44,7 @@ defmodule GolfScoring.Scoring.Services.PaperRecoveryTest do
   end
 
   test "active Competition Manager can recover a hole" do
-    setup = SubmitGroupHoleTest.setup_submit_fixture!(2)
+    setup = PaperRecoveryFixtures.setup_submit_fixture!(2)
     manager = create_staff_user!()
     assign_event_role!(setup, manager, :competition_manager)
     command = command(setup, setup.group.id, setup.entries, setup.start_hole.id, 0)
@@ -55,7 +55,7 @@ defmodule GolfScoring.Scoring.Services.PaperRecoveryTest do
   end
 
   test "recovery rejects scoring support, registration staff, suspended staff, players, and unassigned SYSTEM_ADMIN" do
-    setup = SubmitGroupHoleTest.setup_submit_fixture!(2)
+    setup = PaperRecoveryFixtures.setup_submit_fixture!(2)
     command = command(setup, setup.group.id, setup.entries, setup.start_hole.id, 0)
 
     for role <- [:scoring_support, :registration_staff] do
@@ -92,7 +92,7 @@ defmodule GolfScoring.Scoring.Services.PaperRecoveryTest do
   end
 
   test "missing and blank recovery reasons fail without writes" do
-    setup = SubmitGroupHoleTest.setup_submit_fixture!(2)
+    setup = PaperRecoveryFixtures.setup_submit_fixture!(2)
     command = command(setup, setup.group.id, setup.entries, setup.start_hole.id, 0)
     before = snapshot(setup)
 
@@ -105,7 +105,7 @@ defmodule GolfScoring.Scoring.Services.PaperRecoveryTest do
   end
 
   test "normal run ignores client-supplied paper provenance" do
-    setup = SubmitGroupHoleTest.setup_submit_fixture!(2)
+    setup = PaperRecoveryFixtures.setup_submit_fixture!(2)
 
     command =
       command(setup, setup.group.id, setup.entries, setup.start_hole.id, 0)
@@ -130,7 +130,7 @@ defmodule GolfScoring.Scoring.Services.PaperRecoveryTest do
     assert legacy_fingerprint(vector) ==
              "6fade5a3d1b3e790c3f6eec4124ef45fa66a217f29c43e4a026d0f82c59b048f"
 
-    setup = SubmitGroupHoleTest.setup_submit_fixture!(2)
+    setup = PaperRecoveryFixtures.setup_submit_fixture!(2)
     captured_at = ~U[2026-11-03 12:00:00.000000Z]
 
     command =
@@ -155,7 +155,7 @@ defmodule GolfScoring.Scoring.Services.PaperRecoveryTest do
   end
 
   test "database constraints reject invalid source and source-reason combinations" do
-    setup = SubmitGroupHoleTest.setup_submit_fixture!(2)
+    setup = PaperRecoveryFixtures.setup_submit_fixture!(2)
     command = command(setup, setup.group.id, setup.entries, setup.start_hole.id, 0)
 
     assert {:ok, receipt} =
@@ -227,7 +227,7 @@ defmodule GolfScoring.Scoring.Services.PaperRecoveryTest do
   end
 
   test "paper retry returns the original receipt without extra writes or broadcasts" do
-    setup = SubmitGroupHoleTest.setup_submit_fixture!(2)
+    setup = PaperRecoveryFixtures.setup_submit_fixture!(2)
     command = command(setup, setup.group.id, setup.entries, setup.start_hole.id, 0)
     Phoenix.PubSub.subscribe(GolfScoring.PubSub, "round:#{setup.round.id}")
 
@@ -243,7 +243,7 @@ defmodule GolfScoring.Scoring.Services.PaperRecoveryTest do
   end
 
   test "same key conflicts when source, reason, or scoring payload changes" do
-    setup = SubmitGroupHoleTest.setup_submit_fixture!(2)
+    setup = PaperRecoveryFixtures.setup_submit_fixture!(2)
     command = command(setup, setup.group.id, setup.entries, setup.start_hole.id, 0)
 
     assert {:ok, _} = recover(setup.admin, setup, command, "paper scorecard")
@@ -261,7 +261,7 @@ defmodule GolfScoring.Scoring.Services.PaperRecoveryTest do
   end
 
   test "complete valid paper outcomes pass while invalid outcomes and pickups fail" do
-    setup = SubmitGroupHoleTest.setup_submit_fixture!(2)
+    setup = PaperRecoveryFixtures.setup_submit_fixture!(2)
     [first_entry, second_entry] = setup.entries
 
     valid =
@@ -279,7 +279,7 @@ defmodule GolfScoring.Scoring.Services.PaperRecoveryTest do
     assert {:ok, receipt} = recover(setup.admin, setup, valid, "paper scorecard")
     assert receipt.source == "paper_recovery"
 
-    second = SubmitGroupHoleTest.setup_submit_fixture!(2)
+    second = PaperRecoveryFixtures.setup_submit_fixture!(2)
 
     invalid_result =
       command(second, second.group.id, second.entries, second.start_hole.id, 0)
@@ -304,7 +304,7 @@ defmodule GolfScoring.Scoring.Services.PaperRecoveryTest do
   end
 
   test "stale revisions and skipped holes are rejected; consecutive recovery follows play order" do
-    setup = SubmitGroupHoleTest.setup_shotgun_fixture!(10)
+    setup = PaperRecoveryFixtures.setup_shotgun_fixture!(10)
     start_index = Enum.find_index(setup.route, &(&1.id == setup.start_hole.id))
     {head, tail} = Enum.split(setup.route, start_index)
     playing_order = tail ++ head
@@ -334,7 +334,7 @@ defmodule GolfScoring.Scoring.Services.PaperRecoveryTest do
   end
 
   test "paper recovery of the final required Mystery group reveals exactly once" do
-    setup = SubmitGroupHoleTest.setup_two_group_mystery_fixture!()
+    setup = PaperRecoveryFixtures.setup_two_group_mystery_fixture!()
     normal = command(setup, setup.group.id, setup.entries, setup.start_hole.id, 0)
     paper = command(setup, setup.group_b.id, setup.entries_b, setup.start_hole.id, 0)
     Phoenix.PubSub.subscribe(GolfScoring.PubSub, "round:#{setup.round.id}")
@@ -356,7 +356,7 @@ defmodule GolfScoring.Scoring.Services.PaperRecoveryTest do
   end
 
   test "concurrent online and paper submissions cannot accept the same hole twice" do
-    setup = SubmitGroupHoleTest.setup_submit_fixture!(2)
+    setup = PaperRecoveryFixtures.setup_submit_fixture!(2)
     command = command(setup, setup.group.id, setup.entries, setup.start_hole.id, 0)
     Phoenix.PubSub.subscribe(GolfScoring.PubSub, "round:#{setup.round.id}")
 
@@ -378,7 +378,7 @@ defmodule GolfScoring.Scoring.Services.PaperRecoveryTest do
   end
 
   test "late receipt failure rolls back paper scoring and emits no PubSub" do
-    setup = SubmitGroupHoleTest.setup_submit_fixture!(2)
+    setup = PaperRecoveryFixtures.setup_submit_fixture!(2)
     command = command(setup, setup.group.id, setup.entries, setup.start_hole.id, 0)
     install_reject_receipt_trigger!()
 
@@ -389,7 +389,7 @@ defmodule GolfScoring.Scoring.Services.PaperRecoveryTest do
   end
 
   test "late audit failure rolls back paper scoring, receipt, and lifecycle" do
-    setup = SubmitGroupHoleTest.setup_submit_fixture!(2)
+    setup = PaperRecoveryFixtures.setup_submit_fixture!(2)
     command = command(setup, setup.group.id, setup.entries, setup.start_hole.id, 0)
     install_reject_audit_trigger!()
 
@@ -399,7 +399,7 @@ defmodule GolfScoring.Scoring.Services.PaperRecoveryTest do
   end
 
   test "late Mystery reveal failure rolls back paper scoring, receipt, and audit" do
-    setup = SubmitGroupHoleTest.setup_two_group_mystery_fixture!()
+    setup = PaperRecoveryFixtures.setup_two_group_mystery_fixture!()
     normal = command(setup, setup.group.id, setup.entries, setup.start_hole.id, 0)
     assert {:ok, _} = SubmitGroupHole.run(setup.admin, setup.event.id, setup.round.id, normal)
 
