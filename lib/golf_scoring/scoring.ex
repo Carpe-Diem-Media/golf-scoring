@@ -46,4 +46,8 @@ defmodule GolfScoring.Scoring do
   def build_competition_handicap(round_entry_id, round_competition_id, attrs) do
     BuildCompetitionHandicap.run(round_entry_id, round_competition_id, attrs)
   end
+
+  def submit_group_hole(actor, event_id, round_id, command) do
+    GolfScoring.Scoring.Services.SubmitGroupHole.run(actor, event_id, round_id, command)
+  end
 end

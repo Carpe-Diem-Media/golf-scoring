@@ -417,21 +417,35 @@ defmodule GolfScoring.Competition.PlayingGroupTest do
     assert is_nil(entry_playing_group_id(entry.id))
   end
 
-  test "future lifecycle transitions fail closed" do
+  test "lifecycle transitions enforce valid state paths" do
     %{event: event, round: round, admin: admin} = setup_round!()
     {:ok, group} = Competition.create_playing_group(event.id, round.id, actor: admin)
 
-    for action <- [
-          :mark_group_playing,
-          :mark_group_finished,
-          :flag_group_attention,
-          :clear_group_attention
-        ] do
+    assert {:ok, playing} =
+             group
+             |> Changeset.for_update(:mark_group_playing, %{})
+             |> Ash.update(authorize?: false)
+
+    assert playing.state == :playing
+
+    assert {:error, %Ash.Error.Invalid{}} =
+             group
+             |> Changeset.for_update(:mark_group_finished, %{})
+             |> Ash.update(authorize?: false)
+
+    for action <- [:flag_group_attention, :clear_group_attention] do
       assert {:error, %Ash.Error.Invalid{}} =
-               group
+               playing
                |> Changeset.for_update(action, %{})
                |> Ash.update(authorize?: false)
     end
+
+    assert {:ok, finished} =
+             playing
+             |> Changeset.for_update(:mark_group_finished, %{})
+             |> Ash.update(authorize?: false)
+
+    assert finished.state == :finished_playing
   end
 
   test "terminal pre-start historical entries do not consume current starter capacity" do

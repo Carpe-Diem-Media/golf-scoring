@@ -19,7 +19,7 @@ Acquire **only** in this order (caller input order is ignored):
 | 3 | `:group_role_assignment` | `group_role_assignments` | yes |
 | 4 | `:competition_side` | `competition_sides` | yes |
 | 5 | `:competition_side_result` | `competition_side_results` | yes |
-| 6 | `:score_row` | (future score rows) | no — class reserved |
+| 6 | `:score_row` | `scorecards` (one row per Scorecard UUID) | yes (GLS-34) |
 | 7 | `:verification_row` | (future verification rows) | no — class reserved |
 | 8 | `:query_row` | (future query rows) | no — class reserved |
 | 9 | `:mystery_hole_rule` | `mystery_hole_rules` | yes |
@@ -101,7 +101,7 @@ Event/staff rows are **not** part of the shared gameplay list. Always take **eve
 
 ## Future row policy
 
-Classes `:score_row`, `:verification_row`, `:query_row`, and `:mystery_reveal` appear in the total order for documentation and consumer contracts. GLS-30 does **not** create tables or issue SQL for them. Requests including those classes return `{:error, {:lock_class_not_yet_available, class}}`. Each future consumer ticket must add SQL and its own simultaneous-transaction characterization when the row type exists.
+V1 `:score_row` locks **`scorecards`** rows by Scorecard UUID (GLS-34). `:verification_row`, `:query_row`, and `:mystery_reveal` remain reserved; requests for unimplemented classes return `{:error, {:lock_class_not_yet_available, class}}`.
 
 ## Consumer contract (adopt later — not implemented in GLS-30)
 

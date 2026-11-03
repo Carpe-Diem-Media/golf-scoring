@@ -297,14 +297,59 @@ defmodule GolfScoring.LockProtocolTest do
   test "future lock classes are rejected without querying their tables" do
     missing_id = Ecto.UUID.generate()
 
-    assert {:error, {:lock_class_not_yet_available, :score_row}} =
+    assert {:error, {:lock_class_not_yet_available, :verification_row}} =
              transaction_error(fn ->
-               LockProtocol.acquire!(score_row: [missing_id])
+               LockProtocol.acquire!(verification_row: [missing_id])
              end)
 
     refute future_table_sql_fragment?("hole_results")
     refute future_table_sql_fragment?("score_queries")
     refute future_table_sql_fragment?("mystery_reveals")
+  end
+
+  test "score_row locks scorecards in stable UUID order with row facts" do
+    fixture = setup_representative_fixture!()
+
+    card_a =
+      GolfScoring.Scoring.Scorecard
+      |> Changeset.for_create(:create_internal, %{
+        round_id: fixture.round.id,
+        round_entry_id: fixture.assignment.round_entry_id
+      })
+      |> Ash.create!(authorize?: false)
+
+    player = create_player!()
+
+    {:ok, entry} =
+      Competition.add_round_entry(fixture.event.id, fixture.round.id, player.id,
+        actor: fixture.admin
+      )
+
+    card_b =
+      GolfScoring.Scoring.Scorecard
+      |> Changeset.for_create(:create_internal, %{
+        round_id: fixture.round.id,
+        round_entry_id: entry.id
+      })
+      |> Ash.create!(authorize?: false)
+
+    [first_id, second_id] = sorted_group_ids(card_a.id, card_b.id)
+
+    assert {:ok, result} =
+             transaction_ok(fn ->
+               LockProtocol.acquire!(score_row: [card_b.id, card_a.id])
+             end)
+
+    assert Enum.map(result.acquired, & &1.class) == [:score_row, :score_row]
+    assert Enum.map(result.acquired, & &1.id) == [first_id, second_id]
+    assert Enum.all?(result.acquired, &match?(%{row: %{state: _}}, &1))
+  end
+
+  test "missing scorecard id returns scorecard_not_found" do
+    assert {:error, :scorecard_not_found} =
+             transaction_error(fn ->
+               LockProtocol.acquire!(score_row: [Ecto.UUID.generate()])
+             end)
   end
 
   test "documented total relation order includes future classes after current rows" do
@@ -322,7 +367,8 @@ defmodule GolfScoring.LockProtocolTest do
            ]
 
     assert :round in LockProtocol.implemented_lock_classes()
-    refute :score_row in LockProtocol.implemented_lock_classes()
+    assert :score_row in LockProtocol.implemented_lock_classes()
+    refute :verification_row in LockProtocol.implemented_lock_classes()
   end
 
   defp transaction_error(fun) do
@@ -456,7 +502,8 @@ defmodule GolfScoring.LockProtocolTest do
       assignment: assignment,
       side: side,
       side_result: side_result,
-      mystery_rule: rule
+      mystery_rule: rule,
+      admin: admin
     }
   end
 
