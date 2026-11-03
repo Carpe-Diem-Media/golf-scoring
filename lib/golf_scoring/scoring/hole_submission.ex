@@ -80,6 +80,42 @@ defmodule GolfScoring.Scoring.HoleSubmission do
         )
         """,
         message: "submitter actor and assignment fields are inconsistent"
+
+      check_constraint :source, "hole_submissions_source_allowed",
+        check: "source IN ('normal', 'paper_recovery')",
+        message: "source must be normal or paper recovery"
+
+      check_constraint :recovery_reason, "hole_submissions_source_reason",
+        check: """
+        (source = 'normal' AND recovery_reason IS NULL)
+        OR (
+          source = 'paper_recovery'
+          AND recovery_reason IS NOT NULL
+          AND recovery_reason = btrim(
+            recovery_reason,
+            chr(9) || chr(10) || chr(11) || chr(12) || chr(13) || chr(32) ||
+              chr(133) || chr(160) || chr(5760) || chr(8192) || chr(8193) ||
+              chr(8194) || chr(8195) || chr(8196) || chr(8197) || chr(8198) ||
+              chr(8199) || chr(8200) || chr(8201) || chr(8202) || chr(8232) ||
+              chr(8233) || chr(8239) || chr(8287) || chr(12288)
+          )
+          AND char_length(btrim(
+            recovery_reason,
+            chr(9) || chr(10) || chr(11) || chr(12) || chr(13) || chr(32) ||
+              chr(133) || chr(160) || chr(5760) || chr(8192) || chr(8193) ||
+              chr(8194) || chr(8195) || chr(8196) || chr(8197) || chr(8198) ||
+              chr(8199) || chr(8200) || chr(8201) || chr(8202) || chr(8232) ||
+              chr(8233) || chr(8239) || chr(8287) || chr(12288)
+          )) > 0
+        )
+        """,
+        message: "paper recovery requires a trimmed nonblank reason"
+
+      check_constraint :submitted_by_staff_user_id,
+                       "hole_submissions_paper_recovery_staff_only",
+                       check:
+                         "source <> 'paper_recovery' OR submitted_by_staff_user_id IS NOT NULL",
+                       message: "paper recovery receipts require a staff submitter"
     end
   end
 
@@ -104,7 +140,9 @@ defmodule GolfScoring.Scoring.HoleSubmission do
         :role_assignment_version,
         :payload_fingerprint,
         :submitted_payload,
-        :captured_at
+        :captured_at,
+        :source,
+        :recovery_reason
       ]
 
       change set_attribute(:accepted_at, &DateTime.utc_now/0)
@@ -133,6 +171,17 @@ defmodule GolfScoring.Scoring.HoleSubmission do
 
     attribute :payload_fingerprint, :binary do
       allow_nil? false
+      public? false
+    end
+
+    attribute :source, :string do
+      allow_nil? false
+      default "normal"
+      public? false
+    end
+
+    attribute :recovery_reason, :string do
+      allow_nil? true
       public? false
     end
 

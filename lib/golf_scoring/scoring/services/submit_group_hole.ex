@@ -21,6 +21,8 @@ defmodule GolfScoring.Scoring.Services.SubmitGroupHole do
   alias GolfScoring.Scoring.Scorecard
 
   @staff_roles [:event_admin, :competition_manager, :scoring_support]
+  @paper_recovery_roles [:event_admin, :competition_manager]
+  @paper_recovery_source "paper_recovery"
   @required_registration ~w(expected checked_in)
   @required_participation ~w(not_started active)
   @scheduled_holes 18
@@ -184,6 +186,34 @@ defmodule GolfScoring.Scoring.Services.SubmitGroupHole do
 
   def run(_actor, _event_id, _round_id, _command), do: {:error, :invalid_input}
 
+  @doc false
+  @spec run_paper_recovery(term(), Ecto.UUID.t(), Ecto.UUID.t(), command(), term()) ::
+          {:ok, HoleSubmission.t()} | {:error, term()}
+  def run_paper_recovery(actor, event_id, round_id, command, reason) when is_map(command) do
+    with {:ok, normalized_reason} <- normalize_recovery_reason(reason),
+         {:ok, cmd} <- normalize_command(command) do
+      cmd =
+        Map.merge(cmd, %{
+          source: @paper_recovery_source,
+          recovery_reason: normalized_reason
+        })
+
+      run_transaction(actor, event_id, round_id, cmd)
+    end
+  end
+
+  def run_paper_recovery(_actor, _event_id, _round_id, _command, _reason),
+    do: {:error, :invalid_input}
+
+  defp normalize_recovery_reason(reason) when is_binary(reason) do
+    case String.trim(reason) do
+      "" -> {:error, :recovery_reason_required}
+      normalized -> {:ok, normalized}
+    end
+  end
+
+  defp normalize_recovery_reason(_), do: {:error, :recovery_reason_required}
+
   defp run_transaction(actor, event_id, round_id, cmd) do
     result =
       Repo.transaction(fn ->
@@ -217,7 +247,9 @@ defmodule GolfScoring.Scoring.Services.SubmitGroupHole do
   end
 
   defp execute(actor, event_id, round_id, cmd) do
-    with {:ok, actor_ctx} <- resolve_actor(actor, event_id),
+    source = Map.get(cmd, :source, "normal")
+
+    with {:ok, actor_ctx} <- resolve_actor(actor, event_id, source),
          :ok <- validate_command_shape(actor_ctx, cmd),
          {:ok, locked} <- lock_gameplay_scope(round_id, cmd.playing_group_id),
          {:ok, actor_ctx} <- finalize_actor_context(actor_ctx, cmd, locked),
@@ -568,7 +600,9 @@ defmodule GolfScoring.Scoring.Services.SubmitGroupHole do
       expected_group_score_revision: scoring_revision,
       payload_fingerprint: fingerprint,
       submitted_payload: semantic_payload_map(cmd, actor_ctx),
-      captured_at: cmd.captured_at
+      captured_at: cmd.captured_at,
+      source: Map.get(cmd, :source, "normal"),
+      recovery_reason: Map.get(cmd, :recovery_reason)
     }
 
     attrs =
@@ -612,18 +646,21 @@ defmodule GolfScoring.Scoring.Services.SubmitGroupHole do
       actor_type: actor_ctx.kind
     }
 
+    {context, recovery_reason} = audit_provenance(context, receipt)
+
     case actor_ctx do
       %{kind: :staff, staff_id: staff_id} ->
-        Audit.record_staff_event(
+        attrs =
           %{
             actor_staff_user_id: staff_id,
             action: "submit_group_hole",
             target_type: "HoleSubmission",
             target_id: receipt.id,
             context: context
-          },
-          authorize?: false
-        )
+          }
+          |> maybe_put_recovery_reason(recovery_reason)
+
+        Audit.record_staff_event(attrs, authorize?: false)
 
       %{kind: :player, round_entry_id: entry_id, role_assignment_version: version} ->
         Audit.record_system_event(
@@ -646,6 +683,17 @@ defmodule GolfScoring.Scoring.Services.SubmitGroupHole do
     end
   end
 
+  defp audit_provenance(context, %HoleSubmission{source: @paper_recovery_source} = receipt) do
+    {Map.put(context, :source, @paper_recovery_source), receipt.recovery_reason}
+  end
+
+  defp audit_provenance(context, _receipt), do: {context, nil}
+
+  defp maybe_put_recovery_reason(attrs, nil), do: attrs
+
+  defp maybe_put_recovery_reason(attrs, reason),
+    do: Map.put(attrs, :reason, reason)
+
   defp broadcast!(payload) do
     Phoenix.PubSub.broadcast(
       GolfScoring.PubSub,
@@ -662,7 +710,10 @@ defmodule GolfScoring.Scoring.Services.SubmitGroupHole do
     )
   end
 
-  defp resolve_actor(%PlayerAccessGrant{} = grant, event_id) do
+  defp resolve_actor(%PlayerAccessGrant{}, _event_id, @paper_recovery_source),
+    do: {:error, :forbidden}
+
+  defp resolve_actor(%PlayerAccessGrant{} = grant, event_id, _source) do
     with :ok <- PlayerAccessGrantGuard.apply_lazy_expiry_for_grant_id(Repo, grant.id),
          {:ok, locked_grant} <- lock_grant(grant.id),
          :ok <- grant_event_matches(locked_grant, event_id),
@@ -671,14 +722,14 @@ defmodule GolfScoring.Scoring.Services.SubmitGroupHole do
     end
   end
 
-  defp resolve_actor(%{id: staff_id}, event_id) when is_binary(staff_id) do
+  defp resolve_actor(%{id: staff_id}, event_id, source) when is_binary(staff_id) do
     with {:ok, _scope} <- EventAuthorityLock.lock_scope!(event_id, [staff_id]),
-         :ok <- authorize_staff(staff_id, event_id) do
+         :ok <- authorize_staff(staff_id, event_id, source) do
       {:ok, %{kind: :staff, staff_id: staff_id}}
     end
   end
 
-  defp resolve_actor(_, _), do: {:error, :invalid_actor}
+  defp resolve_actor(_, _, _), do: {:error, :invalid_actor}
 
   defp finalize_actor_context(%{kind: :staff} = ctx, _cmd, locked) do
     case lock_assignments(locked.group.id) do
@@ -776,7 +827,13 @@ defmodule GolfScoring.Scoring.Services.SubmitGroupHole do
     end
   end
 
-  defp authorize_staff(staff_id, event_id) do
+  defp authorize_staff(staff_id, event_id, @paper_recovery_source) do
+    if ActiveEventRole.authorized?(staff_id, event_id, @paper_recovery_roles),
+      do: :ok,
+      else: {:error, :forbidden}
+  end
+
+  defp authorize_staff(staff_id, event_id, _source) do
     if ActiveEventRole.authorized?(staff_id, event_id, @staff_roles),
       do: :ok,
       else: {:error, :forbidden}
@@ -1206,8 +1263,17 @@ defmodule GolfScoring.Scoring.Services.SubmitGroupHole do
   end
 
   defp payload_fingerprint(cmd, actor_ctx) do
-    cmd
-    |> canonical_fingerprint_term(actor_ctx)
+    fingerprint_term =
+      case Map.get(cmd, :source) do
+        @paper_recovery_source ->
+          {@paper_recovery_source, cmd.recovery_reason,
+           canonical_fingerprint_term(cmd, actor_ctx)}
+
+        _ ->
+          canonical_fingerprint_term(cmd, actor_ctx)
+      end
+
+    fingerprint_term
     |> :erlang.term_to_binary([:deterministic])
     |> then(&:crypto.hash(:sha256, &1))
   end
@@ -1253,7 +1319,7 @@ defmodule GolfScoring.Scoring.Services.SubmitGroupHole do
   end
 
   defp semantic_payload_map(cmd, actor_ctx) do
-    %{
+    payload = %{
       playing_group_id: cmd.playing_group_id,
       round_hole_id: cmd.round_hole_id,
       expected_group_score_revision: cmd.expected_group_score_revision,
@@ -1262,6 +1328,17 @@ defmodule GolfScoring.Scoring.Services.SubmitGroupHole do
       actor: semantic_actor(actor_ctx),
       results: semantic_results(cmd.results)
     }
+
+    case Map.get(cmd, :source) do
+      @paper_recovery_source ->
+        Map.merge(payload, %{
+          source: @paper_recovery_source,
+          recovery_reason: cmd.recovery_reason
+        })
+
+      _ ->
+        payload
+    end
   end
 
   defp semantic_actor(%{kind: :staff, staff_id: id}), do: %{type: "staff", staff_user_id: id}

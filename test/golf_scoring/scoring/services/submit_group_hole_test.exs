@@ -1822,7 +1822,7 @@ defmodule GolfScoring.Scoring.Services.SubmitGroupHoleTest do
              SubmitGroupHole.run(grant, setup.event.id, setup.round.id, command)
   end
 
-  defp setup_shotgun_fixture!(start_play_order) do
+  def setup_shotgun_fixture!(start_play_order) do
     setup = setup_submit_fixture!(2)
     set_round_state!(setup.round, :draft)
     start_hole = Enum.find(setup.route, &(&1.play_order == start_play_order))
@@ -2219,7 +2219,7 @@ defmodule GolfScoring.Scoring.Services.SubmitGroupHoleTest do
     |> hd()
   end
 
-  defp setup_submit_fixture!(player_count) do
+  def setup_submit_fixture!(player_count) do
     event = create_event!()
     admin = create_event_admin!(event)
     course = create_course!(event, admin)
@@ -2457,7 +2457,7 @@ defmodule GolfScoring.Scoring.Services.SubmitGroupHoleTest do
     entries
   end
 
-  defp setup_two_group_mystery_fixture! do
+  def setup_two_group_mystery_fixture! do
     setup = setup_submit_fixture!(2)
     set_round_state!(setup.round, :draft)
 
