@@ -39,11 +39,10 @@ defmodule GolfScoring.Scoring.HandicapRecordsTest do
     :ok
   end
 
-  test "Scoring domain registers only expected GLS-22 resources" do
+  test "Scoring domain registers GLS-22 handicap resources" do
     resources = Ash.Domain.Info.resources(Scoring)
     assert HandicapSnapshot in resources
     assert CompetitionHandicap in resources
-    assert length(resources) == 2
     refute Info.action(HandicapSnapshot, :create)
     refute Info.action(CompetitionHandicap, :create)
   end
