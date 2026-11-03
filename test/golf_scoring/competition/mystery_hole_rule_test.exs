@@ -32,7 +32,7 @@ defmodule GolfScoring.Competition.MysteryHoleRuleTest do
     :ok
   end
 
-  test "resources register without generic public CRUD and no MysteryReveal" do
+  test "resources register without generic public CRUD" do
     assert ScoringTrack in Ash.Domain.Info.resources(Competition)
     assert MysteryHoleRule in Ash.Domain.Info.resources(Competition)
 
@@ -47,8 +47,6 @@ defmodule GolfScoring.Competition.MysteryHoleRuleTest do
     assert function_exported?(Competition, :configure_mystery_hole_rule, 6)
     assert function_exported?(Competition, :remove_mystery_hole_rule, 5)
     refute function_exported?(Competition, :lock_scoring_tracks_for_round, 1)
-
-    refute Code.ensure_loaded?(GolfScoring.Competition.MysteryReveal)
   end
 
   test "rule attribute is server-private and sensitive" do

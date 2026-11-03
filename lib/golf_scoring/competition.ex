@@ -69,6 +69,7 @@ defmodule GolfScoring.Competition do
     end
 
     resource GolfScoring.Competition.MysteryHoleRule
+    resource GolfScoring.Competition.MysteryReveal
   end
 
   def mark_round_ready(actor, event_id, round_id),
