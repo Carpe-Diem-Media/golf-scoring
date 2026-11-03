@@ -23,8 +23,26 @@ defmodule GolfScoring.Scoring.Services.SubmitGroupHole do
   @required_registration ~w(expected checked_in)
   @required_participation ~w(not_started active)
   @scheduled_holes 18
+  @progression_batch_key {__MODULE__, :progression_batch}
 
   @type command :: map()
+
+  @doc false
+  def verified_progression?(context, playing_group_id, operation, record_id \\ nil) do
+    batch = Process.get(@progression_batch_key)
+
+    progression = Map.get(context || %{}, :submit_group_hole_progression)
+
+    Repo.in_transaction?() and is_reference(batch) and
+      match?(
+        %{
+          playing_group_id: ^playing_group_id,
+          operation: ^operation,
+          batch: ^batch
+        },
+        progression
+      ) and (is_nil(record_id) or progression[:record_id] == record_id)
+  end
 
   @spec run(term(), Ecto.UUID.t(), Ecto.UUID.t(), command()) ::
           {:ok, HoleSubmission.t()} | {:error, term()}
@@ -65,21 +83,39 @@ defmodule GolfScoring.Scoring.Services.SubmitGroupHole do
     with {:ok, actor_ctx} <- resolve_actor(actor, event_id),
          {:ok, locked} <- lock_gameplay_scope(round_id, cmd.playing_group_id),
          {:ok, actor_ctx} <- finalize_actor_context(actor_ctx, cmd, locked),
-         :ok <- validate_round(locked.round, event_id),
-         :ok <- validate_group(locked.group, round_id),
-         {:ok, expected_hole_id} <- derive_expected_hole(locked.group, locked.route_holes) do
-      case resolve_idempotency(cmd, actor_ctx, round_id, expected_hole_id) do
-        {:ok, %HoleSubmission{} = existing} ->
-          {:ok, %{receipt: existing, idempotent_retry?: true, broadcast: nil}}
-
-        {:ok, :continue} ->
-          accept_new_hole(actor_ctx, cmd, locked, expected_hole_id, event_id, round_id)
-
-        {:error, reason} ->
-          {:error, reason}
-      end
+         :ok <- validate_command_shape(actor_ctx, cmd),
+         :ok <- validate_round(locked.round, event_id) do
+      continue_after_idempotency_check(actor_ctx, cmd, locked, event_id, round_id)
     end
   end
+
+  defp continue_after_idempotency_check(actor_ctx, cmd, locked, event_id, round_id) do
+    case resolve_idempotency(cmd, actor_ctx, round_id) do
+      {:ok, %HoleSubmission{} = existing} ->
+        {:ok, %{receipt: existing, idempotent_retry?: true, broadcast: nil}}
+
+      {:ok, :continue} ->
+        with :ok <- validate_group_for_new_submission(locked.group, round_id),
+             {:ok, expected_hole_id} <- derive_expected_hole(locked.group, locked.route_holes) do
+          accept_new_hole(actor_ctx, cmd, locked, expected_hole_id, event_id, round_id)
+        end
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp validate_command_shape(%{kind: :staff}, %{role_assignment_version: nil}), do: :ok
+
+  defp validate_command_shape(%{kind: :staff}, %{role_assignment_version: _}),
+    do: {:error, :staff_role_version_forbidden}
+
+  defp validate_command_shape(%{kind: :player}, %{role_assignment_version: version})
+       when is_integer(version) and version > 0,
+       do: :ok
+
+  defp validate_command_shape(%{kind: :player}, _),
+    do: {:error, :role_assignment_version_required}
 
   defp accept_new_hole(actor_ctx, cmd, locked, expected_hole_id, event_id, round_id) do
     with :ok <- require_revision_match(cmd, locked.group),
@@ -87,8 +123,8 @@ defmodule GolfScoring.Scoring.Services.SubmitGroupHole do
          {:ok, entries} <- lock_required_entries(locked.group.id),
          :ok <- validate_results_set(entries, cmd.results),
          :ok <- validate_outcomes(entries, cmd, expected_hole_id, locked.round.id),
-         :ok <- confirm_no_conflicting_hole_results(entries, expected_hole_id),
          {:ok, scorecards} <- ensure_and_lock_scorecards(entries, locked.round.id),
+         :ok <- confirm_no_conflicting_hole_results(scorecards, expected_hole_id),
          {:ok, receipt} <-
            persist_acceptance(
              actor_ctx,
@@ -111,7 +147,7 @@ defmodule GolfScoring.Scoring.Services.SubmitGroupHole do
     end
   end
 
-  defp resolve_idempotency(cmd, actor_ctx, round_id, _round_hole_id) do
+  defp resolve_idempotency(cmd, actor_ctx, round_id) do
     fingerprint = payload_fingerprint(cmd, actor_ctx)
 
     case HoleSubmission
@@ -169,23 +205,60 @@ defmodule GolfScoring.Scoring.Services.SubmitGroupHole do
     first_hole? = group.scoring_revision == 0
     final_hole? = group.scoring_revision == @scheduled_holes - 1
     fingerprint = payload_fingerprint(cmd, actor_ctx)
+    group_id = group.id
 
-    with :ok <- write_hole_results(entries, scorecards, round_id, round_hole_id, cmd.results),
-         :ok <- advance_scorecards(scorecards, final_hole?),
-         :ok <- advance_entries(entries, first_hole?, final_hole?),
-         :ok <- advance_group(group, first_hole?, final_hole?),
-         {:ok, receipt} <-
-           create_receipt(
-             actor_ctx,
-             cmd,
-             round_id,
-             round_hole_id,
-             group.scoring_revision,
-             fingerprint
-           ),
-         :ok <- write_audit(actor_ctx, receipt, event_id, group.scoring_revision, length(entries)) do
-      {:ok, receipt}
+    with_progression_batch(fn ->
+      with :ok <- write_hole_results(entries, scorecards, round_id, round_hole_id, cmd.results),
+           :ok <- inject_test_failure_after_hole_results(),
+           :ok <- advance_scorecards(scorecards, final_hole?, group_id),
+           :ok <- advance_entries(entries, first_hole?, final_hole?, group_id),
+           :ok <- advance_group(group, first_hole?, final_hole?),
+           {:ok, receipt} <-
+             create_receipt(
+               actor_ctx,
+               cmd,
+               round_id,
+               round_hole_id,
+               group.scoring_revision,
+               fingerprint
+             ),
+           :ok <-
+             write_audit(actor_ctx, receipt, event_id, group.scoring_revision, length(entries)) do
+        {:ok, receipt}
+      end
+    end)
+  end
+
+  defp with_progression_batch(fun) do
+    batch = make_ref()
+    previous = Process.put(@progression_batch_key, batch)
+
+    try do
+      fun.()
+    after
+      if previous,
+        do: Process.put(@progression_batch_key, previous),
+        else: Process.delete(@progression_batch_key)
     end
+  end
+
+  defp inject_test_failure_after_hole_results do
+    if Process.get(:gls34_inject_failure_after_hole_results),
+      do: {:error, :gls34_injected_test_failure},
+      else: :ok
+  end
+
+  defp progression_context(playing_group_id, operation, record_id) do
+    batch = Process.get(@progression_batch_key)
+
+    %{
+      submit_group_hole_progression: %{
+        playing_group_id: playing_group_id,
+        operation: operation,
+        record_id: record_id,
+        batch: batch
+      }
+    }
   end
 
   defp write_hole_results(entries, scorecards, round_id, round_hole_id, results) do
@@ -213,10 +286,10 @@ defmodule GolfScoring.Scoring.Services.SubmitGroupHole do
     end)
   end
 
-  defp advance_scorecards(scorecards, final_hole?) do
+  defp advance_scorecards(scorecards, final_hole?, playing_group_id) do
     Enum.reduce_while(scorecards, :ok, fn card, :ok ->
-      with :ok <- maybe_mark_scorecard_in_progress(card),
-           :ok <- maybe_mark_scorecard_complete(card, final_hole?) do
+      with :ok <- maybe_mark_scorecard_in_progress(card, playing_group_id),
+           :ok <- maybe_mark_scorecard_complete(card, final_hole?, playing_group_id) do
         {:cont, :ok}
       else
         {:error, reason} -> {:halt, {:error, reason}}
@@ -224,24 +297,27 @@ defmodule GolfScoring.Scoring.Services.SubmitGroupHole do
     end)
   end
 
-  defp maybe_mark_scorecard_in_progress(%{id: id, state: state})
+  defp maybe_mark_scorecard_in_progress(%{id: id, state: state}, playing_group_id)
        when state in ["not_started", :not_started] do
-    update_scorecard!(id, :mark_in_progress_internal)
+    update_scorecard!(id, :mark_in_progress_internal, playing_group_id, :mark_in_progress)
   end
 
-  defp maybe_mark_scorecard_in_progress(_), do: :ok
+  defp maybe_mark_scorecard_in_progress(_, _), do: :ok
 
-  defp maybe_mark_scorecard_complete(%{id: id, state: state}, true)
+  defp maybe_mark_scorecard_complete(%{id: id, state: state}, true, playing_group_id)
        when state in ["in_progress", :in_progress] do
-    update_scorecard!(id, :mark_complete_internal)
+    update_scorecard!(id, :mark_complete_internal, playing_group_id, :mark_complete)
   end
 
-  defp maybe_mark_scorecard_complete(_, _), do: :ok
+  defp maybe_mark_scorecard_complete(_, _, _), do: :ok
 
-  defp update_scorecard!(id, action) do
+  defp update_scorecard!(id, action, playing_group_id, operation) do
+    ctx = progression_context(playing_group_id, operation, id)
+
     Scorecard
     |> Ash.get!(id, authorize?: false)
     |> Changeset.for_update(action, %{})
+    |> Ash.Changeset.set_context(ctx)
     |> Ash.update(authorize?: false)
     |> case do
       {:ok, _} -> :ok
@@ -249,25 +325,32 @@ defmodule GolfScoring.Scoring.Services.SubmitGroupHole do
     end
   end
 
-  defp advance_entries(entries, first_hole?, final_hole?) do
+  defp advance_entries(entries, first_hole?, final_hole?, playing_group_id) do
     Enum.reduce_while(entries, :ok, fn entry, :ok ->
-      case advance_entry_participation(entry.id, first_hole?, final_hole?) do
+      case advance_entry_participation(entry.id, first_hole?, final_hole?, playing_group_id) do
         :ok -> {:cont, :ok}
         {:error, reason} -> {:halt, {:error, reason}}
       end
     end)
   end
 
-  defp advance_entry_participation(entry_id, first_hole?, final_hole?) do
-    with :ok <- if(first_hole?, do: mark_entry_active(entry_id), else: :ok) do
-      if final_hole?, do: mark_entry_completed(entry_id), else: :ok
+  defp advance_entry_participation(entry_id, first_hole?, final_hole?, playing_group_id) do
+    with :ok <-
+           if(first_hole?,
+             do: mark_entry_active(entry_id, playing_group_id),
+             else: :ok
+           ) do
+      if final_hole?, do: mark_entry_completed(entry_id, playing_group_id), else: :ok
     end
   end
 
-  defp mark_entry_active(entry_id) do
+  defp mark_entry_active(entry_id, playing_group_id) do
+    ctx = progression_context(playing_group_id, :mark_participation_active, entry_id)
+
     RoundEntry
     |> Ash.get!(entry_id, authorize?: false)
     |> Changeset.for_update(:mark_participation_active_internal, %{})
+    |> Ash.Changeset.set_context(ctx)
     |> Ash.update(authorize?: false)
     |> case do
       {:ok, _} -> :ok
@@ -275,10 +358,13 @@ defmodule GolfScoring.Scoring.Services.SubmitGroupHole do
     end
   end
 
-  defp mark_entry_completed(entry_id) do
+  defp mark_entry_completed(entry_id, playing_group_id) do
+    ctx = progression_context(playing_group_id, :mark_participation_completed, entry_id)
+
     RoundEntry
     |> Ash.get!(entry_id, authorize?: false)
     |> Changeset.for_update(:mark_participation_completed_internal, %{})
+    |> Ash.Changeset.set_context(ctx)
     |> Ash.update(authorize?: false)
     |> case do
       {:ok, _} -> :ok
@@ -296,8 +382,11 @@ defmodule GolfScoring.Scoring.Services.SubmitGroupHole do
   end
 
   defp mark_group_playing(group) do
+    ctx = progression_context(group.id, :mark_group_playing, group.id)
+
     group
     |> Changeset.for_update(:mark_group_playing, %{})
+    |> Ash.Changeset.set_context(ctx)
     |> Ash.update(authorize?: false)
     |> case do
       {:ok, _} -> :ok
@@ -306,8 +395,11 @@ defmodule GolfScoring.Scoring.Services.SubmitGroupHole do
   end
 
   defp increment_revision(group) do
+    ctx = progression_context(group.id, :increment_scoring_revision, group.id)
+
     group
     |> Changeset.for_update(:increment_scoring_revision_internal, %{})
+    |> Ash.Changeset.set_context(ctx)
     |> Ash.update(authorize?: false)
     |> case do
       {:ok, _} -> :ok
@@ -316,9 +408,12 @@ defmodule GolfScoring.Scoring.Services.SubmitGroupHole do
   end
 
   defp mark_group_finished(group_id) do
+    ctx = progression_context(group_id, :mark_group_finished, group_id)
+
     PlayingGroup
     |> Ash.get!(group_id, authorize?: false)
     |> Changeset.for_update(:mark_group_finished, %{})
+    |> Ash.Changeset.set_context(ctx)
     |> Ash.update(authorize?: false)
     |> case do
       {:ok, _} -> :ok
@@ -609,7 +704,7 @@ defmodule GolfScoring.Scoring.Services.SubmitGroupHole do
     end
   end
 
-  defp validate_group(%{round_id: group_round, state: state}, round_id) do
+  defp validate_group_for_new_submission(%{round_id: group_round, state: state}, round_id) do
     cond do
       group_round != round_id ->
         {:error, :playing_group_mismatch}
@@ -784,12 +879,20 @@ defmodule GolfScoring.Scoring.Services.SubmitGroupHole do
   end
 
   defp load_primary_competition(round_id) do
-    case Repo.query!(
-           "SELECT id::text, pickup_policy_identifier FROM round_competitions WHERE round_id = $1::uuid LIMIT 1",
-           [Ecto.UUID.dump!(round_id)]
-         ).rows do
+    rows =
+      Repo.query!(
+        """
+        SELECT id::text, pickup_policy_identifier
+        FROM round_competitions
+        WHERE round_id = $1::uuid AND is_primary = true
+        """,
+        [Ecto.UUID.dump!(round_id)]
+      ).rows
+
+    case rows do
       [[id, policy]] -> {:ok, %{id: Ecto.UUID.cast!(id), pickup_policy_identifier: policy}}
-      [] -> {:error, :round_competition_not_configured}
+      [] -> {:error, :primary_round_competition_missing}
+      _ -> {:error, :ambiguous_primary_round_competition}
     end
   end
 
@@ -870,18 +973,19 @@ defmodule GolfScoring.Scoring.Services.SubmitGroupHole do
     holes =
       Repo.query!(
         """
-        SELECT round_hole_id::text, par::int, stroke_index::int
+        SELECT round_hole_id::text, par::int, stroke_index::int, plus_stroke_order::int
         FROM round_tee_hole_snapshots
         WHERE round_tee_profile_snapshot_id = $1::uuid
         ORDER BY round_hole_id
         """,
         [Ecto.UUID.dump!(snapshot_id)]
       ).rows
-      |> Enum.map(fn [round_hole_id, par, stroke_index] ->
+      |> Enum.map(fn [round_hole_id, par, stroke_index, plus_stroke_order] ->
         %{
           round_hole_id: Ecto.UUID.cast!(round_hole_id),
           par: par,
-          stroke_index: stroke_index
+          stroke_index: stroke_index,
+          plus_stroke_order: plus_stroke_order
         }
       end)
 
@@ -892,18 +996,17 @@ defmodule GolfScoring.Scoring.Services.SubmitGroupHole do
     end
   end
 
-  defp confirm_no_conflicting_hole_results(entries, round_hole_id) do
-    entry_ids = Enum.map(entries, & &1.id)
+  defp confirm_no_conflicting_hole_results(scorecards, round_hole_id) do
+    scorecard_ids = Enum.map(scorecards, & &1.id)
 
     count =
       Repo.query!(
         """
         SELECT count(*)::int
-        FROM hole_results hr
-        INNER JOIN scorecards sc ON sc.id = hr.scorecard_id
-        WHERE hr.round_hole_id = $1::uuid AND sc.round_entry_id = ANY($2::uuid[])
+        FROM hole_results
+        WHERE round_hole_id = $1::uuid AND scorecard_id = ANY($2::uuid[])
         """,
-        [Ecto.UUID.dump!(round_hole_id), Enum.map(entry_ids, &Ecto.UUID.dump!/1)]
+        [Ecto.UUID.dump!(round_hole_id), Enum.map(scorecard_ids, &Ecto.UUID.dump!/1)]
       ).rows
       |> hd()
       |> hd()
@@ -958,9 +1061,49 @@ defmodule GolfScoring.Scoring.Services.SubmitGroupHole do
 
   defp payload_fingerprint(cmd, actor_ctx) do
     cmd
-    |> semantic_payload_map(actor_ctx)
-    |> Jason.encode!()
+    |> canonical_fingerprint_term(actor_ctx)
+    |> :erlang.term_to_binary([:deterministic])
     |> then(&:crypto.hash(:sha256, &1))
+  end
+
+  defp canonical_fingerprint_term(cmd, actor_ctx) do
+    {
+      cmd.playing_group_id,
+      cmd.round_hole_id,
+      cmd.expected_group_score_revision,
+      canonical_role_assignment_version(cmd, actor_ctx),
+      DateTime.to_unix(cmd.captured_at, :microsecond),
+      canonical_actor_term(actor_ctx),
+      canonical_sorted_results(cmd.results)
+    }
+  end
+
+  defp canonical_role_assignment_version(%{role_assignment_version: version}, %{kind: :player})
+       when is_integer(version),
+       do: version
+
+  defp canonical_role_assignment_version(_, %{kind: :staff}), do: nil
+
+  defp canonical_actor_term(%{kind: :staff, staff_id: id}), do: {:staff, id}
+
+  defp canonical_actor_term(%{
+         kind: :player,
+         round_entry_id: entry_id,
+         role_assignment_version: version
+       }),
+       do: {:player, entry_id, version}
+
+  defp canonical_sorted_results(results) do
+    results
+    |> Enum.map(fn result ->
+      {
+        result.round_entry_id,
+        normalize_outcome(result.outcome),
+        result.gross_strokes,
+        Map.get(result, :strokes_taken)
+      }
+    end)
+    |> Enum.sort_by(fn {entry_id, _, _, _} -> entry_id end)
   end
 
   defp semantic_payload_map(cmd, actor_ctx) do

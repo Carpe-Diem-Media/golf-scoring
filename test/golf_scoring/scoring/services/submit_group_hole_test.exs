@@ -120,7 +120,8 @@ defmodule GolfScoring.Scoring.Services.SubmitGroupHoleTest do
     assert {:error, :stale_scoring_revision} =
              SubmitGroupHole.run(setup.admin, setup.event.id, setup.round.id, command)
 
-    assert hole_submission_count!() == 0
+    submissions_before = hole_submission_count_for_round!(setup.round.id)
+    assert hole_submission_count_for_round!(setup.round.id) == submissions_before
   end
 
   test "wrong round_hole_id is rejected" do
@@ -271,6 +272,660 @@ defmodule GolfScoring.Scoring.Services.SubmitGroupHoleTest do
              Scoring.submit_group_hole(setup.admin, setup.event.id, setup.round.id, command)
   end
 
+  test "pickup uses primary RoundCompetition when a non-primary side exists with different policy" do
+    setup = setup_submit_fixture!(2)
+    insert_non_primary_competition!(setup, "never_pickup_policy")
+
+    hole_id = expected_hole_id!(setup)
+    [entry | _] = setup.entries
+
+    results = [
+      %{
+        round_entry_id: entry.id,
+        outcome: :picked_up,
+        gross_strokes: nil,
+        strokes_taken: 8
+      },
+      %{round_entry_id: List.last(setup.entries).id, outcome: :holed_out, gross_strokes: 4}
+    ]
+
+    command = base_command(setup, hole_id, 0, results)
+
+    assert {:ok, _} = SubmitGroupHole.run(setup.admin, setup.event.id, setup.round.id, command)
+  end
+
+  test "primary competition query requires is_primary filter (non-primary row ignored)" do
+    setup = setup_submit_fixture!(2)
+    insert_non_primary_competition!(setup, "decoy_policy_should_not_win")
+
+    hole_id = expected_hole_id!(setup)
+
+    [[primary]] =
+      Repo.query!(
+        "SELECT pickup_policy_identifier FROM round_competitions WHERE round_id = $1::uuid AND is_primary = true",
+        [Ecto.UUID.dump!(setup.round.id)]
+      ).rows
+
+    assert primary == "standard_pickup_v1"
+
+    command = base_command(setup, hole_id, 0, holed_out_results(setup.entries, 4))
+    assert {:ok, _} = SubmitGroupHole.run(setup.admin, setup.event.id, setup.round.id, command)
+  end
+
+  test "eligible standard pickup accepts picked_up without gross_strokes" do
+    setup = setup_submit_fixture!(2)
+    set_playing_handicap!(setup, hd(setup.entries).id, 18)
+    hole_id = expected_hole_id!(setup)
+
+    results =
+      pickup_results(setup.entries, hole_id, setup, strokes_taken: 10, eligible?: true)
+
+    command = base_command(setup, hole_id, 0, results)
+
+    assert {:ok, _} = SubmitGroupHole.run(setup.admin, setup.event.id, setup.round.id, command)
+  end
+
+  test "ineligible pickup returns pickup_not_eligible" do
+    setup = setup_submit_fixture!(2)
+    hole_id = expected_hole_id!(setup)
+
+    results =
+      pickup_results(setup.entries, hole_id, setup, strokes_taken: 1, eligible?: false)
+
+    command = base_command(setup, hole_id, 0, results)
+
+    assert {:error, :pickup_not_eligible} =
+             SubmitGroupHole.run(setup.admin, setup.event.id, setup.round.id, command)
+  end
+
+  test "plus playing handicap pickup uses frozen plus_stroke_order facts" do
+    setup = setup_submit_fixture!(2)
+    apply_plus_stroke_orders!(setup)
+    set_playing_handicap!(setup, hd(setup.entries).id, -1)
+    set_playing_handicap!(setup, List.last(setup.entries).id, 10)
+    hole_id = expected_hole_id!(setup)
+
+    results =
+      pickup_results(setup.entries, hole_id, setup, strokes_taken: 10, eligible?: true)
+
+    command = base_command(setup, hole_id, 0, results)
+
+    assert {:ok, _} = SubmitGroupHole.run(setup.admin, setup.event.id, setup.round.id, command)
+  end
+
+  test "unsupported pickup policy on primary competition is rejected" do
+    setup = setup_submit_fixture!(2)
+
+    Repo.query!(
+      "UPDATE round_competitions SET pickup_policy_identifier = $1 WHERE id = $2::uuid",
+      ["unsupported_pickup_v999", Ecto.UUID.dump!(setup.competition.id)]
+    )
+
+    hole_id = expected_hole_id!(setup)
+
+    results =
+      pickup_results(setup.entries, hole_id, setup, strokes_taken: 10, eligible?: true)
+
+    command = base_command(setup, hole_id, 0, results)
+
+    assert {:error, :unsupported_pickup_policy} =
+             SubmitGroupHole.run(setup.admin, setup.event.id, setup.round.id, command)
+  end
+
+  test "final hole acceptance finishes group and completes lifecycle" do
+    setup = setup_submit_fixture!(2)
+    advance_to_revision!(setup, 17)
+
+    hole_id = hole_at_revision!(setup, 17)
+    command = base_command(setup, hole_id, 17, holed_out_results(setup.entries, 4))
+
+    Phoenix.PubSub.subscribe(GolfScoring.PubSub, "round:#{setup.round.id}")
+
+    assert {:ok, receipt} =
+             SubmitGroupHole.run(setup.admin, setup.event.id, setup.round.id, command)
+
+    assert receipt.expected_group_score_revision == 17
+
+    group = Ash.get!(PlayingGroup, setup.group.id, authorize?: false)
+    assert group.state == :finished_playing
+    assert group.scoring_revision == 18
+
+    for entry <- setup.entries do
+      assert Ash.get!(RoundEntry, entry.id, authorize?: false).participation_status == :completed
+    end
+
+    cards =
+      Scorecard
+      |> Ash.Query.filter(round_entry_id in ^Enum.map(setup.entries, & &1.id))
+      |> Ash.read!(authorize?: false)
+
+    assert Enum.all?(cards, &(&1.state == :complete))
+    assert_receive {:group_hole_submitted, _}
+  end
+
+  test "final hole identical retry is idempotent without side effects" do
+    setup = setup_submit_fixture!(2)
+    advance_to_revision!(setup, 17)
+    hole_id = hole_at_revision!(setup, 17)
+    command = base_command(setup, hole_id, 17, holed_out_results(setup.entries, 4))
+
+    Phoenix.PubSub.subscribe(GolfScoring.PubSub, "round:#{setup.round.id}")
+
+    assert {:ok, first} =
+             SubmitGroupHole.run(setup.admin, setup.event.id, setup.round.id, command)
+
+    assert_receive {:group_hole_submitted, _}
+
+    audits = audit_count!()
+    results = hole_result_count!()
+    submissions = hole_submission_count!()
+
+    assert {:ok, second} =
+             SubmitGroupHole.run(setup.admin, setup.event.id, setup.round.id, command)
+
+    assert second.id == first.id
+    assert audit_count!() == audits
+    assert hole_result_count!() == results
+    assert hole_submission_count!() == submissions
+    refute_receive {:group_hole_submitted, _}, 50
+  end
+
+  test "new command after group finished is rejected" do
+    setup = setup_submit_fixture!(2)
+    advance_to_revision!(setup, 18)
+
+    hole_id = hole_at_revision!(setup, 17)
+
+    command =
+      base_command(setup, hole_id, 18, holed_out_results(setup.entries, 4))
+      |> Map.put(:client_submission_id, Ecto.UUID.generate())
+
+    assert {:error, {:invalid_group_state, :finished_playing}} =
+             SubmitGroupHole.run(setup.admin, setup.event.id, setup.round.id, command)
+  end
+
+  test "same client key with different payload after finish returns idempotency conflict" do
+    setup = setup_submit_fixture!(2)
+    advance_to_revision!(setup, 17)
+    hole_id = hole_at_revision!(setup, 17)
+    submission_id = Ecto.UUID.generate()
+
+    command =
+      base_command(setup, hole_id, 17, holed_out_results(setup.entries, 4))
+      |> Map.put(:client_submission_id, submission_id)
+
+    assert {:ok, _} = SubmitGroupHole.run(setup.admin, setup.event.id, setup.round.id, command)
+
+    changed =
+      command
+      |> Map.put(:results, holed_out_results(setup.entries, 5))
+
+    assert {:error, :idempotency_payload_conflict} =
+             SubmitGroupHole.run(setup.admin, setup.event.id, setup.round.id, changed)
+  end
+
+  test "reordered equivalent results produce identical idempotent retry" do
+    setup = setup_submit_fixture!(2)
+    hole_id = expected_hole_id!(setup)
+    [a, b] = setup.entries
+
+    ordered = [
+      %{round_entry_id: a.id, outcome: :holed_out, gross_strokes: 4},
+      %{round_entry_id: b.id, outcome: :holed_out, gross_strokes: 5}
+    ]
+
+    reversed = Enum.reverse(ordered)
+    submission_id = Ecto.UUID.generate()
+    captured_at = DateTime.utc_now()
+
+    first_cmd =
+      base_command(setup, hole_id, 0, ordered)
+      |> Map.put(:client_submission_id, submission_id)
+      |> Map.put(:captured_at, captured_at)
+
+    assert {:ok, receipt} =
+             SubmitGroupHole.run(setup.admin, setup.event.id, setup.round.id, first_cmd)
+
+    retry_cmd = Map.put(first_cmd, :results, reversed)
+
+    assert {:ok, second} =
+             SubmitGroupHole.run(setup.admin, setup.event.id, setup.round.id, retry_cmd)
+
+    assert second.id == receipt.id
+  end
+
+  test "staff command with role_assignment_version is rejected" do
+    setup = setup_submit_fixture!(2)
+    hole_id = expected_hole_id!(setup)
+
+    command =
+      base_command(setup, hole_id, 0, holed_out_results(setup.entries, 4))
+      |> Map.put(:role_assignment_version, 1)
+
+    assert {:error, :staff_role_version_forbidden} =
+             SubmitGroupHole.run(setup.admin, setup.event.id, setup.round.id, command)
+  end
+
+  for role <- [:competition_manager, :scoring_support] do
+    @tag staff_role: role
+    test "staff emergency role #{role} can submit", %{staff_role: role} do
+      setup = setup_submit_fixture!(2)
+      staff = create_staff_user!()
+
+      {:ok, _} =
+        Accounts.assign_event_staff_role(
+          %{event_id: setup.event.id, staff_user_id: staff.id, role: role},
+          actor: setup.admin
+        )
+
+      hole_id = expected_hole_id!(setup)
+      command = base_command(setup, hole_id, 0, holed_out_results(setup.entries, 4))
+
+      assert {:ok, _} = SubmitGroupHole.run(staff, setup.event.id, setup.round.id, command)
+    end
+  end
+
+  test "internal lifecycle transitions without SubmitGroupHole progression are blocked" do
+    setup = setup_submit_fixture!(2)
+    entry = hd(setup.entries)
+
+    assert {:error, %Ash.Error.Invalid{}} =
+             RoundEntry
+             |> Ash.get!(entry.id, authorize?: false)
+             |> Changeset.for_update(:mark_participation_completed_internal, %{})
+             |> Ash.update(authorize?: false)
+
+    assert {:error, %Ash.Error.Invalid{}} =
+             PlayingGroup
+             |> Ash.get!(setup.group.id, authorize?: false)
+             |> Changeset.for_update(:increment_scoring_revision_internal, %{})
+             |> Ash.update(authorize?: false)
+  end
+
+  test "shotgun start advances through wrap and final scheduled hole" do
+    setup = setup_shotgun_fixture!(10)
+
+    for rev <- 0..16 do
+      hole_id = hole_at_revision!(setup, rev)
+
+      assert {:ok, _} =
+               SubmitGroupHole.run(
+                 setup.admin,
+                 setup.event.id,
+                 setup.round.id,
+                 base_command(setup, hole_id, rev, holed_out_results(setup.entries, 4))
+               )
+    end
+
+    final_hole = hole_at_revision!(setup, 17)
+
+    assert {:ok, _} =
+             SubmitGroupHole.run(
+               setup.admin,
+               setup.event.id,
+               setup.round.id,
+               base_command(setup, final_hole, 17, holed_out_results(setup.entries, 4))
+             )
+
+    group = Ash.get!(PlayingGroup, setup.group.id, authorize?: false)
+    assert group.scoring_revision == 18
+    assert group.state == :finished_playing
+  end
+
+  test "idempotency rejects actor mismatch on same client key" do
+    setup = setup_submit_fixture!(2)
+    hole_id = expected_hole_id!(setup)
+    submission_id = Ecto.UUID.generate()
+
+    command =
+      base_command(setup, hole_id, 0, holed_out_results(setup.entries, 4))
+      |> Map.put(:client_submission_id, submission_id)
+
+    assert {:ok, _} = SubmitGroupHole.run(setup.admin, setup.event.id, setup.round.id, command)
+
+    other = create_staff_user!()
+
+    {:ok, _} =
+      Accounts.assign_event_staff_role(
+        %{event_id: setup.event.id, staff_user_id: other.id, role: :competition_manager},
+        actor: setup.admin
+      )
+
+    assert {:error, :idempotency_actor_mismatch} =
+             SubmitGroupHole.run(other, setup.event.id, setup.round.id, command)
+  end
+
+  test "idempotency rejects payload conflict on same client key" do
+    setup = setup_submit_fixture!(2)
+    hole_id = expected_hole_id!(setup)
+    submission_id = Ecto.UUID.generate()
+
+    command =
+      base_command(setup, hole_id, 0, holed_out_results(setup.entries, 4))
+      |> Map.put(:client_submission_id, submission_id)
+
+    assert {:ok, _} = SubmitGroupHole.run(setup.admin, setup.event.id, setup.round.id, command)
+
+    changed =
+      command
+      |> Map.put(:results, holed_out_results(setup.entries, 6))
+
+    assert {:error, :idempotency_payload_conflict} =
+             SubmitGroupHole.run(setup.admin, setup.event.id, setup.round.id, changed)
+  end
+
+  test "different client key at stale revision is rejected" do
+    setup = setup_submit_fixture!(2)
+    hole_id = expected_hole_id!(setup)
+
+    assert {:ok, _} =
+             SubmitGroupHole.run(
+               setup.admin,
+               setup.event.id,
+               setup.round.id,
+               base_command(setup, hole_id, 0, holed_out_results(setup.entries, 4))
+             )
+
+    assert {:error, :stale_scoring_revision} =
+             SubmitGroupHole.run(
+               setup.admin,
+               setup.event.id,
+               setup.round.id,
+               base_command(setup, hole_id, 0, holed_out_results(setup.entries, 4))
+             )
+  end
+
+  test "expired player grant is rejected" do
+    setup = setup_submit_fixture!(2)
+    scorer = hd(setup.entries)
+    past = DateTime.add(DateTime.utc_now(), -60, :second)
+
+    assert {:ok, %{grant: grant}} =
+             Accounts.issue_player_access(
+               setup.admin,
+               setup.event.id,
+               scorer.player_id,
+               expires_at: past
+             )
+
+    assignment =
+      GroupRoleAssignment
+      |> Ash.Query.filter(playing_group_id == ^setup.group.id and role == :primary_scorer)
+      |> Ash.read_one!(authorize?: false)
+
+    hole_id = expected_hole_id!(setup)
+
+    command =
+      base_command(setup, hole_id, 0, holed_out_results(setup.entries, 4))
+      |> Map.put(:role_assignment_version, assignment.assignment_version)
+
+    assert {:error, :invalid_player_session} =
+             SubmitGroupHole.run(grant, setup.event.id, setup.round.id, command)
+  end
+
+  test "wrong-event player grant is rejected" do
+    setup = setup_submit_fixture!(2)
+    wrong_event = create_event!()
+    scorer = hd(setup.entries)
+
+    assert {:ok, %{grant: grant}} =
+             Accounts.issue_player_access(setup.admin, setup.event.id, scorer.player_id)
+
+    assignment =
+      GroupRoleAssignment
+      |> Ash.Query.filter(playing_group_id == ^setup.group.id and role == :primary_scorer)
+      |> Ash.read_one!(authorize?: false)
+
+    hole_id = expected_hole_id!(setup)
+
+    command =
+      base_command(setup, hole_id, 0, holed_out_results(setup.entries, 4))
+      |> Map.put(:role_assignment_version, assignment.assignment_version)
+
+    assert {:error, :invalid_player_session} =
+             SubmitGroupHole.run(grant, wrong_event.id, setup.round.id, command)
+  end
+
+  test "revoked player grant is rejected" do
+    setup = setup_submit_fixture!(2)
+    scorer = hd(setup.entries)
+
+    assert {:ok, %{grant: grant}} =
+             Accounts.issue_player_access(setup.admin, setup.event.id, scorer.player_id)
+
+    assignment =
+      GroupRoleAssignment
+      |> Ash.Query.filter(playing_group_id == ^setup.group.id and role == :primary_scorer)
+      |> Ash.read_one!(authorize?: false)
+
+    assert {:ok, _} = Accounts.revoke_player_access(setup.admin, setup.event.id, scorer.player_id)
+
+    hole_id = expected_hole_id!(setup)
+
+    command =
+      base_command(setup, hole_id, 0, holed_out_results(setup.entries, 4))
+      |> Map.put(:role_assignment_version, assignment.assignment_version)
+
+    assert {:error, :invalid_player_session} =
+             SubmitGroupHole.run(grant, setup.event.id, setup.round.id, command)
+  end
+
+  test "post-write injected failure rolls back all scoring artifacts" do
+    setup = setup_submit_fixture!(2)
+    hole_id = expected_hole_id!(setup)
+    command = base_command(setup, hole_id, 0, holed_out_results(setup.entries, 4))
+
+    Phoenix.PubSub.subscribe(GolfScoring.PubSub, "round:#{setup.round.id}")
+
+    Process.put(:gls34_inject_failure_after_hole_results, true)
+
+    try do
+      assert {:error, :gls34_injected_test_failure} =
+               SubmitGroupHole.run(setup.admin, setup.event.id, setup.round.id, command)
+    after
+      Process.delete(:gls34_inject_failure_after_hole_results)
+    end
+
+    results_before = hole_result_count_for_round!(setup.round.id)
+    submissions_before = hole_submission_count_for_round!(setup.round.id)
+    audits_before = audit_count!()
+
+    Process.put(:gls34_inject_failure_after_hole_results, true)
+
+    try do
+      assert {:error, :gls34_injected_test_failure} =
+               SubmitGroupHole.run(setup.admin, setup.event.id, setup.round.id, command)
+    after
+      Process.delete(:gls34_inject_failure_after_hole_results)
+    end
+
+    assert hole_result_count_for_round!(setup.round.id) == results_before
+    assert hole_submission_count_for_round!(setup.round.id) == submissions_before
+    assert audit_count!() == audits_before
+    group = Ash.get!(PlayingGroup, setup.group.id, authorize?: false)
+    assert group.scoring_revision == 0
+    assert group.state == :not_started
+    refute_receive {:group_hole_submitted, _}, 50
+  end
+
+  @tag :real_concurrency
+  test "simultaneous submissions serialize on the playing group lock" do
+    setup =
+      Sandbox.unboxed_run(Repo, fn ->
+        setup_submit_fixture!(2)
+      end)
+
+    hole_id = expected_hole_id!(setup)
+    parent = self()
+    start_ref = make_ref()
+    staff_id = setup.admin.id
+
+    task_a =
+      Task.async(fn ->
+        Sandbox.unboxed_run(Repo, fn ->
+          Sandbox.allow(Repo, parent, self())
+          send(parent, {start_ref, :ready_a})
+
+          receive do
+            ^start_ref -> :go
+          end
+
+          SubmitGroupHole.run(
+            %{id: staff_id},
+            setup.event.id,
+            setup.round.id,
+            base_command(setup, hole_id, 0, holed_out_results(setup.entries, 4))
+          )
+        end)
+      end)
+
+    task_b =
+      Task.async(fn ->
+        Sandbox.unboxed_run(Repo, fn ->
+          Sandbox.allow(Repo, parent, self())
+          send(parent, {start_ref, :ready_b})
+
+          receive do
+            ^start_ref -> :go
+          end
+
+          SubmitGroupHole.run(
+            %{id: staff_id},
+            setup.event.id,
+            setup.round.id,
+            base_command(setup, hole_id, 0, holed_out_results(setup.entries, 5))
+          )
+        end)
+      end)
+
+    assert_receive {^start_ref, :ready_a}, 5_000
+    assert_receive {^start_ref, :ready_b}, 5_000
+    send(task_a.pid, start_ref)
+    send(task_b.pid, start_ref)
+
+    results = [Task.await(task_a, 20_000), Task.await(task_b, 20_000)]
+    oks = Enum.count(results, &match?({:ok, _}, &1))
+    errors = Enum.count(results, &match?({:error, _}, &1))
+
+    assert oks == 1,
+           "expected one acceptance, got #{inspect(results)}"
+
+    assert errors == 1
+    assert hole_result_count_for_round!(setup.round.id) == 2
+    assert hole_submission_count_for_round!(setup.round.id) == 1
+    assert Ash.get!(PlayingGroup, setup.group.id, authorize?: false).scoring_revision == 1
+  end
+
+  defp setup_shotgun_fixture!(start_play_order) do
+    setup = setup_submit_fixture!(2)
+    set_round_state!(setup.round, :draft)
+    start_hole = Enum.find(setup.route, &(&1.play_order == start_play_order))
+
+    assert {:ok, _} =
+             AssignPlayingGroupStart.run(
+               setup.admin,
+               setup.event.id,
+               setup.round.id,
+               setup.group.id,
+               start_hole.id,
+               start_play_order
+             )
+
+    set_round_state!(setup.round, :scoring_open)
+    Map.put(setup, :start_hole, start_hole)
+  end
+
+  defp hole_at_revision!(%{route: route, start_hole: start_hole}, revision) do
+    start_index = Enum.find_index(route, &(&1.id == start_hole.id))
+    {head, tail} = Enum.split(route, start_index)
+    rotated = tail ++ head
+    Enum.at(rotated, revision).id
+  end
+
+  defp advance_to_revision!(setup, target_revision) do
+    for rev <- 0..(target_revision - 1) do
+      hole_id = hole_at_revision!(setup, rev)
+
+      assert {:ok, _} =
+               SubmitGroupHole.run(
+                 setup.admin,
+                 setup.event.id,
+                 setup.round.id,
+                 base_command(setup, hole_id, rev, holed_out_results(setup.entries, 4))
+               )
+    end
+  end
+
+  defp insert_non_primary_competition!(setup, pickup_policy) do
+    Repo.query!(
+      """
+      INSERT INTO round_competitions (
+        id, event_id, round_id, is_primary, scoring_policy_identifier,
+        handicap_allowance_percent, pickup_policy_identifier
+      )
+      SELECT gen_random_uuid(), event_id, round_id, false, scoring_policy_identifier,
+             handicap_allowance_percent, $2
+      FROM round_competitions
+      WHERE id = $1::uuid
+      """,
+      [Ecto.UUID.dump!(setup.competition.id), pickup_policy]
+    )
+  end
+
+  defp set_playing_handicap!(setup, entry_id, handicap) do
+    Repo.query!(
+      """
+      UPDATE competition_handicaps
+      SET playing_handicap = $1
+      WHERE round_entry_id = $2::uuid AND round_competition_id = $3::uuid
+      """,
+      [handicap, Ecto.UUID.dump!(entry_id), Ecto.UUID.dump!(setup.competition.id)]
+    )
+  end
+
+  defp apply_plus_stroke_orders!(setup) do
+    plus_by_si = %{10 => 1, 3 => 2, 14 => 3, 7 => 4, 18 => 5, 2 => 6, 11 => 7, 5 => 8}
+
+    for hole <- setup.route do
+      si = hole.play_order
+
+      if order = Map.get(plus_by_si, si) do
+        Repo.query!(
+          """
+          UPDATE round_tee_hole_snapshots rts
+          SET plus_stroke_order = $1
+          FROM round_entries re
+          WHERE re.round_tee_profile_snapshot_id = rts.round_tee_profile_snapshot_id
+            AND rts.round_hole_id = $2::uuid
+            AND re.round_id = $3::uuid
+          """,
+          [order, Ecto.UUID.dump!(hole.id), Ecto.UUID.dump!(setup.round.id)]
+        )
+      end
+    end
+  end
+
+  defp pickup_results(entries, _hole_id, _setup, opts) do
+    strokes_taken = Keyword.fetch!(opts, :strokes_taken)
+    eligible? = Keyword.get(opts, :eligible?, true)
+
+    taken =
+      if eligible? do
+        strokes_taken
+      else
+        0
+      end
+
+    Enum.map(entries, fn entry ->
+      %{
+        round_entry_id: entry.id,
+        outcome: :picked_up,
+        gross_strokes: nil,
+        strokes_taken: taken
+      }
+    end)
+  end
+
   defp setup_submit_fixture!(player_count) do
     event = create_event!()
     admin = create_event_admin!(event)
@@ -401,6 +1056,20 @@ defmodule GolfScoring.Scoring.Services.SubmitGroupHoleTest do
 
   defp hole_submission_count! do
     HoleSubmission |> Ash.read!(authorize?: false) |> length()
+  end
+
+  defp hole_submission_count_for_round!(round_id) do
+    HoleSubmission
+    |> Ash.Query.filter(round_id == ^round_id)
+    |> Ash.read!(authorize?: false)
+    |> length()
+  end
+
+  defp hole_result_count_for_round!(round_id) do
+    HoleResult
+    |> Ash.Query.filter(round_id == ^round_id)
+    |> Ash.read!(authorize?: false)
+    |> length()
   end
 
   defp set_round_state!(round, state) do

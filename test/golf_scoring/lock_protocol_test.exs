@@ -307,6 +307,71 @@ defmodule GolfScoring.LockProtocolTest do
     refute future_table_sql_fragment?("mystery_reveals")
   end
 
+  test "score_row second transaction blocks until the first releases" do
+    card_a =
+      Sandbox.unboxed_run(Repo, fn ->
+        fixture = setup_representative_fixture!()
+
+        GolfScoring.Scoring.Scorecard
+        |> Changeset.for_create(:create_internal, %{
+          round_id: fixture.round.id,
+          round_entry_id: fixture.assignment.round_entry_id
+        })
+        |> Ash.create!(authorize?: false)
+      end)
+
+    parent = self()
+
+    try do
+      blocker =
+        Task.async(fn ->
+          Sandbox.unboxed_run(Repo, fn ->
+            Repo.transaction(fn ->
+              assert {:ok, _} = LockProtocol.acquire!(score_row: [card_a.id])
+              send(parent, {:gls34_score_row_held, pg_backend_pid()})
+
+              receive do
+                :gls34_release_score_row -> :released
+              after
+                15_000 -> Repo.rollback(:gls34_blocker_timeout)
+              end
+            end)
+          end)
+        end)
+
+      assert_receive {:gls34_score_row_held, _blocker_backend}, 5_000
+
+      waiter =
+        Task.async(fn ->
+          Sandbox.unboxed_run(Repo, fn ->
+            send(parent, {:gls34_score_row_waiter_ready, pg_backend_pid()})
+
+            Repo.transaction(fn ->
+              case LockProtocol.acquire!(score_row: [card_a.id]) do
+                {:ok, _} = ok ->
+                  send(parent, :gls34_score_row_waiter_acquired)
+                  ok
+
+                {:error, reason} ->
+                  Repo.rollback(reason)
+              end
+            end)
+          end)
+        end)
+
+      assert_receive {:gls34_score_row_waiter_ready, waiter_backend}, 5_000
+      await_lock_waiters!([waiter_backend])
+      refute_received_message(:gls34_score_row_waiter_acquired, 200)
+
+      send(blocker.pid, :gls34_release_score_row)
+      assert {:ok, _} = Task.await(blocker, 10_000)
+      assert {:ok, {:ok, %{acquired: [_]}}} = Task.await(waiter, 10_000)
+      assert_received_message(:gls34_score_row_waiter_acquired, 5_000)
+    after
+      :ok
+    end
+  end
+
   test "score_row locks scorecards in stable UUID order with row facts" do
     fixture = setup_representative_fixture!()
 
