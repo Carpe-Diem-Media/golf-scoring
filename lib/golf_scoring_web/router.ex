@@ -60,6 +60,17 @@ defmodule GolfScoringWeb.Router do
     end
   end
 
+  scope "/player", alias: false do
+    pipe_through [:browser, :require_player_access]
+
+    live_session :player_scorecard,
+      on_mount: [{GolfScoringWeb.Player.LiveMount, :require_grant}] do
+      live "/events/:event_id/rounds/:round_id/groups/:group_id/scorecard",
+           GolfScoringWeb.Scoring.GroupScorecardLive,
+           :show
+    end
+  end
+
   scope "/admin" do
     pipe_through :browser
 
