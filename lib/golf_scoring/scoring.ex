@@ -1,5 +1,11 @@
 defmodule GolfScoring.Scoring do
-  @moduledoc "Handicap snapshots, competition handicaps, and authoritative score records."
+  @moduledoc """
+  Public application interface for scoring operations and scorecard reads.
+
+  Score submissions remain owned by `SubmitGroupHole`; scorecard reads and
+  preview projections are provided here so web modules do not own scoring
+  queries, authorization, or golf calculations.
+  """
 
   use Ash.Domain
 
@@ -8,6 +14,7 @@ defmodule GolfScoring.Scoring do
   alias GolfScoring.Scoring.Services.BuildHandicapSnapshot
   alias GolfScoring.Scoring.Services.ConfirmHandicapInput
   alias GolfScoring.Scoring.Services.ConfirmHandicapInputForPlayerGrant
+  alias GolfScoring.Scoring.Services.LoadGroupScorecard
   alias GolfScoring.Scoring.Services.OverrideHandicapBasis
   alias GolfScoring.Scoring.Services.SubmitGroupHole
 
@@ -50,5 +57,36 @@ defmodule GolfScoring.Scoring do
 
   def submit_group_hole(actor, event_id, round_id, command) do
     SubmitGroupHole.run(actor, event_id, round_id, command)
+  end
+
+  @doc """
+  Loads the scorecard for a player grant and route identifiers.
+
+  The current grant and primary-scorer assignment are revalidated for every
+  read. The round must be open for scoring. The result contains the authorized
+  roster, frozen hole and handicap facts, and the physical route.
+  """
+  @spec load_group_scorecard(term(), term(), term(), term()) ::
+          {:ok, LoadGroupScorecard.scorecard()} | {:error, term()}
+  def load_group_scorecard(grant, event_id, round_id, group_id) do
+    LoadGroupScorecard.run(grant, event_id, round_id, group_id)
+  end
+
+  @doc """
+  Finds and loads the current grant holder's assigned scorecard.
+
+  Returns an error when the grant has no single active primary-scorer group in
+  an open round.
+  """
+  @spec load_assigned_group_scorecard(term()) ::
+          {:ok, LoadGroupScorecard.scorecard()} | {:error, term()}
+  def load_assigned_group_scorecard(grant) do
+    LoadGroupScorecard.run_for_assigned_group(grant)
+  end
+
+  @doc "Calculates presentation previews from a scorecard and current form values."
+  @spec preview_group_scorecard(LoadGroupScorecard.scorecard(), map()) :: [map()]
+  def preview_group_scorecard(scorecard, result_values) do
+    LoadGroupScorecard.preview(scorecard, result_values)
   end
 end

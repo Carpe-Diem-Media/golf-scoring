@@ -3,12 +3,24 @@ defmodule GolfScoringWeb.Player.HomeLive do
 
   use GolfScoringWeb, :live_view
 
+  alias GolfScoring.Scoring
+
   @impl true
   def mount(_params, _session, socket) do
+    scorecard_path =
+      case Scoring.load_assigned_group_scorecard(socket.assigns.current_player_access_grant) do
+        {:ok, scorecard} ->
+          ~p"/player/events/#{scorecard.event_id}/rounds/#{scorecard.round_id}/groups/#{scorecard.group_id}/scorecard"
+
+        {:error, _reason} ->
+          nil
+      end
+
     {:ok,
      socket
      |> assign(:page_title, "Home")
-     |> assign(:current_path, ~p"/player")}
+     |> assign(:current_path, ~p"/player")
+     |> assign(:scorecard_path, scorecard_path)}
   end
 
   @impl true
@@ -41,12 +53,23 @@ defmodule GolfScoringWeb.Player.HomeLive do
           </dl>
 
           <section
-            id="player-future-scoring"
+            id="player-scorecard"
             class="rounded-xl border border-dashed border-base-300 bg-base-200/30 px-4 py-5"
           >
             <h3 class="text-base font-semibold">Scorecard</h3>
-            <p class="mt-2 text-sm text-base-content/80">
-              Hole-by-hole entry is not available yet. It will appear here when scoring opens.
+            <p :if={@scorecard_path} class="mt-2 text-sm text-base-content/80">
+              Your group is ready for online scoring.
+            </p>
+            <.link
+              :if={@scorecard_path}
+              id="player-scorecard-link"
+              navigate={@scorecard_path}
+              class="mt-4 inline-flex min-h-11 items-center justify-center rounded-lg bg-primary px-4 text-sm font-semibold text-base-content shadow-sm transition hover:brightness-95 active:scale-[0.99] active:brightness-95 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-base-content motion-reduce:transform-none"
+            >
+              Open group scorecard
+            </.link>
+            <p :if={!@scorecard_path} class="mt-2 text-sm text-base-content/80">
+              Your scorecard will appear here when you are the group's active scorer and scoring is open.
             </p>
           </section>
 
