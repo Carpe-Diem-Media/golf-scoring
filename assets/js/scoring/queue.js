@@ -16,6 +16,7 @@ const STORED_RECORD_FIELDS = [
   "scope_key",
   "metadata",
   "command",
+  "submission_id_key",
   "sequence",
   "record_key",
 ];
@@ -43,6 +44,9 @@ function recoverRecord(record, requestedScopeKey) {
   }
   if (!Number.isSafeInteger(record.sequence) || record.sequence < 1) {
     throw new InvalidStoredRecordError("Stored queue sequence is invalid");
+  }
+  if (record.submission_id_key !== record.command.client_submission_id.toLowerCase()) {
+    throw new InvalidStoredRecordError("Stored submission ID key does not match its command");
   }
 
   const validated = serializeSubmission({

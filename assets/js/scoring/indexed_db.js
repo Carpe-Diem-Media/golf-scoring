@@ -1,4 +1,5 @@
 import {
+  canonicalSubmissionPayload,
   InvalidLifecycleTransitionError,
   serializeSubmission,
 } from "./submission_serializer.js";
@@ -9,8 +10,11 @@ export const SCORING_STORE_NAMES = Object.freeze({
   sequences: "scope_sequences",
 });
 
-const DATABASE_VERSION = 1;
+const DATABASE_VERSION = 2;
 const ORDER_INDEX = "by_scope_order";
+const SUBMISSION_ID_INDEX = "by_submission_id";
+const SUBMISSION_ID_KEY = "submission_id_key";
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 export class IndexedDBUnavailableError extends Error {
   constructor() {
@@ -27,8 +31,8 @@ export class IndexedDBUpgradeBlockedError extends Error {
 }
 
 export class DuplicateSubmissionError extends Error {
-  constructor() {
-    super("client_submission_id is already stored with a different command");
+  constructor(message = "client_submission_id is already stored with a different command") {
+    super(message);
     this.name = "DuplicateSubmissionError";
   }
 }
@@ -58,6 +62,15 @@ export function openScoringDatabase(options = {}) {
       reject(error);
     };
 
+    const abortUpgrade = (error) => {
+      upgradeError = error;
+      try {
+        request.transaction.abort();
+      } catch (_abortError) {
+        // The version-change transaction already aborted.
+      }
+    };
+
     try {
       request = factory.open(name, DATABASE_VERSION);
     } catch (error) {
@@ -65,9 +78,10 @@ export function openScoringDatabase(options = {}) {
       return;
     }
 
-    request.onupgradeneeded = () => {
+    request.onupgradeneeded = (event) => {
       try {
         const db = request.result;
+        const previousVersion = event.oldVersion;
         let pendingStore;
         if (db.objectStoreNames.contains(SCORING_STORE_NAMES.pending)) {
           pendingStore = request.transaction.objectStore(SCORING_STORE_NAMES.pending);
@@ -80,9 +94,21 @@ export function openScoringDatabase(options = {}) {
         if (!db.objectStoreNames.contains(SCORING_STORE_NAMES.sequences)) {
           db.createObjectStore(SCORING_STORE_NAMES.sequences, { keyPath: "scope_key" });
         }
+        if (previousVersion < DATABASE_VERSION) {
+          const ensureUniqueSubmissionIndex = () => {
+            if (!pendingStore.indexNames.contains(SUBMISSION_ID_INDEX)) {
+              pendingStore.createIndex(SUBMISSION_ID_INDEX, SUBMISSION_ID_KEY, { unique: true });
+            }
+          };
+          if (previousVersion > 0) {
+            // Preflight so legacy collisions fail explicitly before any index backfill begins.
+            migrateLegacySubmissionIds(pendingStore, ensureUniqueSubmissionIndex, abortUpgrade);
+          } else {
+            ensureUniqueSubmissionIndex();
+          }
+        }
       } catch (error) {
-        upgradeError = error;
-        request.transaction.abort();
+        abortUpgrade(error);
       }
     };
 
@@ -99,6 +125,69 @@ export function openScoringDatabase(options = {}) {
       resolve(db);
     };
   });
+}
+
+function migrateLegacySubmissionIds(pendingStore, ensureUniqueSubmissionIndex, abortUpgrade) {
+  const submissionIds = new Set();
+  const scanRequest = pendingStore.openCursor();
+  scanRequest.onerror = (event) => {
+    abortUpgrade(event.target?.error || new InvalidStoredRecordError("Could not read legacy pending commands"));
+  };
+  scanRequest.onsuccess = () => {
+    const cursor = scanRequest.result;
+    if (cursor) {
+      const submissionId = cursor.value?.command?.client_submission_id;
+      if (typeof submissionId !== "string" || !UUID.test(submissionId)) {
+        abortUpgrade(new InvalidStoredRecordError("Legacy pending command has an invalid submission ID"));
+        return;
+      }
+      const submissionIdKey = submissionId.toLowerCase();
+      if (submissionIds.has(submissionIdKey)) {
+        abortUpgrade(new DuplicateSubmissionError("Legacy pending commands contain duplicate submission IDs"));
+        return;
+      }
+      submissionIds.add(submissionIdKey);
+      cursor.continue();
+      return;
+    }
+
+    try {
+      ensureUniqueSubmissionIndex();
+      backfillLegacySubmissionIds(pendingStore, abortUpgrade);
+    } catch (error) {
+      abortUpgrade(error);
+    }
+  };
+}
+
+function backfillLegacySubmissionIds(pendingStore, abortUpgrade) {
+  const cursorRequest = pendingStore.openCursor();
+  cursorRequest.onerror = (event) => {
+    abortUpgrade(event.target?.error || new InvalidStoredRecordError("Could not backfill legacy submission IDs"));
+  };
+  cursorRequest.onsuccess = () => {
+    const cursor = cursorRequest.result;
+    if (!cursor) return;
+
+    const submissionId = cursor.value?.command?.client_submission_id;
+    try {
+      const updateRequest = cursor.update({
+        ...cursor.value,
+        [SUBMISSION_ID_KEY]: submissionId.toLowerCase(),
+      });
+      updateRequest.onerror = (event) => {
+        const error = event.target?.error || updateRequest.error;
+        abortUpgrade(
+          error?.name === "ConstraintError"
+            ? new DuplicateSubmissionError("Legacy pending commands contain duplicate submission IDs")
+            : error || new InvalidStoredRecordError("Could not index a legacy pending command"),
+        );
+      };
+      cursor.continue();
+    } catch (error) {
+      abortUpgrade(error);
+    }
+  };
 }
 
 export async function persistValidatedRecord(record, options = {}) {
@@ -172,19 +261,30 @@ function persistInTransaction(db, record) {
       }
     };
 
-    const existingRequest = pending.get(recordKey);
+    const submissionIdKey = record.command.client_submission_id.toLowerCase();
+    const existingRequest = pending.index(SUBMISSION_ID_INDEX).get(submissionIdKey);
     existingRequest.onsuccess = () => {
       const existing = existingRequest.result;
       if (existing) {
-        if (
-          JSON.stringify(existing.command) !== JSON.stringify(record.command) ||
-          JSON.stringify(existing.metadata) !== JSON.stringify(record.metadata)
-        ) {
-          abortWith(new DuplicateSubmissionError());
-          return;
-        }
         if (existing.state !== "PERSISTED") {
           abortWith(new InvalidStoredRecordError("Stored command has an invalid lifecycle state"));
+          return;
+        }
+        if (existing[SUBMISSION_ID_KEY] !== submissionIdKey) {
+          abortWith(new InvalidStoredRecordError("Stored submission ID index does not match its command"));
+          return;
+        }
+        if (existing.scope_key !== record.scope_key) {
+          abortWith(new DuplicateSubmissionError("client_submission_id is already stored in another scoring scope"));
+          return;
+        }
+        try {
+          if (canonicalPayloadForRecord(existing) !== canonicalPayloadForRecord(record)) {
+            abortWith(new DuplicateSubmissionError());
+            return;
+          }
+        } catch (error) {
+          abortWith(new InvalidStoredRecordError("Stored command failed duplicate integrity validation"));
           return;
         }
         result = existing;
@@ -207,6 +307,7 @@ function persistInTransaction(db, record) {
         result = {
           ...record,
           state: "PERSISTED",
+          [SUBMISSION_ID_KEY]: submissionIdKey,
           sequence,
           record_key: recordKey,
         };
@@ -228,6 +329,15 @@ function persistInTransaction(db, record) {
       }
       resolve(result);
     };
+  });
+}
+
+function canonicalPayloadForRecord(record) {
+  return canonicalSubmissionPayload({
+    scope: record.scope,
+    assignment: record.metadata?.captured_assignment,
+    active_round_entry_ids: record.metadata?.active_round_entry_ids,
+    command: record.command,
   });
 }
 
