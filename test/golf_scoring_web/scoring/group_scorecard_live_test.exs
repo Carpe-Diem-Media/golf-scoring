@@ -9,6 +9,7 @@ defmodule GolfScoringWeb.Scoring.GroupScorecardLiveTest do
   alias GolfScoring.Accounts
   alias GolfScoring.Competition
   alias GolfScoring.Competition.PlayingGroup
+  alias GolfScoring.Competition.Services.AssignPlayingGroupStart
   alias GolfScoring.Repo
   alias GolfScoring.Scoring
   alias GolfScoring.Scoring.HoleResult
@@ -42,10 +43,14 @@ defmodule GolfScoringWeb.Scoring.GroupScorecardLiveTest do
       assert has_element?(view, "#group-scorecard")
       assert has_element?(view, "#event-round-context", "Event scorecard")
       assert has_element?(view, "#course-context", setup.course.name)
-      assert has_element?(view, "#group-identity", "Group A")
+      assert has_element?(view, "#group-identity", "Group 1A")
       assert has_element?(view, "#current-hole", "Hole 1")
       assert has_element?(view, "#starting-hole", "Starting hole 1A")
       assert has_element?(view, "#holes-remaining", "18 remaining")
+      refute html =~ "btn-primary"
+      refute html =~ "input-bordered"
+      refute html =~ "select-bordered"
+      refute html =~ "progress-primary"
 
       for index <- 0..(player_count - 1) do
         assert has_element?(view, "#scorecard-player-#{index}")
@@ -60,6 +65,38 @@ defmodule GolfScoringWeb.Scoring.GroupScorecardLiveTest do
       assert length(hole_submissions(setup)) == 1
       assert Ash.get!(PlayingGroup, setup.group.id, authorize?: false).scoring_revision == 1
     end
+  end
+
+  test "uses the shotgun starting hole in the group header", %{conn: conn} do
+    setup = PaperRecoveryFixtures.setup_submit_fixture!(2)
+    PaperRecoveryFixtures.set_round_state!(setup.round, :draft)
+
+    {:ok, group_b} =
+      GolfScoring.Competition.create_playing_group(setup.event.id, setup.round.id,
+        actor: setup.admin
+      )
+
+    start_hole_b = Enum.at(setup.route, 9)
+
+    assert {:ok, _} =
+             AssignPlayingGroupStart.run(
+               setup.admin,
+               setup.event.id,
+               setup.round.id,
+               group_b.id,
+               start_hole_b.id,
+               1
+             )
+
+    entries_b = PaperRecoveryFixtures.add_player_entries_to_group!(setup, group_b, 2)
+    PaperRecoveryFixtures.set_round_state!(setup.round, :scoring_open)
+    group_b_setup = %{setup | group: group_b, entries: entries_b, start_hole: start_hole_b}
+
+    {view, html} = open_scorecard!(conn, group_b_setup, hd(entries_b))
+
+    assert has_element?(view, "#group-identity", "Group 10A")
+    assert has_element?(view, "#starting-hole", "Starting hole 10A")
+    refute html =~ "Group A"
   end
 
   test "uses frozen hole and handicap facts with the existing score calculators", %{conn: conn} do

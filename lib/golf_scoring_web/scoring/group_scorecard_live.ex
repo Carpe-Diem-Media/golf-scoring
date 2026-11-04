@@ -1,17 +1,16 @@
 defmodule GolfScoringWeb.Scoring.GroupScorecardLive do
-  @moduledoc false
+  @moduledoc """
+  Presents the authorized online group scorecard and adapts hole results to
+  `GolfScoring.Scoring`.
+
+  Scoring-state interpretation, authorization, and score previews belong to
+  the Scoring domain; accepted whole-hole submissions go through its existing
+  `SubmitGroupHole` service.
+  """
 
   use GolfScoringWeb, :live_view
 
-  alias Decimal, as: D
-  alias GolfScoring.Competition.StartingPositionLabel
-  alias GolfScoring.Repo
   alias GolfScoring.Scoring
-  alias GolfScoring.Scoring.Calculators.StablefordPoints
-  alias GolfScoring.Scoring.Calculators.StrokeAllocation
-  alias GolfScoring.Scoring.Policies.PickupEligibility
-
-  @scheduled_holes 18
 
   @impl true
   def mount(params, _session, socket) do
@@ -148,7 +147,7 @@ defmodule GolfScoringWeb.Scoring.GroupScorecardLive do
                   </span>
                 </div>
                 <progress
-                  class="progress progress-primary h-2 w-full"
+                  class="block h-2 w-full accent-primary"
                   value={@completed_holes}
                   max="18"
                   aria-label="Holes complete"
@@ -253,7 +252,7 @@ defmodule GolfScoringWeb.Scoring.GroupScorecardLive do
                     prompt="Choose result"
                     value={entry.result_value["outcome"]}
                     options={entry.outcome_options}
-                    class="w-full select select-bordered border-base-content/50"
+                    class="w-full rounded-lg border border-base-content/50 bg-base-100 px-3 py-2 text-base text-base-content shadow-sm focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-base-content"
                   />
                   <.input
                     type="number"
@@ -265,7 +264,7 @@ defmodule GolfScoringWeb.Scoring.GroupScorecardLive do
                     step="1"
                     inputmode="numeric"
                     placeholder="Strokes"
-                    class="w-full input input-bordered border-base-content/50 disabled:cursor-not-allowed disabled:opacity-60"
+                    class="w-full rounded-lg border border-base-content/50 bg-base-100 px-3 py-2 text-base text-base-content shadow-sm focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-base-content disabled:cursor-not-allowed disabled:opacity-60"
                     disabled={entry.result_value["outcome"] == "picked_up"}
                   />
                   <div :if={entry.result_value["outcome"] == "picked_up"} class="col-span-2">
@@ -279,7 +278,7 @@ defmodule GolfScoringWeb.Scoring.GroupScorecardLive do
                       step="1"
                       inputmode="numeric"
                       placeholder="Strokes before picking up"
-                      class="w-full input input-bordered border-base-content/50"
+                      class="w-full rounded-lg border border-base-content/50 bg-base-100 px-3 py-2 text-base text-base-content shadow-sm focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-base-content"
                     />
                   </div>
                   <div :if={entry.result_value["outcome"] != "picked_up"} class="col-span-2">
@@ -293,7 +292,7 @@ defmodule GolfScoringWeb.Scoring.GroupScorecardLive do
                       step="1"
                       inputmode="numeric"
                       placeholder="Enter strokes to check pickup"
-                      class="w-full input input-bordered border-base-content/50"
+                      class="w-full rounded-lg border border-base-content/50 bg-base-100 px-3 py-2 text-base text-base-content shadow-sm focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-base-content"
                     />
                   </div>
                 </div>
@@ -333,9 +332,9 @@ defmodule GolfScoringWeb.Scoring.GroupScorecardLive do
                 <button
                   type="submit"
                   id="submit-group-hole"
-                  class="btn btn-primary min-h-12 w-full whitespace-nowrap text-base text-base-content active:scale-[0.99] active:brightness-95 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-base-content motion-reduce:active:transform-none"
+                  class="inline-flex min-h-12 w-full items-center justify-center whitespace-nowrap rounded-xl bg-primary px-4 text-base font-semibold text-base-content shadow-sm transition hover:brightness-95 active:scale-[0.99] active:brightness-95 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-base-content motion-reduce:transform-none"
                 >
-                  Save hole for all golfers
+                  Save hole for group
                 </button>
               </div>
             </.form>
@@ -410,381 +409,34 @@ defmodule GolfScoringWeb.Scoring.GroupScorecardLive do
   end
 
   defp refresh_scorecard(socket, feedback) do
-    params = %{
-      "event_id" => socket.assigns.event_id,
-      "round_id" => socket.assigns.round_id,
-      "group_id" => socket.assigns.group_id
-    }
-
-    case load_scorecard(params, socket.assigns.current_player_access_grant) do
+    case Scoring.load_group_scorecard(
+           socket.assigns.current_player_access_grant,
+           socket.assigns.event_id,
+           socket.assigns.round_id,
+           socket.assigns.group_id
+         ) do
       {:ok, data} ->
         {:noreply, assign_scorecard(socket, data) |> assign(:feedback, feedback)}
 
       {:error, reason} ->
-        {:noreply,
-         assign_unavailable(socket, reason)
-         |> assign(:feedback, feedback)}
+        {:noreply, assign_unavailable(socket, reason) |> assign(:feedback, feedback)}
     end
   end
 
   defp load_scorecard(params, grant) do
-    with {:ok, ids} <- route_ids(params),
-         true <- ids.event_id == grant.event_id,
-         {:ok, context} <- load_group_context(ids),
-         :ok <- require_open_round(context.round_state),
-         :ok <- require_primary_scorer(context, grant.player_id),
-         {:ok, route} <- load_route(ids.round_id),
-         {:ok, entries} <- load_entries(ids.round_id, ids.group_id),
-         {:ok, data} <- build_scorecard_data(ids, context, route, entries) do
-      {:ok, data}
-    else
-      false -> {:error, :not_assigned}
-      {:error, reason} -> {:error, reason}
-    end
-  end
-
-  defp route_ids(params) do
-    with {:ok, event_id} <- Ecto.UUID.cast(params["event_id"]),
-         {:ok, round_id} <- Ecto.UUID.cast(params["round_id"]),
-         {:ok, group_id} <- Ecto.UUID.cast(params["group_id"]) do
-      {:ok, %{event_id: event_id, round_id: round_id, group_id: group_id}}
-    else
-      _ -> {:error, :invalid_route}
-    end
-  end
-
-  defp load_group_context(ids) do
-    rows =
-      Repo.query!(
-        """
-        SELECT r.state,
-               pg.state,
-               pg.scoring_revision::int,
-               pg.starting_round_hole_id::text,
-               pg.starting_position::int,
-               assignment.id::text,
-               assignment.assignment_version::int,
-               scorer_entry.player_id::text,
-               concat_ws(' ', scorer.first_name, scorer.surname),
-               competition.pickup_policy_identifier,
-               course.name
-        FROM rounds r
-        JOIN courses course ON course.id = r.course_id
-        JOIN playing_groups pg ON pg.round_id = r.id
-        LEFT JOIN group_role_assignments assignment
-          ON assignment.playing_group_id = pg.id
-          AND assignment.role = 'primary_scorer'
-          AND assignment.state = 'active'
-        LEFT JOIN round_entries scorer_entry ON scorer_entry.id = assignment.round_entry_id
-        LEFT JOIN players scorer ON scorer.id = scorer_entry.player_id
-        LEFT JOIN round_competitions competition
-          ON competition.round_id = r.id AND competition.is_primary = true
-        WHERE r.id = $1::uuid AND r.event_id = $2::uuid AND pg.id = $3::uuid
-        """,
-        [
-          Ecto.UUID.dump!(ids.round_id),
-          Ecto.UUID.dump!(ids.event_id),
-          Ecto.UUID.dump!(ids.group_id)
-        ]
-      ).rows
-
-    case rows do
-      [
-        [
-          round_state,
-          group_state,
-          revision,
-          start_hole_id,
-          starting_position,
-          assignment_id,
-          assignment_version,
-          scorer_player_id,
-          scorer_name,
-          pickup_policy,
-          course_name
-        ]
-      ] ->
-        {:ok,
-         %{
-           round_state: round_state,
-           group_state: group_state,
-           revision: revision,
-           start_hole_id: cast_uuid(start_hole_id),
-           starting_position: starting_position,
-           assignment_id: cast_uuid(assignment_id),
-           assignment_version: assignment_version,
-           scorer_player_id: cast_uuid(scorer_player_id),
-           scorer_name: scorer_name,
-           pickup_policy: pickup_policy,
-           course_name: course_name
-         }}
-
-      [] ->
-        {:error, :not_found}
-
-      _ ->
-        {:error, :ambiguous_group_context}
-    end
-  end
-
-  defp require_open_round("scoring_open"), do: :ok
-  defp require_open_round(_), do: {:error, :round_not_open}
-
-  defp require_primary_scorer(%{assignment_id: nil}, _player_id),
-    do: {:error, :not_primary_scorer}
-
-  defp require_primary_scorer(%{scorer_player_id: player_id}, player_id)
-       when not is_nil(player_id),
-       do: :ok
-
-  defp require_primary_scorer(_, _), do: {:error, :not_primary_scorer}
-
-  defp load_route(round_id) do
-    holes =
-      Repo.query!(
-        "SELECT id::text, play_order::int, display_hole_number::int FROM round_holes WHERE round_id = $1::uuid ORDER BY play_order",
-        [Ecto.UUID.dump!(round_id)]
-      ).rows
-      |> Enum.map(fn [id, play_order, display_hole_number] ->
-        %{
-          id: Ecto.UUID.cast!(id),
-          play_order: play_order,
-          display_hole_number: display_hole_number
-        }
-      end)
-
-    if length(holes) == @scheduled_holes do
-      {:ok, holes}
-    else
-      {:error, :invalid_route}
-    end
-  end
-
-  defp load_entries(round_id, group_id) do
-    rows =
-      Repo.query!(
-        """
-        SELECT re.id::text,
-               p.first_name,
-               p.surname,
-               re.registration_status,
-               re.participation_status,
-               re.round_tee_profile_snapshot_id::text,
-               tee.tee_set_name,
-               tee.rating_label,
-               tee.course_rating::text,
-               tee.slope_rating::int,
-               tee.total_par::int,
-               tee.applicable_par::int,
-               handicap.source_handicap_index::text,
-               handicap.deemed_handicap_basis::text,
-               competition_handicap.playing_handicap::int
-        FROM round_entries re
-        JOIN players p ON p.id = re.player_id
-        LEFT JOIN round_tee_profile_snapshots tee
-          ON tee.id = re.round_tee_profile_snapshot_id
-        LEFT JOIN LATERAL (
-          SELECT hs.source_handicap_index, hs.deemed_handicap_basis
-          FROM handicap_snapshots hs
-          WHERE hs.round_entry_id = re.id AND hs.round_id = re.round_id
-          ORDER BY hs.inserted_at DESC, hs.id
-          LIMIT 1
-        ) handicap ON true
-        LEFT JOIN round_competitions competition
-          ON competition.round_id = re.round_id AND competition.is_primary = true
-        LEFT JOIN competition_handicaps competition_handicap
-          ON competition_handicap.round_entry_id = re.id
-          AND competition_handicap.round_competition_id = competition.id
-        WHERE re.round_id = $1::uuid AND re.playing_group_id = $2::uuid
-        ORDER BY re.inserted_at, re.id
-        """,
-        [Ecto.UUID.dump!(round_id), Ecto.UUID.dump!(group_id)]
-      ).rows
-
-    entries =
-      Enum.map(rows, fn [
-                          id,
-                          first_name,
-                          surname,
-                          registration,
-                          participation,
-                          tee_snapshot_id,
-                          tee_set_name,
-                          rating_label,
-                          course_rating,
-                          slope_rating,
-                          total_par,
-                          applicable_par,
-                          source_hi,
-                          deemed_hi,
-                          playing_handicap
-                        ] ->
-        %{
-          id: Ecto.UUID.cast!(id),
-          name: String.trim("#{first_name} #{surname}"),
-          registration_status: registration,
-          participation_status: participation,
-          tee_snapshot_id: cast_uuid(tee_snapshot_id),
-          tee_set_name: tee_set_name,
-          rating_label: rating_label,
-          course_rating: course_rating,
-          slope_rating: slope_rating,
-          total_par: total_par,
-          applicable_par: applicable_par,
-          handicap_index: source_hi || deemed_hi,
-          playing_handicap: playing_handicap
-        }
-      end)
-
-    {:ok, entries}
-  end
-
-  defp build_scorecard_data(ids, context, route, entries) do
-    with {:ok, start_index} <- route_start_index(route, context.start_hole_id),
-         rotated_route = rotate_route(route, start_index),
-         :ok <- validate_group_state(context, entries),
-         {:ok, players} <- build_players(entries, context.revision),
-         true <- length(players) in 2..4 do
-      complete? = context.revision >= @scheduled_holes
-      current_hole = if complete?, do: nil, else: Enum.at(rotated_route, context.revision)
-
-      if complete? or current_hole do
-        {:ok,
-         %{
-           event_id: ids.event_id,
-           round_id: ids.round_id,
-           group_id: ids.group_id,
-           revision: context.revision,
-           assignment_version: context.assignment_version,
-           scorer_name: context.scorer_name,
-           pickup_policy: context.pickup_policy,
-           route: route,
-           rotated_route: rotated_route,
-           starting_hole: Enum.at(route, start_index),
-           starting_position: context.starting_position,
-           group_label: StartingPositionLabel.position_letter(context.starting_position || 1),
-           course_name: context.course_name,
-           current_hole: current_hole,
-           players: players,
-           remaining_holes: max(@scheduled_holes - min(context.revision, @scheduled_holes), 0),
-           lifecycle: if(complete?, do: :group_play_complete, else: :scoring_active)
-         }}
-      else
-        {:error, :group_play_complete}
-      end
-    else
-      false -> {:error, :invalid_group_size}
-      {:error, reason} -> {:error, reason}
-    end
-  end
-
-  defp validate_group_state(%{revision: revision}, _entries)
-       when revision >= @scheduled_holes,
-       do: :ok
-
-  defp validate_group_state(%{revision: revision, group_state: state}, _entries)
-       when revision >= 0 and state in ["not_started", "playing"],
-       do: :ok
-
-  defp validate_group_state(_, _), do: {:error, :group_unavailable}
-
-  defp route_start_index(route, start_hole_id) do
-    case Enum.find_index(route, &(&1.id == start_hole_id)) do
-      nil -> {:error, :starting_hole_unavailable}
-      index -> {:ok, index}
-    end
-  end
-
-  defp rotate_route(route, index) do
-    Enum.drop(route, index) ++ Enum.take(route, index)
-  end
-
-  defp build_players(entries, revision) do
-    participation_statuses =
-      if revision >= @scheduled_holes do
-        ["completed"]
-      else
-        ["not_started", "active"]
-      end
-
-    entries
-    |> Enum.filter(fn entry ->
-      entry.registration_status in ["expected", "checked_in"] and
-        entry.participation_status in participation_statuses
-    end)
-    |> build_all_player_facts()
-  end
-
-  defp build_all_player_facts(entries) do
-    Enum.reduce_while(entries, {:ok, []}, fn entry, {:ok, acc} ->
-      case build_player_facts(entry) do
-        {:ok, player} -> {:cont, {:ok, [player | acc]}}
-        {:error, reason} -> {:halt, {:error, reason}}
-      end
-    end)
-    |> case do
-      {:ok, players} ->
-        players
-        |> Enum.reverse()
-        |> Enum.with_index()
-        |> then(fn indexed ->
-          {:ok, Enum.map(indexed, fn {entry, index} -> Map.put(entry, :index, index) end)}
-        end)
-
-      error ->
-        error
-    end
-  end
-
-  defp build_player_facts(%{tee_snapshot_id: nil}), do: {:error, :tee_not_assigned}
-
-  defp build_player_facts(%{playing_handicap: nil}), do: {:error, :handicap_unavailable}
-
-  defp build_player_facts(entry) do
-    facts =
-      Repo.query!(
-        """
-        SELECT round_hole_id::text, par::int, stroke_index::int, distance_m::int, plus_stroke_order::int
-        FROM round_tee_hole_snapshots
-        WHERE round_tee_profile_snapshot_id = $1::uuid
-        ORDER BY round_hole_id
-        """,
-        [Ecto.UUID.dump!(entry.tee_snapshot_id)]
-      ).rows
-      |> Enum.map(fn [hole_id, par, stroke_index, distance_m, plus_order] ->
-        %{
-          round_hole_id: Ecto.UUID.cast!(hole_id),
-          par: par,
-          stroke_index: stroke_index,
-          distance_m: distance_m,
-          plus_stroke_order: plus_order
-        }
-      end)
-
-    case StrokeAllocation.allocate(entry.playing_handicap, facts) do
-      {:ok, %{strokes_by_round_hole_id: strokes}} ->
-        {:ok,
-         entry
-         |> Map.put(:hole_facts, Map.new(facts, &{&1.round_hole_id, &1}))
-         |> Map.put(:strokes_by_hole, strokes)
-         |> Map.put(:handicap_index_label, format_handicap_index(entry.handicap_index))
-         |> Map.put(:handicap_strokes_by_hole, strokes)}
-
-      {:error, reason} ->
-        {:error, reason}
-    end
+    Scoring.load_group_scorecard(
+      grant,
+      params["event_id"],
+      params["round_id"],
+      params["group_id"]
+    )
   end
 
   defp assign_scorecard(socket, data) do
     current_path =
       ~p"/player/events/#{data.event_id}/rounds/#{data.round_id}/groups/#{data.group_id}/scorecard"
 
-    entries =
-      if data.current_hole do
-        prepare_players(data.players, data.current_hole, data.pickup_policy, %{})
-      else
-        data.players
-      end
+    result_values = default_result_values(data.players)
 
     socket
     |> assign(:page_title, "Group scorecard")
@@ -800,28 +452,18 @@ defmodule GolfScoringWeb.Scoring.GroupScorecardLive do
     |> assign(:group_label, data.group_label)
     |> assign(:remaining_holes, data.remaining_holes)
     |> assign(:unavailable_message, nil)
-    |> assign(:entries, entries)
-    |> assign(:entry_count, length(entries))
+    |> assign(:scorecard_data, data)
+    |> assign(:entries, Scoring.preview_group_scorecard(data, result_values))
+    |> assign(:entry_count, data.entry_count)
     |> assign(:current_hole, data.current_hole)
-    |> assign(
-      :starting_hole_label,
-      starting_hole_label(data.starting_hole, data.starting_position)
-    )
-    |> assign(:completed_holes, min(data.revision, @scheduled_holes))
-    |> assign(
-      :route_display,
-      Enum.map_join(data.rotated_route, ", ", &Integer.to_string(&1.display_hole_number))
-    )
-    |> assign(:pickup_policy, data.pickup_policy)
-    |> assign(:result_values, default_result_values(entries))
+    |> assign(:starting_hole_label, data.starting_hole_label)
+    |> assign(:completed_holes, data.completed_holes)
+    |> assign(:route_display, data.route_display)
+    |> assign(:result_values, result_values)
     |> assign(:scorecard_form, to_form(%{}, as: "scorecard"))
     |> assign(:client_submission_id, Ecto.UUID.generate())
     |> assign(:captured_at, DateTime.utc_now() |> DateTime.to_iso8601())
     |> assign(:feedback, nil)
-  end
-
-  defp starting_hole_label(starting_hole, starting_position) do
-    StartingPositionLabel.format(starting_hole.display_hole_number, starting_position || 1)
   end
 
   defp assign_unavailable(socket, reason) do
@@ -843,93 +485,21 @@ defmodule GolfScoringWeb.Scoring.GroupScorecardLive do
     |> assign(:scorecard_form, to_form(%{}, as: "scorecard"))
   end
 
-  defp prepare_previews(socket) do
+  defp refresh_previews(%{assigns: %{lifecycle: :scoring_active}} = socket) do
     entries =
-      prepare_players(
-        socket.assigns.entries,
-        socket.assigns.current_hole,
-        socket.assigns.pickup_policy,
+      Scoring.preview_group_scorecard(
+        socket.assigns.scorecard_data,
         socket.assigns.result_values
       )
 
     assign(socket, :entries, entries)
   end
 
-  defp refresh_previews(%{assigns: %{lifecycle: :scoring_active}} = socket),
-    do: prepare_previews(socket)
-
   defp refresh_previews(socket), do: socket
 
-  defp prepare_players(players, current_hole, pickup_policy, result_values) do
-    Enum.map(players, fn player ->
-      result_value = Map.get(result_values, player.id, %{})
-      fact = Map.fetch!(player.hole_facts, current_hole.id)
-      allocated = Map.fetch!(player.strokes_by_hole, current_hole.id)
-      strokes_taken = parse_optional_integer(result_value["strokes_taken"])
-
-      pickup_eligible? =
-        case strokes_taken do
-          {:ok, taken} ->
-            match?(
-              {:ok, %{eligible?: true}},
-              PickupEligibility.decide(%{
-                pickup_policy_identifier: pickup_policy,
-                par: fact.par,
-                allocated_strokes: allocated,
-                strokes_taken: taken
-              })
-            )
-
-          _ ->
-            false
-        end
-
-      preview = preview_result(result_value, fact.par, allocated, pickup_eligible?)
-
-      player
-      |> Map.put(:current_fact, fact)
-      |> Map.put(:result_value, result_value)
-      |> Map.put(:pickup_eligible?, pickup_eligible?)
-      |> Map.put(:handicap_strokes_label, handicap_strokes_label(allocated))
-      |> Map.put(:outcome_options, outcome_options(pickup_eligible?, result_value["outcome"]))
-      |> Map.put(:preview, preview)
-    end)
-  end
-
-  defp preview_result(%{"outcome" => "holed_out"} = result, par, allocated, _pickup_eligible?) do
-    with {:ok, gross} <- parse_integer(result["gross_strokes"]),
-         true <- gross > 0,
-         {:ok, %{competition_points: points, competition_net_strokes: net}} <-
-           StablefordPoints.calculate(%{
-             outcome: :holed_out,
-             gross_strokes: gross,
-             par: par,
-             allocated_strokes: allocated
-           }) do
-      %{handicap_adjusted: net, points: points}
-    else
-      _ -> nil
-    end
-  end
-
-  defp preview_result(%{"outcome" => "picked_up"}, _par, _allocated, true),
-    do: %{handicap_adjusted: nil, points: 0}
-
-  defp preview_result(_, _, _, _), do: nil
-
-  defp outcome_options(pickup_eligible?, selected_outcome) do
-    base = [{"Holed out", "holed_out"}]
-
-    if pickup_eligible? or selected_outcome == "picked_up" do
-      base ++ [{"Picked up, no points", "picked_up"}]
-    else
-      base
-    end
-  end
-
-  defp default_result_values(entries) do
-    Map.new(entries, fn entry ->
-      {entry.id, %{"outcome" => "", "gross_strokes" => "", "strokes_taken" => ""}}
+  defp default_result_values(players) do
+    Map.new(players, fn player ->
+      {player.id, %{"outcome" => "", "gross_strokes" => "", "strokes_taken" => ""}}
     end)
   end
 
@@ -986,10 +556,6 @@ defmodule GolfScoringWeb.Scoring.GroupScorecardLive do
 
   defp parse_integer(_), do: {:error, :invalid_integer}
 
-  defp parse_optional_integer(nil), do: :empty
-  defp parse_optional_integer(""), do: :empty
-  defp parse_optional_integer(value), do: parse_integer(value)
-
   defp parse_datetime(value) when is_binary(value) do
     case DateTime.from_iso8601(value) do
       {:ok, datetime, _offset} -> {:ok, datetime}
@@ -1000,34 +566,4 @@ defmodule GolfScoringWeb.Scoring.GroupScorecardLive do
   defp parse_datetime(_), do: {:error, :invalid_datetime}
 
   defp blank?(value), do: value in [nil, ""]
-
-  defp handicap_strokes_label(strokes) when strokes > 0 do
-    label = if strokes == 1, do: "stroke", else: "strokes"
-    "#{strokes} #{label} received"
-  end
-
-  defp handicap_strokes_label(strokes) when strokes < 0 do
-    count = abs(strokes)
-    label = if count == 1, do: "stroke", else: "strokes"
-    "#{count} #{label} given back"
-  end
-
-  defp handicap_strokes_label(_), do: "No handicap stroke"
-
-  defp format_handicap_index(nil), do: "Not recorded"
-
-  defp format_handicap_index(value) do
-    value
-    |> D.new()
-    |> D.to_string(:normal)
-  end
-
-  defp cast_uuid(nil), do: nil
-
-  defp cast_uuid(value) do
-    case Ecto.UUID.cast(value) do
-      {:ok, uuid} -> uuid
-      :error -> nil
-    end
-  end
 end
