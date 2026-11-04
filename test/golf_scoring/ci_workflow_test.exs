@@ -20,7 +20,10 @@ defmodule GolfScoring.CIWorkflowTest do
     "mix sobelow --exit --strict --format github --private",
     "mix test --cover",
     "mix dialyzer --plt",
-    "mix dialyzer --format github --format dialyxir"
+    "mix dialyzer --format github --format dialyxir",
+    "npm ci",
+    "npx playwright install --with-deps chromium",
+    "npm run test:browser"
   ]
 
   test "Dialyzer includes ExUnit in the test PLT for support modules" do
@@ -64,7 +67,7 @@ defmodule GolfScoring.CIWorkflowTest do
       |> then(&Regex.scan(~r/^  ([A-Za-z0-9_-]+):\s*$/m, &1, capture: :all_but_first))
       |> List.flatten()
 
-    assert job_names == ["quality", "security", "test", "dialyzer"]
+    assert job_names == ["quality", "security", "test", "dialyzer", "browser"]
 
     assert workflow =~ "actions/checkout v7.0.1"
     assert workflow =~ "uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"
@@ -72,6 +75,10 @@ defmodule GolfScoring.CIWorkflowTest do
     assert workflow =~ "uses: erlef/setup-beam@54075bcc5e249e4758d363f27d099f55d843f124"
     assert workflow =~ "ELIXIR_VERSION: \"1.19.3\""
     assert workflow =~ "OTP_VERSION: \"28.1.1\""
+
+    assert workflow =~ "actions/setup-node v7.1.0"
+    assert workflow =~ "uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1"
+    assert workflow =~ "node-version: 24"
 
     assert workflow =~ ~r/^      postgres:\s*$/m
     assert workflow =~ "image: postgres:18"
@@ -96,5 +103,18 @@ defmodule GolfScoring.CIWorkflowTest do
     assert command_positions == Enum.sort(command_positions)
     refute workflow =~ ~r/^\s*matrix:\s*$/m
     refute workflow =~ ~r/^\s*redis:\s*$/mi
+  end
+
+  test "Browser CI runs the native IndexedDB Playwright suite" do
+    browser_job =
+      @workflow_path
+      |> File.read!()
+      |> String.split("  browser:", parts: 2)
+      |> List.last()
+
+    assert browser_job =~ "name: Browser scoring queue"
+    assert browser_job =~ "run: npm ci"
+    assert browser_job =~ "run: npx playwright install --with-deps chromium"
+    assert browser_job =~ "run: npm run test:browser"
   end
 end
