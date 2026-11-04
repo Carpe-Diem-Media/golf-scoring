@@ -99,10 +99,18 @@ defmodule GolfScoringWeb.Scoring.GroupScorecardLive do
             class="rounded-2xl border border-success/30 bg-success/5 p-5 shadow-sm"
             role="status"
           >
-            <p class="text-sm font-medium text-success">Round complete</p>
+            <p class="text-sm font-medium text-base-content">Round complete</p>
             <h2 class="mt-1 text-xl font-semibold">Group play complete</h2>
             <p class="mt-2 text-sm text-base-content/75">All 18 holes have been recorded.</p>
-            <p id="event-round-context" class="mt-4 text-sm font-medium">Event scorecard</p>
+            <dl
+              id="event-round-context"
+              class="mt-4 grid grid-cols-[4.25rem_minmax(0,1fr)] gap-x-2 gap-y-1 text-xs leading-5 text-base-content/70"
+            >
+              <dt class="font-medium text-base-content">Event ID</dt>
+              <dd class="break-all font-mono">{@event_id}</dd>
+              <dt class="font-medium text-base-content">Round ID</dt>
+              <dd class="break-all font-mono">{@round_id}</dd>
+            </dl>
             <p id="course-context" class="mt-1 text-sm text-base-content/75">{@course_name}</p>
             <p id="group-identity" class="mt-1 text-sm text-base-content/75">
               Group {@group_label}
@@ -117,9 +125,15 @@ defmodule GolfScoringWeb.Scoring.GroupScorecardLive do
             <header class="rounded-2xl border border-base-300 bg-base-100 p-4 shadow-sm">
               <div class="flex items-start justify-between gap-3">
                 <div>
-                  <p id="event-round-context" class="text-sm text-base-content/70">
-                    Event scorecard
-                  </p>
+                  <dl
+                    id="event-round-context"
+                    class="grid grid-cols-[4.25rem_minmax(0,1fr)] gap-x-2 gap-y-1 text-xs leading-5 text-base-content/70"
+                  >
+                    <dt class="font-medium text-base-content">Event ID</dt>
+                    <dd class="break-all font-mono">{@event_id}</dd>
+                    <dt class="font-medium text-base-content">Round ID</dt>
+                    <dd class="break-all font-mono">{@round_id}</dd>
+                  </dl>
                   <p id="course-context" class="mt-1 truncate text-sm font-medium">
                     {@course_name}
                   </p>

@@ -41,7 +41,11 @@ defmodule GolfScoringWeb.Scoring.GroupScorecardLiveTest do
       assert html =~ "White tee, Men rating"
       refute html =~ "White · Men"
       assert has_element?(view, "#group-scorecard")
-      assert has_element?(view, "#event-round-context", "Event scorecard")
+      assert has_element?(view, "#event-round-context", "Event ID")
+      assert has_element?(view, "#event-round-context", setup.event.id)
+      assert has_element?(view, "#event-round-context", "Round ID")
+      assert has_element?(view, "#event-round-context", setup.round.id)
+      refute html =~ "Event scorecard"
       assert has_element?(view, "#course-context", setup.course.name)
       assert has_element?(view, "#group-identity", "Group 1A")
       assert has_element?(view, "#current-hole", "Hole 1")
@@ -65,6 +69,28 @@ defmodule GolfScoringWeb.Scoring.GroupScorecardLiveTest do
       assert length(hole_submissions(setup)) == 1
       assert Ash.get!(PlayingGroup, setup.group.id, authorize?: false).scoring_revision == 1
     end
+  end
+
+  test "renders distinct event and round identifiers for separate scorecards", %{conn: conn} do
+    first = PaperRecoveryFixtures.setup_submit_fixture!(2)
+    second = PaperRecoveryFixtures.setup_submit_fixture!(2)
+
+    {_first_view, first_html} = open_scorecard!(conn, first)
+    {_second_view, second_html} = open_scorecard!(conn, second)
+
+    assert first_html =~ "Event ID"
+    assert first_html =~ first.event.id
+    assert first_html =~ "Round ID"
+    assert first_html =~ first.round.id
+    refute first_html =~ second.event.id
+    refute first_html =~ second.round.id
+
+    assert second_html =~ "Event ID"
+    assert second_html =~ second.event.id
+    assert second_html =~ "Round ID"
+    assert second_html =~ second.round.id
+    refute second_html =~ first.event.id
+    refute second_html =~ first.round.id
   end
 
   test "uses the shotgun starting hole in the group header", %{conn: conn} do
@@ -389,6 +415,9 @@ defmodule GolfScoringWeb.Scoring.GroupScorecardLiveTest do
 
     assert html =~ "Group play complete"
     assert has_element?(view, "#group-play-complete")
+    assert has_element?(view, "#group-play-complete .text-base-content", "Round complete")
+    assert has_element?(view, "#event-round-context", setup.event.id)
+    assert has_element?(view, "#event-round-context", setup.round.id)
     assert has_element?(view, "#holes-remaining", "0 remaining")
     assert length(hole_results(setup)) == 36
     assert length(hole_submissions(setup)) == 18
