@@ -4,12 +4,12 @@ defmodule GolfScoringWeb.Scoring.GroupScorecardLive do
   use GolfScoringWeb, :live_view
 
   alias Decimal, as: D
+  alias GolfScoring.Competition.StartingPositionLabel
   alias GolfScoring.Repo
   alias GolfScoring.Scoring
   alias GolfScoring.Scoring.Calculators.StablefordPoints
   alias GolfScoring.Scoring.Calculators.StrokeAllocation
   alias GolfScoring.Scoring.Policies.PickupEligibility
-  alias GolfScoring.Competition.StartingPositionLabel
 
   @scheduled_holes 18
 
@@ -355,47 +355,58 @@ defmodule GolfScoringWeb.Scoring.GroupScorecardLive do
         command
       )
 
-    case result do
-      {:ok, receipt} ->
-        if receipt.expected_group_score_revision < socket.assigns.group_revision do
-          refresh_scorecard(socket, "This scorecard has moved to a newer hole.")
-        else
-          refresh_scorecard(socket, "Hole saved")
-        end
+    handle_submission_result(socket, result)
+  end
 
-      {:error, reason} when reason in [:stale_role_assignment, :not_primary_scorer] ->
-        {:noreply,
-         assign_unavailable(socket, :scorer_changed)
-         |> assign(
-           :feedback,
-           "The scorer assignment changed. This scorecard is no longer active."
-         )}
+  defp handle_submission_result(socket, {:ok, receipt}) do
+    feedback =
+      if receipt.expected_group_score_revision < socket.assigns.group_revision do
+        "This scorecard has moved to a newer hole."
+      else
+        "Hole saved"
+      end
 
-      {:error, :stale_scoring_revision} ->
-        refresh_scorecard(socket, "This scorecard has moved to a newer hole.")
+    refresh_scorecard(socket, feedback)
+  end
 
-      {:error, :wrong_round_hole} ->
-        refresh_scorecard(socket, "This scorecard has moved to a newer hole.")
+  defp handle_submission_result(socket, {:error, reason}) do
+    handle_submission_error(socket, reason)
+  end
 
-      {:error, :group_scoring_complete} ->
-        refresh_scorecard(socket, "This group has completed all 18 holes.")
+  defp handle_submission_error(socket, reason)
+       when reason in [:stale_role_assignment, :not_primary_scorer] do
+    {:noreply,
+     assign_unavailable(socket, :scorer_changed)
+     |> assign(:feedback, "The scorer assignment changed. This scorecard is no longer active.")}
+  end
 
-      {:error, {:invalid_round_state, _state}} ->
-        {:noreply,
-         assign_unavailable(socket, :round_not_open)
-         |> assign(:feedback, "Scoring is unavailable while this round is not open.")}
+  defp handle_submission_error(socket, reason)
+       when reason in [:stale_scoring_revision, :wrong_round_hole] do
+    refresh_scorecard(socket, "This scorecard has moved to a newer hole.")
+  end
 
-      {:error, :pickup_not_eligible} ->
-        {:noreply,
-         assign(socket, :feedback, "Pickup is available only when no Stableford point remains.")}
+  defp handle_submission_error(socket, :group_scoring_complete) do
+    refresh_scorecard(socket, "This group has completed all 18 holes.")
+  end
 
-      {:error, :strokes_taken_required} ->
-        {:noreply, assign(socket, :feedback, "Enter strokes taken before selecting a pickup.")}
+  defp handle_submission_error(socket, {:invalid_round_state, _state}) do
+    {:noreply,
+     assign_unavailable(socket, :round_not_open)
+     |> assign(:feedback, "Scoring is unavailable while this round is not open.")}
+  end
 
-      {:error, _reason} ->
-        {:noreply,
-         assign(socket, :feedback, "This hole could not be saved. Check every golfer's result.")}
-    end
+  defp handle_submission_error(socket, :pickup_not_eligible) do
+    {:noreply,
+     assign(socket, :feedback, "Pickup is available only when no Stableford point remains.")}
+  end
+
+  defp handle_submission_error(socket, :strokes_taken_required) do
+    {:noreply, assign(socket, :feedback, "Enter strokes taken before selecting a pickup.")}
+  end
+
+  defp handle_submission_error(socket, _reason) do
+    {:noreply,
+     assign(socket, :feedback, "This hole could not be saved. Check every golfer's result.")}
   end
 
   defp refresh_scorecard(socket, feedback) do
@@ -429,7 +440,6 @@ defmodule GolfScoringWeb.Scoring.GroupScorecardLive do
     else
       false -> {:error, :not_assigned}
       {:error, reason} -> {:error, reason}
-      _ -> {:error, :not_assigned}
     end
   end
 
@@ -751,16 +761,17 @@ defmodule GolfScoringWeb.Scoring.GroupScorecardLive do
         }
       end)
 
-    with {:ok, %{strokes_by_round_hole_id: strokes}} <-
-           StrokeAllocation.allocate(entry.playing_handicap, facts) do
-      {:ok,
-       entry
-       |> Map.put(:hole_facts, Map.new(facts, &{&1.round_hole_id, &1}))
-       |> Map.put(:strokes_by_hole, strokes)
-       |> Map.put(:handicap_index_label, format_handicap_index(entry.handicap_index))
-       |> Map.put(:handicap_strokes_by_hole, strokes)}
-    else
-      {:error, reason} -> {:error, reason}
+    case StrokeAllocation.allocate(entry.playing_handicap, facts) do
+      {:ok, %{strokes_by_round_hole_id: strokes}} ->
+        {:ok,
+         entry
+         |> Map.put(:hole_facts, Map.new(facts, &{&1.round_hole_id, &1}))
+         |> Map.put(:strokes_by_hole, strokes)
+         |> Map.put(:handicap_index_label, format_handicap_index(entry.handicap_index))
+         |> Map.put(:handicap_strokes_by_hole, strokes)}
+
+      {:error, reason} ->
+        {:error, reason}
     end
   end
 
