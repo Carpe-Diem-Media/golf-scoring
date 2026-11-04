@@ -15,6 +15,7 @@ defmodule GolfScoring.Competition.Services.ExcludeCompetitionSideBeforeHoleTest 
 
   @password "GLS-80 synthetic staff passphrase 2026"
   @reason "organizer confirmed the side had not started this hole"
+  @submit_audit_barrier 9_038_080
 
   setup do
     Process.put(:gls34_prefix, "gls80-#{Ecto.UUID.generate()}")
@@ -404,6 +405,188 @@ defmodule GolfScoring.Competition.Services.ExcludeCompetitionSideBeforeHoleTest 
     refute_receive {:mystery_reveal_changed, _}, 50
   end
 
+  test "a failed audit insert rolls back exclusion provenance and reveal without publishing" do
+    {setup, mystery} = single_group_mystery!()
+    side_id = side_id_for_entries(setup.entries)
+    result = provisional_result_for_side!(side_id)
+    subscribe_to_round(setup.round.id)
+    function_name = "gls80_reject_audit_#{System.unique_integer([:positive])}"
+    trigger_name = "gls80_reject_audit_trigger_#{System.unique_integer([:positive])}"
+
+    Repo.query!("""
+    CREATE FUNCTION #{function_name}() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN
+      IF NEW.action = 'exclude_competition_side_before_hole' THEN
+        RAISE EXCEPTION 'GLS-80 test audit failure' USING ERRCODE = '23514';
+      END IF;
+      RETURN NEW;
+    END;
+    $$
+    """)
+
+    Repo.query!("""
+    CREATE TRIGGER #{trigger_name}
+    BEFORE INSERT ON audit_events
+    FOR EACH ROW EXECUTE FUNCTION #{function_name}()
+    """)
+
+    assert {:error, _error} =
+             exclude(setup, side_id, setup.group.id, mystery.rule.round_hole_id)
+
+    assert side_result_state(side_id) == "provisional"
+
+    assert [[nil, nil, nil, nil, nil, nil, nil]] =
+             Repo.query!(
+               """
+               SELECT excluded_by_staff_user_id, exclusion_reason, excluded_at,
+                      excluded_playing_group_id, excluded_effective_round_hole_id,
+                      excluded_effective_play_index, excluded_preplay_confirmed
+               FROM competition_side_results
+               WHERE id = $1::uuid
+               """,
+               [Ecto.UUID.dump!(result.id)]
+             ).rows
+
+    assert count_for_rule("mystery_reveals", mystery.rule.id) == 0
+    assert count_audits_for_action(setup.event.id) == 0
+    refute_receive {:mystery_reveal_changed, _}, 50
+  end
+
+  @tag :real_concurrency
+  test "last-group scoring serializes against exclusion without a premature or duplicate reveal" do
+    fixture =
+      Sandbox.unboxed_run(Repo, fn ->
+        setup = PaperRecoveryFixtures.setup_two_group_mystery_fixture!()
+        first_side_id = side_id_for_entries(setup.entries)
+
+        assert {:ok, %{mystery_reveal_created?: false}} =
+                 exclude(setup, first_side_id, setup.group.id, setup.mystery.rule.round_hole_id)
+
+        setup
+      end)
+
+    parent = self()
+    Process.delete(:gls80_last_group_barrier_task)
+    Process.delete(:gls80_last_group_race_tasks)
+
+    try do
+      Sandbox.unboxed_run(Repo, fn -> install_submit_audit_barrier!() end)
+      Phoenix.PubSub.subscribe(GolfScoring.PubSub, "round:#{fixture.round.id}")
+
+      barrier_task =
+        Task.async(fn ->
+          Sandbox.unboxed_run(Repo, fn ->
+            Repo.transaction(fn ->
+              Repo.query!("SELECT pg_advisory_xact_lock($1)", [@submit_audit_barrier])
+              send(parent, {:gls80_submit_audit_barrier_held, pg_backend_pid!()})
+
+              receive do
+                :gls80_release_submit_audit_barrier -> :released
+              after
+                15_000 -> Repo.rollback(:gls80_submit_audit_barrier_timeout)
+              end
+            end)
+          end)
+        end)
+
+      Process.put(:gls80_last_group_barrier_task, barrier_task)
+      assert_receive {:gls80_submit_audit_barrier_held, barrier_pid}, 5_000
+
+      scoring_setup = Map.merge(fixture, %{group: fixture.group_b, entries: fixture.entries_b})
+
+      scoring_task =
+        Task.async(fn ->
+          Sandbox.unboxed_run(Repo, fn ->
+            send(parent, {:gls80_last_group_scoring_started, pg_backend_pid!()})
+
+            submit_first_hole(
+              scoring_setup,
+              fixture.group_b,
+              fixture.entries_b,
+              fixture.mystery.rule.round_hole_id
+            )
+          end)
+        end)
+
+      Process.put(:gls80_last_group_race_tasks, [scoring_task])
+      assert_receive {:gls80_last_group_scoring_started, scoring_pid}, 10_000
+      await_blocked_by!(scoring_pid, barrier_pid, System.monotonic_time(:millisecond) + 10_000)
+      refute_receive {:group_hole_submitted, _}, 50
+      refute_receive {:mystery_reveal_changed, _}, 50
+
+      exclusion_task =
+        Task.async(fn ->
+          Sandbox.unboxed_run(Repo, fn ->
+            send(parent, {:gls80_last_group_exclusion_started, pg_backend_pid!()})
+
+            exclude(
+              fixture,
+              side_id_for_entries(fixture.entries_b),
+              fixture.group_b.id,
+              fixture.mystery.rule.round_hole_id
+            )
+          end)
+        end)
+
+      Process.put(:gls80_last_group_race_tasks, [scoring_task, exclusion_task])
+      assert_receive {:gls80_last_group_exclusion_started, exclusion_pid}, 10_000
+      refute scoring_pid == exclusion_pid
+      await_blocked_by!(exclusion_pid, scoring_pid, System.monotonic_time(:millisecond) + 10_000)
+      refute_receive {:group_hole_submitted, _}, 50
+      refute_receive {:mystery_reveal_changed, _}, 50
+
+      send(barrier_task.pid, :gls80_release_submit_audit_barrier)
+
+      assert {:ok, _receipt} = Task.await(scoring_task, 20_000)
+      Process.put(:gls80_last_group_race_tasks, [exclusion_task])
+
+      assert {:error, :preplay_checkpoint_already_passed} = Task.await(exclusion_task, 20_000)
+      assert {:ok, _} = Task.await(barrier_task, 10_000)
+      Process.delete(:gls80_last_group_race_tasks)
+      Process.delete(:gls80_last_group_barrier_task)
+
+      Sandbox.unboxed_run(Repo, fn -> remove_submit_audit_barrier!() end)
+
+      assert count_for_rule("mystery_reveals", fixture.mystery.rule.id) == 1
+
+      assert [[1]] =
+               Repo.query!(
+                 "SELECT count(*)::int FROM hole_submissions WHERE round_id = $1::uuid AND playing_group_id = $2::uuid AND round_hole_id = $3::uuid",
+                 [
+                   Ecto.UUID.dump!(fixture.round.id),
+                   Ecto.UUID.dump!(fixture.group_b.id),
+                   Ecto.UUID.dump!(fixture.mystery.rule.round_hole_id)
+                 ]
+               ).rows
+
+      assert side_result_state(side_id_for_entries(fixture.entries_b)) == "provisional"
+      assert_receive {:group_hole_submitted, %{playing_group_id: group_id}}, 5_000
+      assert Ecto.UUID.cast!(group_id) == fixture.group_b.id
+      assert_receive {:mystery_reveal_changed, %{round_id: round_id}}, 5_000
+      assert Ecto.UUID.cast!(round_id) == fixture.round.id
+      refute_receive {:mystery_reveal_changed, _}, 50
+      refute_receive {:group_hole_submitted, _}, 50
+    after
+      if barrier = Process.delete(:gls80_last_group_barrier_task) do
+        send(barrier.pid, :gls80_release_submit_audit_barrier)
+        Task.shutdown(barrier, 10_000)
+      end
+
+      for task <- Process.delete(:gls80_last_group_race_tasks) || [] do
+        try do
+          Task.shutdown(task, 10_000)
+        rescue
+          _ -> :ok
+        catch
+          :exit, _ -> :ok
+        end
+      end
+
+      Sandbox.unboxed_run(Repo, fn -> remove_submit_audit_barrier!() end)
+      cleanup_committed_fixture!(fixture)
+    end
+  end
+
   test "database constraints reject incomplete and generic excluded provenance" do
     {setup, _mystery} = single_group_mystery!()
     side_id = side_id_for_entries(setup.entries)
@@ -420,6 +603,111 @@ defmodule GolfScoring.Competition.Services.ExcludeCompetitionSideBeforeHoleTest 
              "competition_side_results_exclusion_transition_guard"
   end
 
+  defp install_submit_audit_barrier! do
+    remove_submit_audit_barrier!()
+
+    Repo.query!("""
+    CREATE FUNCTION gls80_wait_for_submit_audit() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN
+      IF NEW.action = 'submit_group_hole' THEN
+        PERFORM pg_advisory_xact_lock(#{@submit_audit_barrier});
+      END IF;
+      RETURN NEW;
+    END;
+    $$
+    """)
+
+    Repo.query!("""
+    CREATE TRIGGER gls80_wait_for_submit_audit_trigger
+    BEFORE INSERT ON audit_events
+    FOR EACH ROW EXECUTE FUNCTION gls80_wait_for_submit_audit()
+    """)
+  end
+
+  defp remove_submit_audit_barrier! do
+    Repo.query!("DROP TRIGGER IF EXISTS gls80_wait_for_submit_audit_trigger ON audit_events")
+    Repo.query!("DROP FUNCTION IF EXISTS gls80_wait_for_submit_audit()")
+  end
+
+  defp cleanup_committed_fixture!(fixture) do
+    Sandbox.unboxed_run(Repo, fn ->
+      round = Ecto.UUID.dump!(fixture.round.id)
+      event = Ecto.UUID.dump!(fixture.event.id)
+      staff = Ecto.UUID.dump!(fixture.admin.id)
+
+      player_ids =
+        Repo.query!("SELECT player_id::text FROM round_entries WHERE round_id = $1::uuid", [round]).rows
+        |> Enum.map(fn [id] -> Ecto.UUID.cast!(id) end)
+
+      for {sql, args} <- [
+            {"DELETE FROM hole_results WHERE round_id = $1::uuid", [round]},
+            {"DELETE FROM hole_submissions WHERE round_id = $1::uuid", [round]},
+            {"DELETE FROM audit_events WHERE context->>'round_id' = $1", [fixture.round.id]},
+            {"DELETE FROM scorecards WHERE round_id = $1::uuid", [round]},
+            {"DELETE FROM competition_handicaps WHERE round_id = $1::uuid", [round]},
+            {"DELETE FROM handicap_snapshots WHERE round_id = $1::uuid", [round]},
+            {"DELETE FROM mystery_reveals WHERE mystery_hole_rule_id IN (SELECT id FROM mystery_hole_rules WHERE round_id = $1::uuid)",
+             [round]},
+            {"DELETE FROM mystery_hole_rules WHERE round_id = $1::uuid", [round]},
+            {"DELETE FROM scoring_tracks WHERE round_id = $1::uuid", [round]},
+            {"DELETE FROM competition_side_results WHERE competition_side_id IN (SELECT id FROM competition_sides WHERE round_id = $1::uuid)",
+             [round]},
+            {"DELETE FROM competition_side_memberships WHERE round_id = $1::uuid", [round]},
+            {"DELETE FROM competition_sides WHERE round_id = $1::uuid", [round]},
+            {"DELETE FROM group_role_assignments WHERE playing_group_id IN (SELECT id FROM playing_groups WHERE round_id = $1::uuid)",
+             [round]},
+            {"DELETE FROM round_entries WHERE round_id = $1::uuid", [round]},
+            {"DELETE FROM playing_groups WHERE round_id = $1::uuid", [round]},
+            {"DELETE FROM round_competitions WHERE round_id = $1::uuid", [round]},
+            {"DELETE FROM round_tee_hole_snapshots WHERE round_tee_profile_snapshot_id IN (SELECT id FROM round_tee_profile_snapshots WHERE round_id = $1::uuid)",
+             [round]},
+            {"DELETE FROM round_tee_profile_snapshots WHERE round_id = $1::uuid", [round]},
+            {"DELETE FROM round_holes WHERE round_id = $1::uuid", [round]},
+            {"DELETE FROM rounds WHERE id = $1::uuid", [round]},
+            {"DELETE FROM tee_rating_profiles WHERE id = $1::uuid",
+             [Ecto.UUID.dump!(fixture.tee_profile.id)]},
+            {"DELETE FROM tee_sets WHERE id = $1::uuid", [Ecto.UUID.dump!(fixture.tee_set.id)]},
+            {"DELETE FROM course_holes WHERE course_id = $1::uuid",
+             [Ecto.UUID.dump!(fixture.course.id)]},
+            {"DELETE FROM courses WHERE id = $1::uuid", [Ecto.UUID.dump!(fixture.course.id)]},
+            {"DELETE FROM event_staff_assignments WHERE event_id = $1::uuid", [event]},
+            {"DELETE FROM player_access_grants WHERE event_id = $1::uuid", [event]},
+            {"DELETE FROM events WHERE id = $1::uuid", [event]},
+            {"DELETE FROM staff_users WHERE id = $1::uuid", [staff]}
+          ] do
+        Repo.query!(sql, args)
+      end
+
+      for player_id <- player_ids do
+        Repo.query!("DELETE FROM players WHERE id = $1::uuid", [Ecto.UUID.dump!(player_id)])
+      end
+    end)
+  end
+
+  defp pg_backend_pid! do
+    Repo.query!("SELECT pg_backend_pid()").rows |> hd() |> hd()
+  end
+
+  defp await_blocked_by!(waiting_pid, blocking_pid, deadline) do
+    [[blocked?]] =
+      Repo.query!(
+        "SELECT $1::integer = ANY(pg_blocking_pids($2::integer))",
+        [blocking_pid, waiting_pid]
+      ).rows
+
+    cond do
+      blocked? ->
+        :ok
+
+      System.monotonic_time(:millisecond) >= deadline ->
+        flunk("expected PostgreSQL blocking between #{waiting_pid} and #{blocking_pid}")
+
+      true ->
+        Process.sleep(5)
+        await_blocked_by!(waiting_pid, blocking_pid, deadline)
+    end
+  end
+
   test "database check constraints reject provenance on a provisional result" do
     {setup, _mystery} = single_group_mystery!()
     side_id = side_id_for_entries(setup.entries)
@@ -434,6 +722,58 @@ defmodule GolfScoring.Competition.Services.ExcludeCompetitionSideBeforeHoleTest 
 
     assert error.postgres.constraint ==
              "competition_side_results_exclusion_provenance_consistent"
+  end
+
+  test "database constraint rejects noncanonical exclusion reasons" do
+    {setup, mystery} = single_group_mystery!()
+    side_id = side_id_for_entries(setup.entries)
+    result = provisional_result_for_side!(side_id)
+
+    update_sql = """
+    UPDATE competition_side_results
+    SET state = 'excluded', excluded_by_staff_user_id = $2::uuid,
+        exclusion_reason = $3, excluded_playing_group_id = $4::uuid,
+        excluded_effective_round_hole_id = $5::uuid,
+        excluded_effective_play_index = 0, excluded_preplay_confirmed = TRUE
+    WHERE id = $1::uuid
+    """
+
+    for invalid_reason <- [
+          "\t",
+          "\n",
+          "\u00A0\u202F",
+          " #{@reason} ",
+          "\t#{@reason}\n"
+        ] do
+      error =
+        assert_raise Postgrex.Error, fn ->
+          Repo.query!(update_sql, [
+            Ecto.UUID.dump!(result.id),
+            Ecto.UUID.dump!(setup.admin.id),
+            invalid_reason,
+            Ecto.UUID.dump!(setup.group.id),
+            Ecto.UUID.dump!(mystery.rule.round_hole_id)
+          ])
+        end
+
+      assert error.postgres.constraint ==
+               "competition_side_results_exclusion_provenance_consistent"
+    end
+
+    assert %{num_rows: 1} =
+             Repo.query!(update_sql, [
+               Ecto.UUID.dump!(result.id),
+               Ecto.UUID.dump!(setup.admin.id),
+               @reason,
+               Ecto.UUID.dump!(setup.group.id),
+               Ecto.UUID.dump!(mystery.rule.round_hole_id)
+             ])
+
+    assert [[@reason]] =
+             Repo.query!(
+               "SELECT exclusion_reason FROM competition_side_results WHERE id = $1::uuid",
+               [Ecto.UUID.dump!(result.id)]
+             ).rows
   end
 
   test "database trigger rejects a forged route index on provisional to excluded" do

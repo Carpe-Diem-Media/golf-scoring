@@ -71,7 +71,22 @@ defmodule GolfScoring.Repo.Migrations.Gls80PreplayMysteryExclusion do
                state = 'excluded'
                AND excluded_by_staff_user_id IS NOT NULL
                AND exclusion_reason IS NOT NULL
-               AND btrim(exclusion_reason) <> ''
+               AND exclusion_reason = btrim(
+                 exclusion_reason,
+                 chr(9) || chr(10) || chr(11) || chr(12) || chr(13) || chr(32) ||
+                   chr(133) || chr(160) || chr(5760) || chr(8192) || chr(8193) ||
+                   chr(8194) || chr(8195) || chr(8196) || chr(8197) || chr(8198) ||
+                   chr(8199) || chr(8200) || chr(8201) || chr(8202) || chr(8232) ||
+                   chr(8233) || chr(8239) || chr(8287) || chr(12288)
+               )
+               AND char_length(btrim(
+                 exclusion_reason,
+                 chr(9) || chr(10) || chr(11) || chr(12) || chr(13) || chr(32) ||
+                   chr(133) || chr(160) || chr(5760) || chr(8192) || chr(8193) ||
+                   chr(8194) || chr(8195) || chr(8196) || chr(8197) || chr(8198) ||
+                   chr(8199) || chr(8200) || chr(8201) || chr(8202) || chr(8232) ||
+                   chr(8233) || chr(8239) || chr(8287) || chr(12288)
+               )) > 0
                AND excluded_at IS NOT NULL
                AND excluded_playing_group_id IS NOT NULL
                AND excluded_effective_round_hole_id IS NOT NULL
