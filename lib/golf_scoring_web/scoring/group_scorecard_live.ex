@@ -19,6 +19,9 @@ defmodule GolfScoringWeb.Scoring.GroupScorecardLive do
           | :wrong_hole
           | :round_closed
           | :group_complete
+          | :receipt_not_found
+          | :payload_mismatch
+          | :receipt_mismatch
           | :scoring_unavailable
 
   @type replay_receipt :: %{
@@ -39,6 +42,7 @@ defmodule GolfScoringWeb.Scoring.GroupScorecardLive do
 
   @type replay_response ::
           %{required(:status) => :accepted, required(:receipt) => replay_receipt()}
+          | %{required(:status) => :resolved, required(:receipt) => replay_receipt()}
           | %{required(:status) => :rejected, required(:reason) => replay_rejection_reason()}
 
   @type event_reply ::
@@ -79,6 +83,20 @@ defmodule GolfScoringWeb.Scoring.GroupScorecardLive do
   end
 
   def handle_event("submit_queued_hole", _params, socket) do
+    {:reply, %{status: :rejected, reason: :scoring_unavailable}, socket}
+  end
+
+  @impl true
+  def handle_event(
+        "resolve_queued_hole",
+        %{"command" => command},
+        %{assigns: %{lifecycle: lifecycle}} = socket
+      )
+      when lifecycle in [:scoring_active, :group_play_complete] do
+    resolve_queued_receipt(command, socket)
+  end
+
+  def handle_event("resolve_queued_hole", _params, socket) do
     {:reply, %{status: :rejected, reason: :scoring_unavailable}, socket}
   end
 
@@ -497,6 +515,27 @@ defmodule GolfScoringWeb.Scoring.GroupScorecardLive do
     end
   end
 
+  defp resolve_queued_receipt(command, socket) do
+    case normalize_queued_command(command, socket) do
+      {:ok, command} ->
+        case Scoring.resolve_accepted_group_hole_receipt(
+               socket.assigns.current_player_access_grant,
+               socket.assigns.event_id,
+               socket.assigns.round_id,
+               command
+             ) do
+          {:ok, receipt} ->
+            {:reply, %{status: :resolved, receipt: project_receipt(receipt)}, socket}
+
+          {:error, reason} ->
+            rejected_reply(socket, normalize_resolution_rejection_reason(reason))
+        end
+
+      {:error, reason} ->
+        rejected_reply(socket, normalize_resolution_rejection_reason(reason))
+    end
+  end
+
   defp same_uuid?(left, right) when is_binary(left) and is_binary(right) do
     String.downcase(left) == String.downcase(right)
   end
@@ -613,6 +652,27 @@ defmodule GolfScoringWeb.Scoring.GroupScorecardLive do
 
   defp normalize_rejection_reason({:invalid_round_state, _state}), do: :round_closed
   defp normalize_rejection_reason(_reason), do: :invalid_submission
+
+  defp normalize_resolution_rejection_reason(:accepted_receipt_not_found),
+    do: :receipt_not_found
+
+  defp normalize_resolution_rejection_reason(:idempotency_payload_conflict),
+    do: :payload_mismatch
+
+  defp normalize_resolution_rejection_reason(:idempotency_scope_mismatch),
+    do: :receipt_mismatch
+
+  defp normalize_resolution_rejection_reason(reason)
+       when reason in [
+              :stale_role_assignment,
+              :not_primary_scorer,
+              :not_assigned,
+              :idempotency_actor_mismatch,
+              :idempotency_assignment_mismatch
+            ],
+       do: :stale_authority
+
+  defp normalize_resolution_rejection_reason(reason), do: normalize_rejection_reason(reason)
 
   defp parse_non_negative_integer(value) do
     with {:ok, parsed} <- parse_integer(value), true <- parsed >= 0 do

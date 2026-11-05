@@ -113,7 +113,7 @@ export const ScoringQueue = {
       const pending = await recoverPending(this.projection.scope);
       this.pendingCount = pending.length;
 
-      if (await this.resumeCompletedCommand(pending)) {
+      if (await this.resumeUnacknowledgedCommand(pending)) {
         this.initializingQueue = false;
         this.renderStatus();
         await this.replayPending();
@@ -149,7 +149,7 @@ export const ScoringQueue = {
       const pending = await recoverPending(this.projection.scope);
       this.pendingCount = pending.length;
 
-      if (await this.resumeCompletedCommand(pending)) {
+      if (await this.resumeUnacknowledgedCommand(pending)) {
         this.renderStatus();
         await this.replayPending();
         return;
@@ -177,58 +177,53 @@ export const ScoringQueue = {
     }
   },
 
-  async resumeCompletedCommand(pending) {
-    if (!this.isCompletedFinalCommand(pending)) return false;
+  async resumeUnacknowledgedCommand(pending) {
+    if (this.controller.state !== CONNECTION_STATES.conflictStop) return false;
 
-    if (this.controller.state === CONNECTION_STATES.conflictStop) {
-      const conflict = this.controller.conflict;
-      if (conflict?.reason !== "replay_intent_unresolved") return true;
-      if (!this.hasAuthorizedConnection()) return true;
+    const conflict = this.controller.conflict;
+    if (conflict?.reason !== "replay_intent_unresolved") return true;
 
-      const [record] = pending;
-      await this.controller.recover({
-        authorize: async ({ scope_key, assignment, conflict: unresolved }) => {
-          const response = await this.pushEvent("submit_queued_hole", { command: record.command });
-          const receipt = response?.receipt;
+    const record = pending[0];
+    if (!this.isRecoverableCommand(record, conflict) || !this.hasAuthorizedConnection()) return true;
 
-          if (!this.matchesCompletedReceipt(receipt, record)) return null;
+    await this.controller.recover({
+      authorize: async ({ scope_key, assignment, conflict: unresolved }) => {
+        const response = await this.pushEvent("resolve_queued_hole", { command: record.command });
+        const receipt = response?.receipt;
 
-          return {
-            status: "authorized",
-            scope_key,
-            submission_id: unresolved.submission_id,
-            assignment_id: assignment.id,
-            assignment_version: assignment.assignment_version,
-          };
-        },
-      });
-    }
+        if (response?.status !== "resolved" || !this.matchesAuthorizedReceipt(receipt, record)) {
+          return null;
+        }
+
+        return {
+          status: "authorized",
+          scope_key,
+          submission_id: unresolved.submission_id,
+          assignment_id: assignment.id,
+          assignment_version: assignment.assignment_version,
+          receipt,
+        };
+      },
+    });
 
     return true;
   },
 
-  isCompletedFinalCommand(pending) {
-    if (
-      this.lifecycle !== "group_play_complete" ||
-      this.projection.revision !== 18 ||
-      this.projection.route.length !== 18 ||
-      pending.length !== 1
-    ) {
-      return false;
-    }
+  isRecoverableCommand(record, conflict) {
+    if (!record || !this.projection || this.projection.route.length !== 18) return false;
 
-    const [record] = pending;
-    const finalHole = this.projection.route[17];
     const command = record.command;
     const assignment = record.metadata?.captured_assignment;
     const scope = record.scope;
-    const conflict = this.controller.conflict;
+    const routeHole = this.projection.route[command.expected_group_score_revision];
 
     return (
-      command.expected_group_score_revision === 17 &&
-      sameId(command.round_hole_id, finalHole.id) &&
-      sameId(command.client_submission_id, conflict?.submission_id || command.client_submission_id) &&
-      record.sequence === (conflict?.sequence ?? record.sequence) &&
+      Number.isSafeInteger(command.expected_group_score_revision) &&
+      command.expected_group_score_revision >= 0 &&
+      command.expected_group_score_revision < 18 &&
+      sameId(command.round_hole_id, routeHole?.id) &&
+      sameId(command.client_submission_id, conflict.submission_id) &&
+      record.sequence === conflict.sequence &&
       sameId(command.playing_group_id, this.projection.scope.playing_group_id) &&
       sameId(scope?.event_id, this.projection.scope.event_id) &&
       sameId(scope?.round_id, this.projection.scope.round_id) &&
@@ -241,7 +236,7 @@ export const ScoringQueue = {
     );
   },
 
-  matchesCompletedReceipt(receipt, record) {
+  matchesAuthorizedReceipt(receipt, record) {
     const command = record.command;
     const scope = record.scope;
     const assignment = record.metadata.captured_assignment;
@@ -257,14 +252,18 @@ export const ScoringQueue = {
       receipt.group_role_assignment_id === assignment.id &&
       receipt.role_assignment_version === assignment.assignment_version &&
       receipt.submitted_by_round_entry_id === scope.scorer.round_entry_id &&
+      receipt.source === "normal" &&
+      timestampsMatch(receipt.captured_at, command.captured_at) &&
       typeof receipt.payload_fingerprint === "string" &&
       payload?.playing_group_id === command.playing_group_id &&
       payload.round_hole_id === command.round_hole_id &&
       payload.expected_group_score_revision === command.expected_group_score_revision &&
       payload.role_assignment_version === command.role_assignment_version &&
+      timestampsMatch(payload.captured_at, command.captured_at) &&
       actor?.type === "player" &&
       actor.round_entry_id === scope.scorer.round_entry_id &&
-      actor.role_assignment_version === command.role_assignment_version
+      actor.role_assignment_version === command.role_assignment_version &&
+      sameResultPayload(payload.results, command.results)
     );
   },
 
@@ -595,6 +594,32 @@ function sameId(left, right) {
   return typeof left === "string" &&
     typeof right === "string" &&
     left.toLowerCase() === right.toLowerCase();
+}
+
+function sameResultPayload(received, expected) {
+  if (!Array.isArray(received) || !Array.isArray(expected) || received.length !== expected.length) {
+    return false;
+  }
+
+  const normalize = (results) => results
+    .map((result) => ({
+      round_entry_id: typeof result?.round_entry_id === "string"
+        ? result.round_entry_id.toLowerCase()
+        : result?.round_entry_id,
+      outcome: result?.outcome,
+      gross_strokes: result?.gross_strokes ?? null,
+      strokes_taken: result?.strokes_taken ?? null,
+    }))
+    .sort((left, right) => left.round_entry_id.localeCompare(right.round_entry_id));
+
+  return JSON.stringify(normalize(received)) === JSON.stringify(normalize(expected));
+}
+
+function timestampsMatch(left, right) {
+  return typeof left === "string" &&
+    typeof right === "string" &&
+    Number.isFinite(Date.parse(left)) &&
+    Date.parse(left) === Date.parse(right);
 }
 
 function cssEscape(value) {

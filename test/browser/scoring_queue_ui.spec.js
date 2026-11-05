@@ -413,7 +413,7 @@ test("reconciles an accepted final-hole command after its acknowledgement is los
       liveSocket: { isConnected: () => navigator.onLine },
       async pushEvent(event, payload) {
         window.__transportCalls.push({ event, command: structuredClone(payload.command) });
-        return { status: "accepted", receipt: window.__makeReceipt(payload.command) };
+        return { status: "resolved", receipt: window.__makeReceipt(payload.command) };
       },
     }, ScoringQueue);
     window.__scorecardHook = hook;
@@ -423,10 +423,13 @@ test("reconciles an accepted final-hole command after its acknowledgement is los
 
   await expect(page.locator("#scoring-sync-label")).toHaveText("Saved");
   await expect(page.locator("#scoring-pending-count")).toHaveText("0 pending");
-  expect(await page.evaluate(() => window.__transportCalls.map(({ command }) => command.client_submission_id))).toEqual([
-    "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
-    "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
-  ]);
+  expect(await page.evaluate(() => window.__transportCalls)).toEqual([{
+    event: "resolve_queued_hole",
+    command: expect.objectContaining({
+      client_submission_id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+      expected_group_score_revision: 17,
+    }),
+  }]);
   const pending = await page.evaluate(async (scope) => {
     const { recoverPending } = await import("/scoring/queue.js");
     return recoverPending(scope);

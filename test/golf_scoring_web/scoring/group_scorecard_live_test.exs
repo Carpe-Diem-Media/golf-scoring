@@ -19,11 +19,15 @@ defmodule GolfScoringWeb.Scoring.GroupScorecardLiveTest do
   alias GolfScoringWeb.Player.Session
 
   setup do
+    assert Mix.env() == :test
+
     Process.put(:gls34_prefix, "gls72-#{Ecto.UUID.generate()}")
     on_exit(fn -> Process.delete(:gls34_prefix) end)
 
     owner = Sandbox.start_owner!(Repo, shared: true)
     on_exit(fn -> Sandbox.stop_owner(owner) end)
+
+    assert Repo.query!("SELECT current_database()").rows == [["golf_scoring_test"]]
 
     :ok
   end
@@ -133,6 +137,115 @@ defmodule GolfScoringWeb.Scoring.GroupScorecardLiveTest do
     assert receipt.submitted_payload.actor.round_entry_id == scorer_entry.id
     assert length(receipt.submitted_payload.results) == 2
     refute Map.has_key?(receipt.submitted_payload, :mystery)
+    assert length(hole_results(setup)) == 2
+    assert length(hole_submissions(setup)) == 1
+  end
+
+  test "resolves an existing queued receipt without submitting another score", %{conn: conn} do
+    setup = PaperRecoveryFixtures.setup_submit_fixture!(2)
+    {view, _html} = open_scorecard!(conn, setup)
+    params = hole_params(setup, 0, hd(setup.route).id)
+
+    {accepted, _html} = submit_queued_hole!(view, setup, params)
+    {resolved, _html} = resolve_queued_hole!(view, setup, params)
+
+    assert accepted.status == :accepted
+    assert resolved.status == :resolved
+    assert resolved.receipt.id == accepted.receipt.id
+    assert resolved.receipt.client_submission_id == accepted.receipt.client_submission_id
+    assert length(hole_results(setup)) == 2
+    assert length(hole_submissions(setup)) == 1
+    assert Ash.get!(PlayingGroup, setup.group.id, authorize?: false).scoring_revision == 1
+  end
+
+  test "receipt resolution does not create a score when the server never accepted the command",
+       %{conn: conn} do
+    setup = PaperRecoveryFixtures.setup_submit_fixture!(2)
+    {view, _html} = open_scorecard!(conn, setup)
+    params = hole_params(setup, 0, hd(setup.route).id)
+
+    {response, _html} = resolve_queued_hole!(view, setup, params)
+
+    assert response == %{status: :rejected, reason: :receipt_not_found}
+    assert hole_results(setup) == []
+    assert hole_submissions(setup) == []
+    assert Ash.get!(PlayingGroup, setup.group.id, authorize?: false).scoring_revision == 0
+  end
+
+  test "receipt resolution rejects a changed payload", %{conn: conn} do
+    setup = PaperRecoveryFixtures.setup_submit_fixture!(2)
+    {view, _html} = open_scorecard!(conn, setup)
+    params = hole_params(setup, 0, hd(setup.route).id)
+    {accepted, _html} = submit_queued_hole!(view, setup, params)
+    scorecard = params["scorecard"]
+    [{entry_id, result} | _] = Map.to_list(scorecard["results"])
+    results = Map.put(scorecard["results"], entry_id, Map.put(result, "gross_strokes", "5"))
+    changed_params = Map.put(params, "scorecard", Map.put(scorecard, "results", results))
+
+    {response, _html} = resolve_queued_hole!(view, setup, changed_params)
+
+    assert accepted.status == :accepted
+    assert response.status == :rejected
+    refute response.reason == :receipt_not_found
+    assert length(hole_results(setup)) == 2
+    assert length(hole_submissions(setup)) == 1
+    assert Ash.get!(PlayingGroup, setup.group.id, authorize?: false).scoring_revision == 1
+  end
+
+  test "receipt resolution rejects a mismatched hole without changing scores", %{conn: conn} do
+    setup = PaperRecoveryFixtures.setup_submit_fixture!(2)
+    {view, _html} = open_scorecard!(conn, setup)
+    params = hole_params(setup, 0, hd(setup.route).id)
+    {accepted, _html} = submit_queued_hole!(view, setup, params)
+    scorecard = params["scorecard"]
+    mismatched = Map.put(scorecard, "round_hole_id", Enum.at(setup.route, 1).id)
+
+    {response, _html} =
+      resolve_queued_hole!(view, setup, Map.put(params, "scorecard", mismatched))
+
+    assert accepted.status == :accepted
+    assert response == %{status: :rejected, reason: :receipt_mismatch}
+    assert length(hole_results(setup)) == 2
+    assert length(hole_submissions(setup)) == 1
+    assert Ash.get!(PlayingGroup, setup.group.id, authorize?: false).scoring_revision == 1
+  end
+
+  test "receipt resolution rejects a closed round without changing scores", %{conn: conn} do
+    setup = PaperRecoveryFixtures.setup_submit_fixture!(2)
+    {view, _html} = open_scorecard!(conn, setup)
+    params = hole_params(setup, 0, hd(setup.route).id)
+    {accepted, _html} = submit_queued_hole!(view, setup, params)
+    PaperRecoveryFixtures.set_round_state!(setup.round, :scoring_closed)
+
+    {response, _html} = resolve_queued_hole!(view, setup, params)
+
+    assert accepted.status == :accepted
+    assert response == %{status: :rejected, reason: :round_closed}
+    assert length(hole_results(setup)) == 2
+    assert length(hole_submissions(setup)) == 1
+    assert Ash.get!(PlayingGroup, setup.group.id, authorize?: false).scoring_revision == 1
+  end
+
+  test "receipt resolution rejects a scorer after handover", %{conn: conn} do
+    setup = PaperRecoveryFixtures.setup_submit_fixture!(2)
+    [old_scorer, new_scorer] = setup.entries
+    {view, _html} = open_scorecard!(conn, setup, old_scorer)
+    params = hole_params(setup, 0, hd(setup.route).id)
+    {accepted, _html} = submit_queued_hole!(view, setup, params)
+
+    assert {:ok, _assignment} =
+             Competition.handover_primary_scorer(
+               setup.admin,
+               setup.event.id,
+               setup.round.id,
+               setup.group.id,
+               new_scorer.id
+             )
+
+    {response, _html} = resolve_queued_hole!(view, setup, params)
+
+    assert accepted.status == :accepted
+    assert response == %{status: :rejected, reason: :stale_authority}
     assert length(hole_results(setup)) == 2
     assert length(hole_submissions(setup)) == 1
   end
@@ -656,6 +769,27 @@ defmodule GolfScoringWeb.Scoring.GroupScorecardLiveTest do
     }
 
     render_hook(view, "submit_queued_hole", %{"command" => command})
+    %{proxy: {ref, _topic, _}} = view
+    assert_receive {^ref, {:reply, response}}
+
+    {response, render(view)}
+  end
+
+  defp resolve_queued_hole!(view, setup, %{"scorecard" => values}, assignment_version \\ 1) do
+    command = %{
+      "client_submission_id" => values["client_submission_id"],
+      "playing_group_id" => setup.group.id,
+      "round_hole_id" => values["round_hole_id"],
+      "expected_group_score_revision" => values["expected_group_score_revision"],
+      "role_assignment_version" => Integer.to_string(assignment_version),
+      "captured_at" => values["captured_at"],
+      "results" =>
+        Enum.map(values["results"], fn {round_entry_id, result} ->
+          Map.put(result, "round_entry_id", round_entry_id)
+        end)
+    }
+
+    render_hook(view, "resolve_queued_hole", %{"command" => command})
     %{proxy: {ref, _topic, _}} = view
     assert_receive {^ref, {:reply, response}}
 

@@ -60,6 +60,19 @@ defmodule GolfScoring.Scoring do
   end
 
   @doc """
+  Resolves an existing accepted player command by its idempotency key.
+
+  The current grant, primary-scorer assignment, round, and command payload are
+  checked again. This function only reads an existing receipt and never accepts
+  a new score.
+  """
+  @spec resolve_accepted_group_hole_receipt(term(), term(), term(), map()) ::
+          {:ok, GolfScoring.Scoring.HoleSubmission.t()} | {:error, term()}
+  def resolve_accepted_group_hole_receipt(actor, event_id, round_id, command) do
+    SubmitGroupHole.resolve_accepted_receipt(actor, event_id, round_id, command)
+  end
+
+  @doc """
   Loads the scorecard for a player grant and route identifiers.
 
   The current grant and primary-scorer assignment are revalidated for every
