@@ -140,6 +140,7 @@ test("an authenticated LiveView keeps Hole 3 next after reconciling Hole 1 with 
   await expect.poll(() => traffic.submissionIds.length).toBe(2);
   await expect.poll(() => traffic.replies.filter(({ event }) => event === "submit_queued_hole").length).toBe(2);
   await expect(page.locator("#current-hole")).toHaveText("Hole 3");
+  await expect(page.locator('[name="scorecard[expected_group_score_revision]"]')).toHaveValue("2");
   await expect(page.locator("#scoring-sync-label")).toHaveText("Pending sync");
   await expect(page.locator("#scoring-pending-count")).toHaveText("1 pending");
 
@@ -327,8 +328,20 @@ async function queueTwoHolesOffline(page, context) {
     await expect(page.locator("#scoring-sync-label")).toHaveText("Pending sync");
     await expect(page.locator("#scoring-pending-count")).toHaveText(`${holeNumber} pending`);
     await expect(page.locator("#current-hole")).toHaveText(`Hole ${holeNumber + 1}`);
-    commands.push((await pendingCommands(page))[holeNumber - 1]);
+
+    const pending = await pendingCommands(page);
+    expect(pending).toHaveLength(holeNumber);
+
+    const matchingCommands = pending.filter(
+      ({ expected_group_score_revision }) =>
+        expected_group_score_revision === holeNumber - 1,
+    );
+    expect(matchingCommands).toHaveLength(1);
+    commands.push(matchingCommands[0]);
   }
+
+  expect(commands).toHaveLength(2);
+  expect(new Set(commands.map(({ client_submission_id }) => client_submission_id)).size).toBe(2);
 
   return commands;
 }
