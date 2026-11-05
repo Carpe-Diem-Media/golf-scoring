@@ -17,12 +17,14 @@ defmodule GolfScoring.Scoring do
   alias GolfScoring.Scoring.Services.LoadGroupScorecard
   alias GolfScoring.Scoring.Services.OverrideHandicapBasis
   alias GolfScoring.Scoring.Services.SubmitGroupHole
+  alias GolfScoring.Scoring.Services.VerifyHoleResult
 
   resources do
     resource GolfScoring.Scoring.HandicapSnapshot
     resource GolfScoring.Scoring.CompetitionHandicap
     resource GolfScoring.Scoring.Scorecard
     resource GolfScoring.Scoring.HoleResult
+    resource GolfScoring.Scoring.ScoreVerification
     resource GolfScoring.Scoring.HoleSubmission
   end
 
@@ -57,6 +59,27 @@ defmodule GolfScoring.Scoring do
 
   def submit_group_hole(actor, event_id, round_id, command) do
     SubmitGroupHole.run(actor, event_id, round_id, command)
+  end
+
+  @doc """
+  Certifies the current result revision using a player grant and current role assignment.
+
+  The command identifies the playing group, HoleResult, expected result revision,
+  assignment ID and assignment version. Identical retries return the same evidence;
+  a stale revision, ineligible actor or conflicting certification returns an error.
+  """
+  def verify_hole_result(actor, event_id, round_id, command) do
+    VerifyHoleResult.run(actor, event_id, round_id, command)
+  end
+
+  @doc """
+  Records an authorized staff exception for the current result revision.
+
+  The command identifies the playing group, HoleResult, expected revision and a
+  nonblank reason. The transaction records the staff identity and audit event.
+  """
+  def override_hole_verification(actor, event_id, round_id, command) do
+    VerifyHoleResult.override(actor, event_id, round_id, command)
   end
 
   @doc """
