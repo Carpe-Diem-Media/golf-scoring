@@ -3,6 +3,7 @@ import { defineConfig } from "@playwright/test";
 export default defineConfig({
   testDir: ".",
   testMatch: ["**/assets/test/**/*.test.js", "**/test/browser/**/*.spec.js"],
+  testIgnore: ["**/.worktrees/**"],
   outputDir: "/tmp/golf-scoring-playwright-results",
   workers: 1,
   reporter: "line",

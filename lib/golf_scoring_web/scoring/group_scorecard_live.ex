@@ -72,27 +72,10 @@ defmodule GolfScoringWeb.Scoring.GroupScorecardLive do
   def handle_event(
         "submit_queued_hole",
         %{"command" => command},
-        %{assigns: %{lifecycle: :scoring_active}} = socket
-      ) do
-    case normalize_queued_command(command, socket) do
-      {:ok, command} ->
-        case Scoring.submit_group_hole(
-               socket.assigns.current_player_access_grant,
-               socket.assigns.event_id,
-               socket.assigns.round_id,
-               command
-             ) do
-          {:ok, receipt} ->
-            reply = %{status: :accepted, receipt: project_receipt(receipt)}
-            {:reply, reply, refreshed_scorecard_socket(socket, "Hole saved")}
-
-          {:error, reason} ->
-            {:reply, %{status: :rejected, reason: normalize_rejection_reason(reason)}, socket}
-        end
-
-      {:error, reason} ->
-        {:reply, %{status: :rejected, reason: normalize_rejection_reason(reason)}, socket}
-    end
+        %{assigns: %{lifecycle: lifecycle}} = socket
+      )
+      when lifecycle in [:scoring_active, :group_play_complete] do
+    handle_queued_command(command, socket)
   end
 
   def handle_event("submit_queued_hole", _params, socket) do
@@ -109,7 +92,15 @@ defmodule GolfScoringWeb.Scoring.GroupScorecardLive do
         player_name={@player_name}
         current_path={@current_path}
       >
-        <section id="group-scorecard" class="space-y-5">
+        <section
+          id="group-scorecard"
+          phx-hook={if @lifecycle in [:scoring_active, :group_play_complete], do: "ScoringQueue"}
+          data-scorecard-lifecycle={@lifecycle}
+          data-scoring-queue-projection={
+            if @lifecycle in [:scoring_active, :group_play_complete], do: @offline_projection
+          }
+          class="space-y-5"
+        >
           <section
             :if={@lifecycle == :unavailable}
             id="scorecard-unavailable"
@@ -123,8 +114,6 @@ defmodule GolfScoringWeb.Scoring.GroupScorecardLive do
           <section
             :if={@lifecycle == :group_play_complete}
             id="group-play-complete"
-            phx-hook="ScoringQueue"
-            data-scoring-queue-projection={@offline_projection}
             class="rounded-2xl border border-success/30 bg-success/5 p-5 shadow-sm"
             role="status"
           >
@@ -224,8 +213,6 @@ defmodule GolfScoringWeb.Scoring.GroupScorecardLive do
             <.form
               for={@scorecard_form}
               id="scorecard-entry-form"
-              phx-hook="ScoringQueue"
-              data-scoring-queue-projection={@offline_projection}
               phx-change="update_results"
               class="space-y-4"
             >
@@ -462,6 +449,60 @@ defmodule GolfScoringWeb.Scoring.GroupScorecardLive do
 
   defp normalize_queued_command(_command, _socket), do: {:error, :invalid_input}
 
+  defp handle_queued_command(command, socket) do
+    case normalize_queued_command(command, socket) do
+      {:ok, command} -> submit_if_replayable(command, socket)
+      {:error, reason} -> rejected_reply(socket, normalize_rejection_reason(reason))
+    end
+  end
+
+  defp submit_if_replayable(command, socket) do
+    if replayable_command?(command, socket) do
+      submit_queued_command(command, socket)
+    else
+      rejected_reply(socket, :group_complete)
+    end
+  end
+
+  defp rejected_reply(socket, reason) do
+    {:reply, %{status: :rejected, reason: reason}, socket}
+  end
+
+  defp replayable_command?(_command, %{assigns: %{lifecycle: :scoring_active}}), do: true
+
+  defp replayable_command?(command, %{assigns: %{lifecycle: :group_play_complete} = assigns}) do
+    route = assigns.scorecard_data.rotated_route
+
+    length(route) == 18 and
+      assigns.scorecard_data.revision == 18 and
+      command.expected_group_score_revision == 17 and
+      same_uuid?(command.round_hole_id, List.last(route).id)
+  end
+
+  defp replayable_command?(_command, _socket), do: false
+
+  defp submit_queued_command(command, socket) do
+    case Scoring.submit_group_hole(
+           socket.assigns.current_player_access_grant,
+           socket.assigns.event_id,
+           socket.assigns.round_id,
+           command
+         ) do
+      {:ok, receipt} ->
+        reply = %{status: :accepted, receipt: project_receipt(receipt)}
+        {:reply, reply, refreshed_scorecard_socket(socket, "Hole saved")}
+
+      {:error, reason} ->
+        {:reply, %{status: :rejected, reason: normalize_rejection_reason(reason)}, socket}
+    end
+  end
+
+  defp same_uuid?(left, right) when is_binary(left) and is_binary(right) do
+    String.downcase(left) == String.downcase(right)
+  end
+
+  defp same_uuid?(_left, _right), do: false
+
   defp normalize_queued_results(entries, values)
        when is_list(values) and length(values) in 2..4 do
     entries_by_id = Map.new(entries, &{String.downcase(&1.id), &1})
@@ -566,6 +607,10 @@ defmodule GolfScoringWeb.Scoring.GroupScorecardLive do
   defp normalize_rejection_reason(:stale_scoring_revision), do: :stale_group_revision
   defp normalize_rejection_reason(:wrong_round_hole), do: :wrong_hole
   defp normalize_rejection_reason(:group_scoring_complete), do: :group_complete
+
+  defp normalize_rejection_reason({:invalid_group_state, state})
+       when state in [:finished_playing, "finished_playing"], do: :group_complete
+
   defp normalize_rejection_reason({:invalid_round_state, _state}), do: :round_closed
   defp normalize_rejection_reason(_reason), do: :invalid_submission
 

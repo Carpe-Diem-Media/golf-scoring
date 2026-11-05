@@ -6,11 +6,12 @@ const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 export const ScoringQueue = {
   mounted() {
-    this.form = this.el.matches(FORM_SELECTOR) ? this.el : this.el.querySelector(FORM_SELECTOR);
-    this.statusRoot = this.form || this.el;
-    this.projectionRoot = this.form || this.el;
-    this.submitButton = this.form?.querySelector("#submit-group-hole");
-    this.feedback = this.statusRoot.querySelector("#scorecard-feedback");
+    this.form = null;
+    this.submitListener = (event) => this.submitHole(event);
+    this.offlineChangeListener = (event) => {
+      if (!this.hasAuthorizedConnection()) event.stopPropagation();
+    };
+    this.refreshElements();
     this.destroyedQueue = false;
     this.replayingQueue = false;
     this.replayPromise = null;
@@ -24,17 +25,19 @@ export const ScoringQueue = {
     window.addEventListener("online", this.onlineListener);
     window.addEventListener("offline", this.offlineListener);
 
-    if (this.form && this.submitButton) {
-      this.submitListener = (event) => this.submitHole(event);
-      this.form.addEventListener("submit", this.submitListener);
-      this.setControlsDisabled(true);
-    }
+    this.setControlsDisabled(true);
 
     this.ready = this.restoreQueue();
   },
 
   updated() {
     if (this.destroyedQueue || !this.projectionRoot) return;
+    this.refreshElements();
+    if (!this.initializingQueue) {
+      this.setControlsDisabled(
+        this.replayingQueue || this.controller?.state === CONNECTION_STATES.conflictStop,
+      );
+    }
 
     try {
       const projection = readProjection(this.projectionRoot);
@@ -63,8 +66,36 @@ export const ScoringQueue = {
     if (this.form && this.submitListener) {
       this.form.removeEventListener("submit", this.submitListener);
     }
+    if (this.form && this.offlineChangeListener) {
+      this.form.removeEventListener("input", this.offlineChangeListener);
+      this.form.removeEventListener("change", this.offlineChangeListener);
+    }
     if (this.onlineListener) window.removeEventListener("online", this.onlineListener);
     if (this.offlineListener) window.removeEventListener("offline", this.offlineListener);
+  },
+
+  refreshElements() {
+    this.statusRoot = this.el;
+    this.projectionRoot = this.el;
+    this.lifecycle = this.el.dataset.scorecardLifecycle;
+    const nextForm = this.el.querySelector(FORM_SELECTOR);
+
+    if (nextForm !== this.form) {
+      if (this.form && this.submitListener) {
+        this.form.removeEventListener("submit", this.submitListener);
+      }
+      this.form = nextForm;
+      if (this.form && this.submitListener) {
+        this.form.addEventListener("submit", this.submitListener);
+      }
+      if (this.form && this.offlineChangeListener) {
+        this.form.addEventListener("input", this.offlineChangeListener);
+        this.form.addEventListener("change", this.offlineChangeListener);
+      }
+    }
+
+    this.submitButton = this.form?.querySelector("#submit-group-hole");
+    this.feedback = this.statusRoot.querySelector("#scorecard-feedback");
   },
 
   async restoreQueue() {
@@ -82,10 +113,20 @@ export const ScoringQueue = {
       const pending = await recoverPending(this.projection.scope);
       this.pendingCount = pending.length;
 
-      if (!this.isContiguous(pending, this.serverRevision)) {
+      if (await this.resumeCompletedCommand(pending)) {
+        this.initializingQueue = false;
+        this.renderStatus();
+        await this.replayPending();
+        return;
+      }
+
+      if (
+        this.controller.state !== CONNECTION_STATES.conflictStop &&
+        !this.isContiguous(pending, this.serverRevision)
+      ) {
         await persistConflictStop(pending[0], "local_progression_mismatch");
         await this.controller.refresh();
-      } else {
+      } else if (this.controller.state !== CONNECTION_STATES.conflictStop) {
         this.nextRevision = this.serverRevision + pending.length;
       }
 
@@ -107,12 +148,22 @@ export const ScoringQueue = {
     try {
       const pending = await recoverPending(this.projection.scope);
       this.pendingCount = pending.length;
+
+      if (await this.resumeCompletedCommand(pending)) {
+        this.renderStatus();
+        await this.replayPending();
+        return;
+      }
+
       if (pending.length === 0) {
         this.nextRevision = Math.max(this.nextRevision, this.serverRevision);
-      } else if (!this.isContiguous(pending, this.serverRevision)) {
+      } else if (
+        this.controller.state !== CONNECTION_STATES.conflictStop &&
+        !this.isContiguous(pending, this.serverRevision)
+      ) {
         await persistConflictStop(pending[0], "local_progression_mismatch");
         await this.controller.refresh();
-      } else {
+      } else if (this.controller.state !== CONNECTION_STATES.conflictStop) {
         this.nextRevision = Math.max(this.nextRevision, this.serverRevision + pending.length);
       }
 
@@ -124,6 +175,104 @@ export const ScoringQueue = {
     } catch (_error) {
       this.showAttention("This browser could not verify its saved scores. Keep this page open and try again.");
     }
+  },
+
+  async resumeCompletedCommand(pending) {
+    if (!this.isCompletedFinalCommand(pending)) return false;
+
+    if (this.controller.state === CONNECTION_STATES.conflictStop) {
+      const conflict = this.controller.conflict;
+      if (conflict?.reason !== "replay_intent_unresolved") return true;
+      if (!this.hasAuthorizedConnection()) return true;
+
+      const [record] = pending;
+      await this.controller.recover({
+        authorize: async ({ scope_key, assignment, conflict: unresolved }) => {
+          const response = await this.pushEvent("submit_queued_hole", { command: record.command });
+          const receipt = response?.receipt;
+
+          if (!this.matchesCompletedReceipt(receipt, record)) return null;
+
+          return {
+            status: "authorized",
+            scope_key,
+            submission_id: unresolved.submission_id,
+            assignment_id: assignment.id,
+            assignment_version: assignment.assignment_version,
+          };
+        },
+      });
+    }
+
+    return true;
+  },
+
+  isCompletedFinalCommand(pending) {
+    if (
+      this.lifecycle !== "group_play_complete" ||
+      this.projection.revision !== 18 ||
+      this.projection.route.length !== 18 ||
+      pending.length !== 1
+    ) {
+      return false;
+    }
+
+    const [record] = pending;
+    const finalHole = this.projection.route[17];
+    const command = record.command;
+    const assignment = record.metadata?.captured_assignment;
+    const scope = record.scope;
+    const conflict = this.controller.conflict;
+
+    return (
+      command.expected_group_score_revision === 17 &&
+      sameId(command.round_hole_id, finalHole.id) &&
+      sameId(command.client_submission_id, conflict?.submission_id || command.client_submission_id) &&
+      record.sequence === (conflict?.sequence ?? record.sequence) &&
+      sameId(command.playing_group_id, this.projection.scope.playing_group_id) &&
+      sameId(scope?.event_id, this.projection.scope.event_id) &&
+      sameId(scope?.round_id, this.projection.scope.round_id) &&
+      sameId(scope?.playing_group_id, this.projection.scope.playing_group_id) &&
+      sameId(scope?.scorer?.round_entry_id, this.projection.scope.scorer.round_entry_id) &&
+      sameId(assignment?.id, this.projection.assignment.id) &&
+      sameId(assignment?.round_entry_id, this.projection.assignment.round_entry_id) &&
+      assignment?.assignment_version === this.projection.assignment.assignment_version &&
+      command.role_assignment_version === this.projection.assignment.assignment_version
+    );
+  },
+
+  matchesCompletedReceipt(receipt, record) {
+    const command = record.command;
+    const scope = record.scope;
+    const assignment = record.metadata.captured_assignment;
+    const payload = receipt?.submitted_payload;
+    const actor = payload?.actor;
+
+    return (
+      receipt?.client_submission_id === command.client_submission_id &&
+      receipt.round_id === scope.round_id &&
+      receipt.playing_group_id === scope.playing_group_id &&
+      receipt.round_hole_id === command.round_hole_id &&
+      receipt.expected_group_score_revision === command.expected_group_score_revision &&
+      receipt.group_role_assignment_id === assignment.id &&
+      receipt.role_assignment_version === assignment.assignment_version &&
+      receipt.submitted_by_round_entry_id === scope.scorer.round_entry_id &&
+      typeof receipt.payload_fingerprint === "string" &&
+      payload?.playing_group_id === command.playing_group_id &&
+      payload.round_hole_id === command.round_hole_id &&
+      payload.expected_group_score_revision === command.expected_group_score_revision &&
+      payload.role_assignment_version === command.role_assignment_version &&
+      actor?.type === "player" &&
+      actor.round_entry_id === scope.scorer.round_entry_id &&
+      actor.role_assignment_version === command.role_assignment_version
+    );
+  },
+
+  hasAuthorizedConnection() {
+    return (
+      globalThis.navigator?.onLine !== false &&
+      this.liveSocket?.isConnected() === true
+    );
   },
 
   isContiguous(records, revision) {
@@ -139,6 +288,7 @@ export const ScoringQueue = {
 
   async submitHole(event) {
     event.preventDefault();
+    event.stopPropagation();
     if (this.initializingQueue || this.replayingQueue || this.controller?.state === CONNECTION_STATES.conflictStop) {
       return;
     }
@@ -229,10 +379,8 @@ export const ScoringQueue = {
   },
 
   renderCurrentHole() {
-    if (!this.form) return;
-
     const hole = this.projection.route[this.nextRevision];
-    const currentHole = this.form.querySelector("#current-hole");
+    const currentHole = this.projectionRoot.querySelector("#current-hole");
     if (!hole) {
       if (currentHole) currentHole.textContent = "All holes queued for sync";
       if (this.submitButton) this.submitButton.disabled = true;
@@ -240,6 +388,7 @@ export const ScoringQueue = {
     }
 
     if (currentHole) currentHole.textContent = `Hole ${hole.display_hole_number}`;
+    if (!this.form) return;
     this.setNamedValue("scorecard[expected_group_score_revision]", this.nextRevision);
     this.setNamedValue("scorecard[round_hole_id]", hole.id);
     this.setNamedValue("scorecard[client_submission_id]", globalThis.crypto.randomUUID());
@@ -291,12 +440,12 @@ export const ScoringQueue = {
     if (!this.form) return;
 
     setText(
-      this.form.querySelector("#completed-holes-label"),
+      this.projectionRoot.querySelector("#completed-holes-label"),
       `${this.serverRevision} of 18 holes complete`,
     );
-    const progress = this.form.querySelector("#holes-complete-progress");
+    const progress = this.projectionRoot.querySelector("#holes-complete-progress");
     if (progress) progress.value = this.serverRevision;
-    setText(this.form.querySelector("#holes-remaining"), `${Math.max(18 - this.nextRevision, 0)} remaining`);
+    setText(this.projectionRoot.querySelector("#holes-remaining"), `${Math.max(18 - this.nextRevision, 0)} remaining`);
   },
 
   async renderStatus() {
@@ -440,6 +589,12 @@ function parseScore(value, minimum) {
 
 function setText(element, value) {
   if (element) element.textContent = String(value);
+}
+
+function sameId(left, right) {
+  return typeof left === "string" &&
+    typeof right === "string" &&
+    left.toLowerCase() === right.toLowerCase();
 }
 
 function cssEscape(value) {

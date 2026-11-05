@@ -41,6 +41,17 @@ defmodule GolfScoringWeb.Scoring.GroupScorecardLiveTest do
       assert html =~ "White tee, Men rating"
       refute html =~ "White · Men"
       assert has_element?(view, "#group-scorecard")
+      assert has_element?(view, "#group-scorecard[phx-hook='ScoringQueue']")
+      assert has_element?(view, "#group-scorecard[data-scorecard-lifecycle='scoring_active']")
+      assert has_element?(view, "#group-scorecard #current-hole", "Hole 1")
+      assert has_element?(view, "#group-scorecard form#scorecard-entry-form")
+      refute has_element?(view, "#scorecard-entry-form[phx-hook='ScoringQueue']")
+
+      {header_offset, _} = :binary.match(html, ~s(id="current-hole"))
+      {form_offset, _} = :binary.match(html, ~s(id="scorecard-entry-form"))
+
+      assert header_offset < form_offset
+
       assert has_element?(view, "#event-round-context", "Event ID")
       assert has_element?(view, "#event-round-context", setup.event.id)
       assert has_element?(view, "#event-round-context", "Round ID")
@@ -530,6 +541,52 @@ defmodule GolfScoringWeb.Scoring.GroupScorecardLiveTest do
     assert has_element?(view, "#event-round-context", setup.event.id)
     assert has_element?(view, "#event-round-context", setup.round.id)
     assert has_element?(view, "#holes-remaining", "0 remaining")
+    assert length(hole_results(setup)) == 36
+    assert length(hole_submissions(setup)) == 18
+    assert Ash.get!(PlayingGroup, setup.group.id, authorize?: false).scoring_revision == 18
+  end
+
+  test "a completed group returns the existing final-hole receipt without accepting a new command",
+       %{
+         conn: conn
+       } do
+    setup = PaperRecoveryFixtures.setup_submit_fixture!(2)
+    scorer = hd(setup.entries)
+
+    for revision <- 0..16 do
+      hole = route_hole_at_revision!(setup, revision)
+
+      assert {:ok, _receipt} =
+               Scoring.submit_group_hole(
+                 setup.admin,
+                 setup.event.id,
+                 setup.round.id,
+                 service_command(setup, revision, hole.id)
+               )
+    end
+
+    {view, _html} = open_scorecard!(conn, setup, scorer)
+    final_hole = route_hole_at_revision!(setup, 17)
+    params = hole_params(setup, 17, final_hole.id)
+
+    {accepted_response, html} = submit_queued_hole!(view, setup, params)
+
+    assert accepted_response.status == :accepted
+    assert html =~ "Group play complete"
+
+    {retry_response, html} = submit_queued_hole!(view, setup, params)
+
+    assert retry_response.status == :accepted
+    assert retry_response.receipt.id == accepted_response.receipt.id
+    assert html =~ "Group play complete"
+    assert length(hole_results(setup)) == 36
+    assert length(hole_submissions(setup)) == 18
+    assert Ash.get!(PlayingGroup, setup.group.id, authorize?: false).scoring_revision == 18
+
+    new_command = put_in(params, ["scorecard", "client_submission_id"], Ecto.UUID.generate())
+    {new_response, _html} = submit_queued_hole!(view, setup, new_command)
+
+    assert new_response == %{status: :rejected, reason: :group_complete}
     assert length(hole_results(setup)) == 36
     assert length(hole_submissions(setup)) == 18
     assert Ash.get!(PlayingGroup, setup.group.id, authorize?: false).scoring_revision == 18

@@ -205,6 +205,29 @@ jobs:
       - name: Install locked dependencies
         run: mix deps.get --check-locked
 
+      - name: Set up Node.js for the authenticated browser integration
+        # actions/setup-node v7.1.0
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - name: Install browser test dependencies
+        run: npm ci
+
+      - name: Install Chromium for the authenticated browser integration
+        run: npx playwright install --with-deps chromium
+
+      - name: Install Phoenix asset build tools
+        run: mix assets.setup
+
+      - name: Build and inspect the application JavaScript bundle
+        run: |
+          mix assets.build
+          test -s priv/static/assets/js/app.js
+          node -e 'const fs = require("node:fs"); const bundle = fs.readFileSync("priv/static/assets/js/app.js", "utf8"); if (!bundle.includes("ScoringQueue") || !bundle.includes("submit_queued_hole")) process.exit(1);'
+
       # The existing `test` alias runs `ash.setup --quiet` first.
       # Because this job gets a fresh PostgreSQL service, this also proves
       # database setup/migration health from an empty CI database.
