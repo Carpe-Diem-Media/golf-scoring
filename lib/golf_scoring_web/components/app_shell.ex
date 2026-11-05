@@ -305,7 +305,7 @@ defmodule GolfScoringWeb.AppShell do
         id={@item.id}
         aria-current={if @item.current, do: "page", else: false}
         class={[
-          "flex min-h-11 flex-col items-center justify-center rounded-xl px-2 py-1 text-center text-xs font-medium focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-base-content",
+          "flex min-h-11 flex-col items-center justify-center rounded-xl px-2 py-1 text-center text-xs font-medium active:scale-[0.98] focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-base-content",
           @item.current && "bg-base-200 text-base-content",
           !@item.current && "text-base-content/80"
         ]}

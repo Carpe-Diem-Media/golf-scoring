@@ -12,6 +12,43 @@ defmodule GolfScoringWeb.Scoring.GroupScorecardLive do
 
   alias GolfScoring.Scoring
 
+  @type replay_rejection_reason ::
+          :invalid_submission
+          | :stale_authority
+          | :stale_group_revision
+          | :wrong_hole
+          | :round_closed
+          | :group_complete
+          | :receipt_not_found
+          | :payload_mismatch
+          | :receipt_mismatch
+          | :scoring_unavailable
+
+  @type replay_receipt :: %{
+          required(:id) => Ecto.UUID.t(),
+          required(:client_submission_id) => Ecto.UUID.t(),
+          required(:round_id) => Ecto.UUID.t(),
+          required(:playing_group_id) => Ecto.UUID.t(),
+          required(:round_hole_id) => Ecto.UUID.t(),
+          required(:expected_group_score_revision) => non_neg_integer(),
+          required(:group_role_assignment_id) => Ecto.UUID.t(),
+          required(:role_assignment_version) => pos_integer(),
+          required(:submitted_by_round_entry_id) => Ecto.UUID.t(),
+          required(:captured_at) => String.t(),
+          required(:payload_fingerprint) => String.t(),
+          required(:submitted_payload) => map(),
+          required(:source) => String.t()
+        }
+
+  @type replay_response ::
+          %{required(:status) => :accepted, required(:receipt) => replay_receipt()}
+          | %{required(:status) => :resolved, required(:receipt) => replay_receipt()}
+          | %{required(:status) => :rejected, required(:reason) => replay_rejection_reason()}
+
+  @type event_reply ::
+          {:noreply, Phoenix.LiveView.Socket.t()}
+          | {:reply, replay_response(), Phoenix.LiveView.Socket.t()}
+
   @impl true
   def mount(params, _session, socket) do
     case load_scorecard(params, socket.assigns.current_player_access_grant) do
@@ -23,6 +60,7 @@ defmodule GolfScoringWeb.Scoring.GroupScorecardLive do
     end
   end
 
+  @spec handle_event(binary(), map(), Phoenix.LiveView.Socket.t()) :: event_reply()
   @impl true
   def handle_event("update_results", %{"scorecard" => params}, socket) do
     values = Map.get(params, "results", %{})
@@ -36,40 +74,30 @@ defmodule GolfScoringWeb.Scoring.GroupScorecardLive do
 
   @impl true
   def handle_event(
-        "submit_hole",
-        %{"scorecard" => params},
-        %{assigns: %{lifecycle: :scoring_active}} = socket
-      ) do
-    values = Map.get(params, "results", %{})
-    socket = socket |> assign(:result_values, values) |> refresh_previews()
-
-    with {:ok, expected_revision} <- parse_integer(params["expected_group_score_revision"]),
-         {:ok, hole_id} <- Ecto.UUID.cast(params["round_hole_id"]),
-         {:ok, client_submission_id} <- Ecto.UUID.cast(params["client_submission_id"]),
-         {:ok, captured_at} <- parse_datetime(params["captured_at"]),
-         {:ok, results} <- normalize_results(socket.assigns.entries, values) do
-      command = %{
-        client_submission_id: client_submission_id,
-        playing_group_id: socket.assigns.group_id,
-        round_hole_id: hole_id,
-        expected_group_score_revision: expected_revision,
-        role_assignment_version: socket.assigns.assignment_version,
-        captured_at: captured_at,
-        results: results
-      }
-
-      submit_hole(socket, command)
-    else
-      {:error, :incomplete_results} ->
-        {:noreply, assign(socket, :feedback, "Complete every golfer's result before submitting.")}
-
-      _ ->
-        {:noreply, assign(socket, :feedback, "Refresh the scorecard before submitting.")}
-    end
+        "submit_queued_hole",
+        %{"command" => command},
+        %{assigns: %{lifecycle: lifecycle}} = socket
+      )
+      when lifecycle in [:scoring_active, :group_play_complete] do
+    handle_queued_command(command, socket)
   end
 
-  def handle_event("submit_hole", _params, socket) do
-    {:noreply, assign(socket, :feedback, "Scoring is unavailable for this group.")}
+  def handle_event("submit_queued_hole", _params, socket) do
+    {:reply, %{status: :rejected, reason: :scoring_unavailable}, socket}
+  end
+
+  @impl true
+  def handle_event(
+        "resolve_queued_hole",
+        %{"command" => command},
+        %{assigns: %{lifecycle: lifecycle}} = socket
+      )
+      when lifecycle in [:scoring_active, :group_play_complete] do
+    resolve_queued_receipt(command, socket)
+  end
+
+  def handle_event("resolve_queued_hole", _params, socket) do
+    {:reply, %{status: :rejected, reason: :scoring_unavailable}, socket}
   end
 
   @impl true
@@ -82,7 +110,15 @@ defmodule GolfScoringWeb.Scoring.GroupScorecardLive do
         player_name={@player_name}
         current_path={@current_path}
       >
-        <section id="group-scorecard" class="space-y-5">
+        <section
+          id="group-scorecard"
+          phx-hook={if @lifecycle in [:scoring_active, :group_play_complete], do: "ScoringQueue"}
+          data-scorecard-lifecycle={@lifecycle}
+          data-scoring-queue-projection={
+            if @lifecycle in [:scoring_active, :group_play_complete], do: @offline_projection
+          }
+          class="space-y-5"
+        >
           <section
             :if={@lifecycle == :unavailable}
             id="scorecard-unavailable"
@@ -107,9 +143,9 @@ defmodule GolfScoringWeb.Scoring.GroupScorecardLive do
               class="mt-4 grid grid-cols-[4.25rem_minmax(0,1fr)] gap-x-2 gap-y-1 text-xs leading-5 text-base-content/70"
             >
               <dt class="font-medium text-base-content">Event ID</dt>
-              <dd class="break-all font-mono">{@event_id}</dd>
+              <dd class="scorecard-id break-all"><code class="font-mono">{@event_id}</code></dd>
               <dt class="font-medium text-base-content">Round ID</dt>
-              <dd class="break-all font-mono">{@round_id}</dd>
+              <dd class="scorecard-id break-all"><code class="font-mono">{@round_id}</code></dd>
             </dl>
             <p id="course-context" class="mt-1 text-sm text-base-content/75">{@course_name}</p>
             <p id="group-identity" class="mt-1 text-sm text-base-content/75">
@@ -118,6 +154,22 @@ defmodule GolfScoringWeb.Scoring.GroupScorecardLive do
             <p class="mt-4 text-sm font-medium">18 holes complete</p>
             <p id="holes-remaining" class="mt-1 text-sm text-base-content/75">
               {@remaining_holes} remaining
+            </p>
+            <p
+              id="scoring-sync-status"
+              class="mt-4 text-sm font-medium text-base-content/75"
+              role="status"
+              aria-live="polite"
+            >
+              <span id="scoring-sync-label">Checking sync</span>
+              <span id="scoring-pending-count" class="ml-1" hidden>0 pending</span>
+            </p>
+            <p
+              id="scorecard-feedback"
+              class="mt-2 text-sm font-medium text-error"
+              role="status"
+              hidden
+            >
             </p>
           </section>
 
@@ -130,9 +182,9 @@ defmodule GolfScoringWeb.Scoring.GroupScorecardLive do
                     class="grid grid-cols-[4.25rem_minmax(0,1fr)] gap-x-2 gap-y-1 text-xs leading-5 text-base-content/70"
                   >
                     <dt class="font-medium text-base-content">Event ID</dt>
-                    <dd class="break-all font-mono">{@event_id}</dd>
+                    <dd class="scorecard-id break-all"><code class="font-mono">{@event_id}</code></dd>
                     <dt class="font-medium text-base-content">Round ID</dt>
-                    <dd class="break-all font-mono">{@round_id}</dd>
+                    <dd class="scorecard-id break-all"><code class="font-mono">{@round_id}</code></dd>
                   </dl>
                   <p id="course-context" class="mt-1 truncate text-sm font-medium">
                     {@course_name}
@@ -155,12 +207,15 @@ defmodule GolfScoringWeb.Scoring.GroupScorecardLive do
               <div class="mt-4 space-y-2">
                 <div class="flex flex-wrap items-center justify-between gap-x-3 gap-y-1 text-sm">
                   <span class="font-medium">{@entry_count} golfers</span>
-                  <span class="text-base-content/70">{@completed_holes} of 18 holes complete</span>
+                  <span id="completed-holes-label" class="text-base-content/70">
+                    {@completed_holes} of 18 holes complete
+                  </span>
                   <span id="holes-remaining" class="text-base-content/70">
                     {@remaining_holes} remaining
                   </span>
                 </div>
                 <progress
+                  id="holes-complete-progress"
                   class="block h-2 w-full accent-primary"
                   value={@completed_holes}
                   max="18"
@@ -177,7 +232,6 @@ defmodule GolfScoringWeb.Scoring.GroupScorecardLive do
               for={@scorecard_form}
               id="scorecard-entry-form"
               phx-change="update_results"
-              phx-submit="submit_hole"
               class="space-y-4"
             >
               <.input
@@ -204,6 +258,7 @@ defmodule GolfScoringWeb.Scoring.GroupScorecardLive do
               <article
                 :for={entry <- @entries}
                 id={"scorecard-player-#{entry.index}"}
+                data-scorecard-entry-id={entry.id}
                 class="rounded-2xl border border-base-300 bg-base-100 p-4 shadow-sm"
               >
                 <div class="flex items-start justify-between gap-3">
@@ -235,7 +290,7 @@ defmodule GolfScoringWeb.Scoring.GroupScorecardLive do
                   </div>
                   <div>
                     <dt class="text-xs text-base-content/65">Distance</dt>
-                    <dd class="mt-0.5 font-medium">
+                    <dd id={"scorecard-distance-#{entry.index}"} class="mt-0.5 font-medium">
                       <%= if entry.current_fact.distance_m do %>
                         {entry.current_fact.distance_m} m
                       <% else %>
@@ -253,7 +308,12 @@ defmodule GolfScoringWeb.Scoring.GroupScorecardLive do
                   </div>
                   <div class="col-span-2">
                     <dt class="text-xs text-base-content/65">Handicap strokes</dt>
-                    <dd class="mt-0.5 font-medium">{entry.handicap_strokes_label}</dd>
+                    <dd
+                      id={"scorecard-handicap-strokes-#{entry.index}"}
+                      class="mt-0.5 font-medium"
+                    >
+                      {entry.handicap_strokes_label}
+                    </dd>
                   </div>
                 </dl>
 
@@ -336,12 +396,21 @@ defmodule GolfScoringWeb.Scoring.GroupScorecardLive do
 
               <div class="mt-4 space-y-2">
                 <p
-                  :if={@feedback}
+                  id="scoring-sync-status"
+                  class="text-center text-sm font-medium text-base-content/75"
+                  role="status"
+                  aria-live="polite"
+                >
+                  <span id="scoring-sync-label">Checking sync</span>
+                  <span id="scoring-pending-count" class="ml-1" hidden>0 pending</span>
+                </p>
+                <p
                   id="scorecard-feedback"
                   class="text-center text-sm font-medium text-error"
                   role="status"
+                  hidden={is_nil(@feedback)}
                 >
-                  {@feedback}
+                  {@feedback || ""}
                 </p>
                 <button
                   type="submit"
@@ -359,70 +428,269 @@ defmodule GolfScoringWeb.Scoring.GroupScorecardLive do
     """
   end
 
-  defp submit_hole(socket, command) do
-    result =
-      Scoring.submit_group_hole(
-        socket.assigns.current_player_access_grant,
-        socket.assigns.event_id,
-        socket.assigns.round_id,
-        command
-      )
+  defp normalize_queued_command(command, socket) when is_map(command) do
+    allowed_keys = [
+      "client_submission_id",
+      "playing_group_id",
+      "round_hole_id",
+      "expected_group_score_revision",
+      "role_assignment_version",
+      "captured_at",
+      "results"
+    ]
 
-    handle_submission_result(socket, result)
+    with true <- Enum.all?(Map.keys(command), &(&1 in allowed_keys)),
+         {:ok, client_submission_id} <- Ecto.UUID.cast(command["client_submission_id"]),
+         {:ok, playing_group_id} <- Ecto.UUID.cast(command["playing_group_id"]),
+         true <- playing_group_id == socket.assigns.group_id,
+         {:ok, round_hole_id} <- Ecto.UUID.cast(command["round_hole_id"]),
+         {:ok, expected_group_score_revision} <-
+           parse_non_negative_integer(command["expected_group_score_revision"]),
+         {:ok, role_assignment_version} <-
+           parse_positive_integer(command["role_assignment_version"]),
+         {:ok, captured_at} <- parse_datetime(command["captured_at"]),
+         {:ok, results} <- normalize_queued_results(socket.assigns.entries, command["results"]) do
+      {:ok,
+       %{
+         client_submission_id: client_submission_id,
+         playing_group_id: playing_group_id,
+         round_hole_id: round_hole_id,
+         expected_group_score_revision: expected_group_score_revision,
+         role_assignment_version: role_assignment_version,
+         captured_at: captured_at,
+         results: results
+       }}
+    else
+      _ -> {:error, :invalid_input}
+    end
   end
 
-  defp handle_submission_result(socket, {:ok, receipt}) do
-    feedback =
-      if receipt.expected_group_score_revision < socket.assigns.group_revision do
-        "This scorecard has moved to a newer hole."
-      else
-        "Hole saved"
-      end
+  defp normalize_queued_command(_command, _socket), do: {:error, :invalid_input}
 
-    refresh_scorecard(socket, feedback)
+  defp handle_queued_command(command, socket) do
+    case normalize_queued_command(command, socket) do
+      {:ok, command} -> submit_if_replayable(command, socket)
+      {:error, reason} -> rejected_reply(socket, normalize_rejection_reason(reason))
+    end
   end
 
-  defp handle_submission_result(socket, {:error, reason}) do
-    handle_submission_error(socket, reason)
+  defp submit_if_replayable(command, socket) do
+    if replayable_command?(command, socket) do
+      submit_queued_command(command, socket)
+    else
+      rejected_reply(socket, :group_complete)
+    end
   end
 
-  defp handle_submission_error(socket, reason)
-       when reason in [:stale_role_assignment, :not_primary_scorer] do
-    {:noreply,
-     assign_unavailable(socket, :scorer_changed)
-     |> assign(:feedback, "The scorer assignment changed. This scorecard is no longer active.")}
+  defp rejected_reply(socket, reason) do
+    {:reply, %{status: :rejected, reason: reason}, socket}
   end
 
-  defp handle_submission_error(socket, reason)
-       when reason in [:stale_scoring_revision, :wrong_round_hole] do
-    refresh_scorecard(socket, "This scorecard has moved to a newer hole.")
+  defp replayable_command?(_command, %{assigns: %{lifecycle: :scoring_active}}), do: true
+
+  defp replayable_command?(command, %{assigns: %{lifecycle: :group_play_complete} = assigns}) do
+    route = assigns.scorecard_data.rotated_route
+
+    length(route) == 18 and
+      assigns.scorecard_data.revision == 18 and
+      command.expected_group_score_revision == 17 and
+      same_uuid?(command.round_hole_id, List.last(route).id)
   end
 
-  defp handle_submission_error(socket, :group_scoring_complete) do
-    refresh_scorecard(socket, "This group has completed all 18 holes.")
+  defp replayable_command?(_command, _socket), do: false
+
+  defp submit_queued_command(command, socket) do
+    case Scoring.submit_group_hole(
+           socket.assigns.current_player_access_grant,
+           socket.assigns.event_id,
+           socket.assigns.round_id,
+           command
+         ) do
+      {:ok, receipt} ->
+        reply = %{status: :accepted, receipt: project_receipt(receipt)}
+        {:reply, reply, refreshed_scorecard_socket(socket, "Hole saved")}
+
+      {:error, reason} ->
+        {:reply, %{status: :rejected, reason: normalize_rejection_reason(reason)}, socket}
+    end
   end
 
-  defp handle_submission_error(socket, {:invalid_round_state, _state}) do
-    {:noreply,
-     assign_unavailable(socket, :round_not_open)
-     |> assign(:feedback, "Scoring is unavailable while this round is not open.")}
+  defp resolve_queued_receipt(command, socket) do
+    case normalize_queued_command(command, socket) do
+      {:ok, command} ->
+        case Scoring.resolve_accepted_group_hole_receipt(
+               socket.assigns.current_player_access_grant,
+               socket.assigns.event_id,
+               socket.assigns.round_id,
+               command
+             ) do
+          {:ok, receipt} ->
+            {:reply, %{status: :resolved, receipt: project_receipt(receipt)}, socket}
+
+          {:error, reason} ->
+            rejected_reply(socket, normalize_resolution_rejection_reason(reason))
+        end
+
+      {:error, reason} ->
+        rejected_reply(socket, normalize_resolution_rejection_reason(reason))
+    end
   end
 
-  defp handle_submission_error(socket, :pickup_not_eligible) do
-    {:noreply,
-     assign(socket, :feedback, "Pickup is available only when no Stableford point remains.")}
+  defp same_uuid?(left, right) when is_binary(left) and is_binary(right) do
+    String.downcase(left) == String.downcase(right)
   end
 
-  defp handle_submission_error(socket, :strokes_taken_required) do
-    {:noreply, assign(socket, :feedback, "Enter strokes taken before selecting a pickup.")}
+  defp same_uuid?(_left, _right), do: false
+
+  defp normalize_queued_results(entries, values)
+       when is_list(values) and length(values) in 2..4 do
+    entries_by_id = Map.new(entries, &{String.downcase(&1.id), &1})
+
+    with {:ok, results} <-
+           Enum.reduce_while(
+             values,
+             {:ok, %{}},
+             &collect_queued_result(&1, &2, entries_by_id)
+           ),
+         true <- MapSet.new(Map.keys(results)) == MapSet.new(Map.keys(entries_by_id)) do
+      {:ok, Enum.map(entries, &Map.fetch!(results, String.downcase(&1.id)))}
+    else
+      _ -> {:error, :incomplete_results}
+    end
   end
 
-  defp handle_submission_error(socket, _reason) do
-    {:noreply,
-     assign(socket, :feedback, "This hole could not be saved. Check every golfer's result.")}
+  defp normalize_queued_results(_entries, _values), do: {:error, :incomplete_results}
+
+  defp collect_queued_result(value, {:ok, results_by_id}, entries_by_id) do
+    case normalize_queued_result(value, entries_by_id) do
+      {:ok, entry_id, result} when not is_map_key(results_by_id, entry_id) ->
+        {:cont, {:ok, Map.put(results_by_id, entry_id, result)}}
+
+      _ ->
+        {:halt, {:error, :incomplete_results}}
+    end
   end
 
-  defp refresh_scorecard(socket, feedback) do
+  defp normalize_queued_result(value, entries_by_id) when is_map(value) do
+    allowed_keys = ["round_entry_id", "outcome", "gross_strokes", "strokes_taken"]
+
+    with true <- Enum.all?(Map.keys(value), &(&1 in allowed_keys)),
+         {:ok, entry_id} <- Ecto.UUID.cast(value["round_entry_id"]),
+         normalized_id = String.downcase(entry_id),
+         %{} = entry <- Map.get(entries_by_id, normalized_id),
+         {:ok, result} <- normalize_result(entry, value) do
+      {:ok, normalized_id, result}
+    else
+      _ -> {:error, :incomplete_results}
+    end
+  end
+
+  defp normalize_queued_result(_value, _entries_by_id), do: {:error, :incomplete_results}
+
+  defp project_receipt(receipt) do
+    %{
+      id: receipt.id,
+      client_submission_id: receipt.client_submission_id,
+      round_id: receipt.round_id,
+      playing_group_id: receipt.playing_group_id,
+      round_hole_id: receipt.round_hole_id,
+      expected_group_score_revision: receipt.expected_group_score_revision,
+      group_role_assignment_id: receipt.group_role_assignment_id,
+      role_assignment_version: receipt.role_assignment_version,
+      submitted_by_round_entry_id: receipt.submitted_by_round_entry_id,
+      captured_at: DateTime.to_iso8601(receipt.captured_at),
+      payload_fingerprint: Base.encode16(receipt.payload_fingerprint, case: :lower),
+      submitted_payload: project_submitted_payload(receipt.submitted_payload),
+      source: receipt.source
+    }
+  end
+
+  defp project_submitted_payload(payload) do
+    actor = payload_field(payload, :actor)
+
+    %{
+      playing_group_id: payload_field(payload, :playing_group_id),
+      round_hole_id: payload_field(payload, :round_hole_id),
+      expected_group_score_revision: payload_field(payload, :expected_group_score_revision),
+      role_assignment_version: payload_field(payload, :role_assignment_version),
+      captured_at: payload_field(payload, :captured_at),
+      actor: %{
+        type: payload_field(actor, :type),
+        round_entry_id: payload_field(actor, :round_entry_id),
+        role_assignment_version: payload_field(actor, :role_assignment_version)
+      },
+      results:
+        payload
+        |> payload_field(:results)
+        |> Enum.map(fn result ->
+          %{
+            round_entry_id: payload_field(result, :round_entry_id),
+            outcome: payload_field(result, :outcome),
+            gross_strokes: payload_field(result, :gross_strokes),
+            strokes_taken: payload_field(result, :strokes_taken)
+          }
+        end)
+    }
+  end
+
+  defp payload_field(value, key) when is_map(value) do
+    Map.get(value, key, Map.get(value, Atom.to_string(key)))
+  end
+
+  defp payload_field(_value, _key), do: nil
+
+  defp normalize_rejection_reason(reason)
+       when reason in [:stale_role_assignment, :not_primary_scorer, :not_assigned],
+       do: :stale_authority
+
+  defp normalize_rejection_reason(:stale_scoring_revision), do: :stale_group_revision
+  defp normalize_rejection_reason(:wrong_round_hole), do: :wrong_hole
+  defp normalize_rejection_reason(:group_scoring_complete), do: :group_complete
+
+  defp normalize_rejection_reason({:invalid_group_state, state})
+       when state in [:finished_playing, "finished_playing"], do: :group_complete
+
+  defp normalize_rejection_reason({:invalid_round_state, _state}), do: :round_closed
+  defp normalize_rejection_reason(_reason), do: :invalid_submission
+
+  defp normalize_resolution_rejection_reason(:accepted_receipt_not_found),
+    do: :receipt_not_found
+
+  defp normalize_resolution_rejection_reason(:idempotency_payload_conflict),
+    do: :payload_mismatch
+
+  defp normalize_resolution_rejection_reason(:idempotency_scope_mismatch),
+    do: :receipt_mismatch
+
+  defp normalize_resolution_rejection_reason(reason)
+       when reason in [
+              :stale_role_assignment,
+              :not_primary_scorer,
+              :not_assigned,
+              :idempotency_actor_mismatch,
+              :idempotency_assignment_mismatch
+            ],
+       do: :stale_authority
+
+  defp normalize_resolution_rejection_reason(reason), do: normalize_rejection_reason(reason)
+
+  defp parse_non_negative_integer(value) do
+    with {:ok, parsed} <- parse_integer(value), true <- parsed >= 0 do
+      {:ok, parsed}
+    else
+      _ -> {:error, :invalid_integer}
+    end
+  end
+
+  defp parse_positive_integer(value) do
+    with {:ok, parsed} <- parse_integer(value), true <- parsed > 0 do
+      {:ok, parsed}
+    else
+      _ -> {:error, :invalid_integer}
+    end
+  end
+
+  defp refreshed_scorecard_socket(socket, feedback) do
     case Scoring.load_group_scorecard(
            socket.assigns.current_player_access_grant,
            socket.assigns.event_id,
@@ -430,10 +698,10 @@ defmodule GolfScoringWeb.Scoring.GroupScorecardLive do
            socket.assigns.group_id
          ) do
       {:ok, data} ->
-        {:noreply, assign_scorecard(socket, data) |> assign(:feedback, feedback)}
+        assign_scorecard(socket, data) |> assign(:feedback, feedback)
 
       {:error, reason} ->
-        {:noreply, assign_unavailable(socket, reason) |> assign(:feedback, feedback)}
+        assign_unavailable(socket, reason) |> assign(:feedback, feedback)
     end
   end
 
@@ -467,6 +735,7 @@ defmodule GolfScoringWeb.Scoring.GroupScorecardLive do
     |> assign(:remaining_holes, data.remaining_holes)
     |> assign(:unavailable_message, nil)
     |> assign(:scorecard_data, data)
+    |> assign(:offline_projection, Jason.encode!(offline_projection(data)))
     |> assign(:entries, Scoring.preview_group_scorecard(data, result_values))
     |> assign(:entry_count, data.entry_count)
     |> assign(:current_hole, data.current_hole)
@@ -478,6 +747,48 @@ defmodule GolfScoringWeb.Scoring.GroupScorecardLive do
     |> assign(:client_submission_id, Ecto.UUID.generate())
     |> assign(:captured_at, DateTime.utc_now() |> DateTime.to_iso8601())
     |> assign(:feedback, nil)
+  end
+
+  defp offline_projection(data) do
+    blank_results = default_result_values(data.players)
+
+    route =
+      Enum.map(data.rotated_route, fn hole ->
+        players =
+          Scoring.preview_group_scorecard(%{data | current_hole: hole}, blank_results)
+          |> Enum.map(fn player ->
+            %{
+              round_entry_id: player.id,
+              par: player.current_fact.par,
+              stroke_index: player.current_fact.stroke_index,
+              distance_m: player.current_fact.distance_m,
+              handicap_strokes_label: player.handicap_strokes_label
+            }
+          end)
+
+        %{
+          id: hole.id,
+          display_hole_number: hole.display_hole_number,
+          players: players
+        }
+      end)
+
+    %{
+      scope: %{
+        event_id: data.event_id,
+        round_id: data.round_id,
+        playing_group_id: data.group_id,
+        scorer: %{type: "player", round_entry_id: data.scorer_round_entry_id}
+      },
+      assignment: %{
+        id: data.primary_scorer_assignment_id,
+        round_entry_id: data.scorer_round_entry_id,
+        assignment_version: data.assignment_version
+      },
+      active_round_entry_ids: Enum.map(data.players, & &1.id),
+      revision: data.revision,
+      route: route
+    }
   end
 
   defp assign_unavailable(socket, reason) do
@@ -515,21 +826,6 @@ defmodule GolfScoringWeb.Scoring.GroupScorecardLive do
     Map.new(players, fn player ->
       {player.id, %{"outcome" => "", "gross_strokes" => "", "strokes_taken" => ""}}
     end)
-  end
-
-  defp normalize_results(entries, values) do
-    Enum.reduce_while(entries, {:ok, []}, fn entry, {:ok, acc} ->
-      result_value = Map.get(values, entry.id, %{})
-
-      case normalize_result(entry, result_value) do
-        {:ok, result} -> {:cont, {:ok, [result | acc]}}
-        {:error, reason} -> {:halt, {:error, reason}}
-      end
-    end)
-    |> case do
-      {:ok, results} -> {:ok, Enum.reverse(results)}
-      error -> error
-    end
   end
 
   defp normalize_result(entry, %{"outcome" => "holed_out"} = values) do

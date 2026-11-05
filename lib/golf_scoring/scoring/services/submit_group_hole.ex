@@ -187,6 +187,65 @@ defmodule GolfScoring.Scoring.Services.SubmitGroupHole do
   def run(_actor, _event_id, _round_id, _command), do: {:error, :invalid_input}
 
   @doc false
+  @spec resolve_accepted_receipt(term(), Ecto.UUID.t(), Ecto.UUID.t(), command()) ::
+          {:ok, HoleSubmission.t()} | {:error, term()}
+  def resolve_accepted_receipt(actor, event_id, round_id, command) when is_map(command) do
+    case normalize_command(command) do
+      {:ok, cmd} -> resolve_normalized_receipt(actor, event_id, round_id, cmd)
+      {:error, _reason} = error -> error
+    end
+  end
+
+  def resolve_accepted_receipt(_actor, _event_id, _round_id, _command),
+    do: {:error, :invalid_input}
+
+  defp normalize_receipt_resolution({:ok, %HoleSubmission{} = receipt}), do: {:ok, receipt}
+  defp normalize_receipt_resolution({:error, reason}), do: {:error, reason}
+  defp normalize_receipt_resolution({:error, :rollback, reason}), do: {:error, reason}
+
+  defp resolve_normalized_receipt(actor, event_id, round_id, cmd) do
+    Repo.transaction(fn -> resolve_receipt_in_transaction(actor, event_id, round_id, cmd) end)
+    |> normalize_receipt_resolution()
+  end
+
+  defp resolve_receipt_in_transaction(actor, event_id, round_id, cmd) do
+    with {:ok, actor_ctx} <- resolve_receipt_actor(actor, event_id),
+         :ok <- validate_command_shape(actor_ctx, cmd),
+         {:ok, locked} <- lock_gameplay_scope(round_id, cmd.playing_group_id),
+         {:ok, actor_ctx} <- finalize_actor_context(actor_ctx, cmd, locked),
+         :ok <- validate_round(locked.round, event_id),
+         {:ok, %HoleSubmission{} = receipt} <- resolve_idempotency(cmd, actor_ctx, round_id),
+         :ok <- receipt_assignment_matches(receipt, actor_ctx) do
+      receipt
+    else
+      {:ok, :continue} -> Repo.rollback(:accepted_receipt_not_found)
+      {:error, reason} -> Repo.rollback(reason)
+    end
+  end
+
+  defp resolve_receipt_actor(%PlayerAccessGrant{} = grant, event_id) do
+    with {:ok, locked_grant} <- lock_grant(grant.id),
+         :ok <- grant_event_matches(locked_grant, event_id),
+         :ok <- grant_usable(locked_grant) do
+      {:ok, %{kind: :player, grant: locked_grant}}
+    end
+  end
+
+  defp resolve_receipt_actor(_actor, _event_id), do: {:error, :invalid_actor}
+
+  defp receipt_assignment_matches(
+         %HoleSubmission{
+           group_role_assignment_id: assignment_id,
+           role_assignment_version: version
+         },
+         %{kind: :player, assignment_id: assignment_id, role_assignment_version: version}
+       ),
+       do: :ok
+
+  defp receipt_assignment_matches(_receipt, _actor_ctx),
+    do: {:error, :idempotency_assignment_mismatch}
+
+  @doc false
   @spec run_paper_recovery(term(), Ecto.UUID.t(), Ecto.UUID.t(), command(), term()) ::
           {:ok, HoleSubmission.t()} | {:error, term()}
   def run_paper_recovery(actor, event_id, round_id, command, reason) when is_map(command) do

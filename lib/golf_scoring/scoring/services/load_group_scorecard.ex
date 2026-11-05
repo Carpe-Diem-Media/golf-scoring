@@ -20,7 +20,11 @@ defmodule GolfScoring.Scoring.Services.LoadGroupScorecard do
           required(:round_id) => Ecto.UUID.t(),
           required(:group_id) => Ecto.UUID.t(),
           required(:revision) => non_neg_integer(),
+          required(:primary_scorer_assignment_id) => Ecto.UUID.t(),
+          required(:scorer_round_entry_id) => Ecto.UUID.t(),
           required(:players) => [map()],
+          required(:rotated_route) => [map()],
+          required(:current_hole) => map() | nil,
           required(:lifecycle) => :scoring_active | :group_play_complete
         }
 
@@ -142,6 +146,7 @@ defmodule GolfScoring.Scoring.Services.LoadGroupScorecard do
                pg.starting_position::int,
                assignment.id::text,
                assignment.assignment_version::int,
+               scorer_entry.id::text,
                scorer_entry.player_id::text,
                concat_ws(' ', scorer.first_name, scorer.surname),
                competition.pickup_policy_identifier,
@@ -240,6 +245,7 @@ defmodule GolfScoring.Scoring.Services.LoadGroupScorecard do
          starting_position,
          assignment_id,
          assignment_version,
+         scorer_round_entry_id,
          scorer_player_id,
          scorer_name,
          pickup_policy,
@@ -278,6 +284,7 @@ defmodule GolfScoring.Scoring.Services.LoadGroupScorecard do
       starting_position: starting_position,
       assignment_id: cast_uuid(assignment_id),
       assignment_version: assignment_version,
+      scorer_round_entry_id: cast_uuid(scorer_round_entry_id),
       scorer_player_id: cast_uuid(scorer_player_id),
       scorer_name: scorer_name,
       pickup_policy: pickup_policy,
@@ -347,10 +354,16 @@ defmodule GolfScoring.Scoring.Services.LoadGroupScorecard do
   end
 
   defp require_primary_scorer(
-         %{assignment_id: assignment_id, scorer_player_id: player_id},
+         %{
+           assignment_id: assignment_id,
+           assignment_version: assignment_version,
+           scorer_round_entry_id: round_entry_id,
+           scorer_player_id: player_id
+         },
          player_id
        )
-       when not is_nil(assignment_id) and not is_nil(player_id),
+       when not is_nil(assignment_id) and is_integer(assignment_version) and
+              assignment_version > 0 and not is_nil(round_entry_id) and not is_nil(player_id),
        do: :ok
 
   defp require_primary_scorer(_, _), do: {:error, :not_primary_scorer}
@@ -486,6 +499,8 @@ defmodule GolfScoring.Scoring.Services.LoadGroupScorecard do
            round_id: ids.round_id,
            group_id: ids.group_id,
            revision: context.revision,
+           primary_scorer_assignment_id: context.assignment_id,
+           scorer_round_entry_id: context.scorer_round_entry_id,
            assignment_version: context.assignment_version,
            scorer_name: context.scorer_name,
            pickup_policy: context.pickup_policy,

@@ -4,6 +4,7 @@ defmodule GolfScoring.Scoring.Services.LoadGroupScorecardTest do
   alias GolfScoring.Accounts
   alias GolfScoring.Competition
   alias GolfScoring.Competition.Services.AssignPlayingGroupStart
+  alias GolfScoring.Repo
   alias GolfScoring.Scoring
   alias GolfScoring.Scoring.Services.PaperRecoveryFixtures
 
@@ -31,6 +32,36 @@ defmodule GolfScoring.Scoring.Services.LoadGroupScorecardTest do
              player.hole_facts[scorecard.current_hole.id].par == 4 and
                is_integer(player.strokes_by_hole[scorecard.current_hole.id])
            end)
+  end
+
+  test "exposes the active scorer assignment and round entry to its authorized scorecard" do
+    setup = PaperRecoveryFixtures.setup_submit_fixture!(2)
+    scorer_entry = hd(setup.entries)
+    grant = issue_grant!(setup, scorer_entry)
+
+    assert {:ok, scorecard} =
+             Scoring.load_group_scorecard(grant, setup.event.id, setup.round.id, setup.group.id)
+
+    assert [[assignment_id, assignment_version, round_entry_id]] =
+             Repo.query!(
+               """
+               SELECT assignment.id::text, assignment.assignment_version::int,
+                      scorer_entry.id::text
+               FROM group_role_assignments assignment
+               JOIN round_entries scorer_entry ON scorer_entry.id = assignment.round_entry_id
+               WHERE assignment.playing_group_id = $1::uuid
+                 AND assignment.role = 'primary_scorer'
+                 AND assignment.state = 'active'
+               """,
+               [Ecto.UUID.dump!(setup.group.id)]
+             ).rows
+
+    assert scorecard.primary_scorer_assignment_id == Ecto.UUID.cast!(assignment_id)
+    assert scorecard.scorer_round_entry_id == Ecto.UUID.cast!(round_entry_id)
+    assert scorecard.scorer_round_entry_id == scorer_entry.id
+    assert scorecard.assignment_version == assignment_version
+    refute Map.has_key?(scorecard, :grant_id)
+    refute Map.has_key?(scorecard, :grant_token)
   end
 
   test "rejects a scorecard route from another event" do

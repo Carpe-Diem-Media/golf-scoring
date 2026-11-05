@@ -18,11 +18,13 @@ defmodule GolfScoring.CIWorkflowTest do
     "mix deps.unlock --check-unused",
     "mix hex.audit",
     "mix sobelow --exit --strict --format github --private",
+    "npm ci",
+    "npx playwright install --with-deps chromium",
+    "mix assets.setup",
+    "mix assets.build",
     "mix test --cover",
     "mix dialyzer --plt",
     "mix dialyzer --format github --format dialyxir",
-    "npm ci",
-    "npx playwright install --with-deps chromium",
     "npm run test:browser"
   ]
 
@@ -116,5 +118,22 @@ defmodule GolfScoring.CIWorkflowTest do
     assert browser_job =~ "run: npm ci"
     assert browser_job =~ "run: npx playwright install --with-deps chromium"
     assert browser_job =~ "run: npm run test:browser"
+  end
+
+  test "ExUnit CI builds assets and installs Chromium for authenticated Phoenix coverage" do
+    test_job =
+      @workflow_path
+      |> File.read!()
+      |> String.split("  test:\n", parts: 2)
+      |> List.last()
+      |> String.split("  dialyzer:\n", parts: 2)
+      |> hd()
+
+    assert test_job =~ "name: Set up Node.js for the authenticated browser integration"
+    assert test_job =~ "run: npm ci"
+    assert test_job =~ "run: npx playwright install --with-deps chromium"
+    assert test_job =~ "run: mix assets.setup"
+    assert test_job =~ "mix assets.build"
+    assert test_job =~ "run: mix test --cover"
   end
 end

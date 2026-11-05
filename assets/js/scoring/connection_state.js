@@ -287,18 +287,33 @@ export function createConnectionState(options) {
 
     if (!validRecoveryAuthorization(authorization, scopeKey, stopped, record)) return state;
 
-    let cleared;
-    try {
-      cleared = await clearReplayMarkersForRecovery(
-        scopeKey,
-        markers.conflict_stop,
-        markers.replay_intent,
-        databaseOptions,
-      );
-    } catch (_error) {
-      return state;
+    if (Object.hasOwn(authorization, "receipt")) {
+      if (!markers.replay_intent || markers.conflict_stop) return state;
+
+      let acknowledged;
+      try {
+        acknowledged = await acknowledgeSubmission(record, authorization.receipt, {
+          ...databaseOptions,
+          replayIntent: markers.replay_intent,
+        });
+      } catch (_error) {
+        return state;
+      }
+      if (!acknowledged) return state;
+    } else {
+      let cleared;
+      try {
+        cleared = await clearReplayMarkersForRecovery(
+          scopeKey,
+          markers.conflict_stop,
+          markers.replay_intent,
+          databaseOptions,
+        );
+      } catch (_error) {
+        return state;
+      }
+      if (!cleared) return state;
     }
-    if (!cleared) return state;
 
     conflict = undefined;
     state = CONNECTION_STATES.recovery;
