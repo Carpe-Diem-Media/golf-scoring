@@ -6,8 +6,9 @@ const groupId = "33333333-3333-4333-8333-333333333333";
 const scorerId = "44444444-4444-4444-8444-444444444444";
 const assignmentId = "55555555-5555-4555-8555-555555555555";
 const secondPlayerId = "66666666-6666-4666-8666-666666666666";
+const secondAssignmentId = "99999999-9999-4999-8999-999999999999";
 
-function submission(index, capturedAt) {
+function submission(index, capturedAt, { scorerId: selectedScorerId = scorerId, assignmentId: selectedAssignmentId = assignmentId } = {}) {
   const suffix = String(index).padStart(12, "0");
 
   return {
@@ -15,11 +16,11 @@ function submission(index, capturedAt) {
       event_id: eventId,
       round_id: roundId,
       playing_group_id: groupId,
-      scorer: { type: "player", round_entry_id: scorerId },
+      scorer: { type: "player", round_entry_id: selectedScorerId },
     },
     assignment: {
-      id: assignmentId,
-      round_entry_id: scorerId,
+      id: selectedAssignmentId,
+      round_entry_id: selectedScorerId,
       assignment_version: 3,
     },
     active_round_entry_ids: [scorerId, secondPlayerId],
@@ -52,6 +53,51 @@ async function enqueueInBrowser(page, commands) {
   }, commands);
 }
 
+async function sequenceRecordInBrowser(page, scope) {
+  return page.evaluate(async (scoringScope) => {
+    const { scopeKeyFor } = await import("/scoring/submission_serializer.js");
+    const { openScoringDatabase, SCORING_STORE_NAMES } = await import("/scoring/indexed_db.js");
+    const db = await openScoringDatabase();
+    try {
+      const transaction = db.transaction(SCORING_STORE_NAMES.sequences, "readonly");
+      const request = transaction.objectStore(SCORING_STORE_NAMES.sequences).get(scopeKeyFor(scoringScope));
+      let result;
+      request.onsuccess = () => { result = request.result; };
+      await new Promise((resolve, reject) => {
+        transaction.oncomplete = resolve;
+        transaction.onabort = () => reject(transaction.error);
+        transaction.onerror = () => reject(transaction.error);
+      });
+      return result || null;
+    } finally {
+      db.close();
+    }
+  }, scope);
+}
+
+async function updateSequenceRecordInBrowser(page, scope, changes) {
+  return page.evaluate(async ({ scoringScope, changes }) => {
+    const { scopeKeyFor } = await import("/scoring/submission_serializer.js");
+    const { openScoringDatabase, SCORING_STORE_NAMES } = await import("/scoring/indexed_db.js");
+    const db = await openScoringDatabase();
+    try {
+      const transaction = db.transaction(SCORING_STORE_NAMES.sequences, "readwrite");
+      const store = transaction.objectStore(SCORING_STORE_NAMES.sequences);
+      const request = store.get(scopeKeyFor(scoringScope));
+      request.onsuccess = () => {
+        if (request.result) store.put({ ...request.result, ...changes });
+      };
+      await new Promise((resolve, reject) => {
+        transaction.oncomplete = resolve;
+        transaction.onabort = () => reject(transaction.error);
+        transaction.onerror = () => reject(transaction.error);
+      });
+    } finally {
+      db.close();
+    }
+  }, { scoringScope: scope, changes });
+}
+
 async function replayInBrowser(page, scopeOrCommands, options = {}) {
   const scope = Array.isArray(scopeOrCommands) ? scopeOrCommands[0].scope : scopeOrCommands;
   return page.evaluate(async ({ scope, options }) => {
@@ -75,6 +121,21 @@ async function replayInBrowser(page, scopeOrCommands, options = {}) {
           const plan = options.responses?.[context.sequence]?.[attempt - 1];
           if (plan?.status === "throw") throw new Error(plan.message || "transport timed out");
           if (plan?.status === "rejected") {
+            return { status: "rejected", reason: plan.reason };
+          }
+          if (plan?.status === "invalidate-sequence-before-rejection") {
+            const { openScoringDatabase, SCORING_STORE_NAMES } = await import("/scoring/indexed_db.js");
+            const db = await openScoringDatabase();
+            const transaction = db.transaction(SCORING_STORE_NAMES.sequences, "readwrite");
+            const store = transaction.objectStore(SCORING_STORE_NAMES.sequences);
+            const request = store.get(context.scope_key);
+            request.onsuccess = () => store.put({ ...request.result, last_sequence: "unavailable" });
+            await new Promise((resolve, reject) => {
+              transaction.oncomplete = resolve;
+              transaction.onabort = () => reject(transaction.error);
+              transaction.onerror = () => reject(transaction.error);
+            });
+            db.close();
             return { status: "rejected", reason: plan.reason };
           }
 
@@ -136,6 +197,47 @@ async function replayInBrowser(page, scopeOrCommands, options = {}) {
   }, { scope, options });
 }
 
+async function recoverAfterIntentInBrowser(page, scope) {
+  return page.evaluate(async (scoringScope) => {
+    const { createConnectionState } = await import("/scoring/connection_state.js");
+    const { recoverPending } = await import("/scoring/queue.js");
+    const calls = [];
+    const controller = createConnectionState({
+      scope: scoringScope,
+      isOnline: () => true,
+      transport: async (command, context) => {
+        calls.push(command.client_submission_id);
+        return {
+          status: "accepted",
+          receipt: window.__scoringTestReceipt(command, context),
+        };
+      },
+    });
+    const before = await controller.refresh();
+    const automatic = await controller.replay();
+    const withoutAuthorization = await controller.recover();
+    const afterAuthorization = await controller.recover({
+      authorize: async ({ scope_key, conflict, assignment }) => ({
+        status: "authorized",
+        scope_key,
+        submission_id: conflict.submission_id,
+        assignment_id: assignment.id,
+        assignment_version: assignment.assignment_version,
+      }),
+    });
+    const replayed = await controller.replay();
+    return {
+      before,
+      automatic,
+      withoutAuthorization,
+      afterAuthorization,
+      replayed,
+      calls,
+      pending: await recoverPending(scoringScope),
+    };
+  }, scope);
+}
+
 test.beforeEach(async ({ page, context }) => {
   await context.addInitScript(() => {
     window.__scoringTestReceipt = (command, context) => ({
@@ -179,6 +281,7 @@ test("replays commands in stored sequence and reaches caught up after valid rece
   await enqueueInBrowser(page, commands);
 
   const result = await replayInBrowser(page, commands);
+  const sequenceRecord = await sequenceRecordInBrowser(page, commands[0].scope);
 
   expect(result.moduleError).toBeUndefined();
   expect(result.state).toBe("CAUGHT_UP");
@@ -195,6 +298,23 @@ test("replays commands in stored sequence and reaches caught up after valid rece
     },
   ]);
   expect(result.pending).toEqual([]);
+  expect(sequenceRecord.replay_intent).toBeUndefined();
+});
+
+test("valid acknowledgement removes only its matching command", async ({ page }) => {
+  const commands = [
+    submission(1, "2026-11-05T12:00:00.000Z"),
+    submission(2, "2026-11-04T12:00:00.000Z"),
+  ];
+  await enqueueInBrowser(page, commands);
+
+  const result = await replayInBrowser(page, commands, {
+    responses: { 2: [{ status: "throw" }] },
+  });
+
+  expect(result.state).toBe("PENDING");
+  expect(result.calls.map(({ sequence }) => sequence)).toEqual([1, 2]);
+  expect(result.pending).toEqual([{ sequence: 2, command: commands[1].command }]);
 });
 
 test("moves offline capture to pending only after the whole-hole command is stored", async ({ page }) => {
@@ -243,6 +363,35 @@ test("retries an uncertain submission with the original retry key and payload", 
   expect(result.calls[0].command.client_submission_id).toBe(
     result.calls[1].command.client_submission_id,
   );
+});
+
+test("blocks an unresolved replay intent after a browser restart", async ({ page }) => {
+  const command = submission(1, "2026-11-05T12:00:00.000Z");
+  await enqueueInBrowser(page, [command]);
+
+  const interrupted = await replayInBrowser(page, command.scope, {
+    responses: { 1: [{ status: "throw" }] },
+  });
+  await page.reload();
+  const recovered = await replayInBrowser(page, command.scope);
+
+  expect(interrupted.state).toBe("PENDING");
+  expect(interrupted.calls).toHaveLength(1);
+  expect(recovered.state).toBe("CONFLICT_STOP");
+  expect(recovered.calls).toEqual([]);
+  expect(recovered.pending).toEqual([{ sequence: 1, command: command.command }]);
+});
+
+test("does not transmit when the pre-send replay intent cannot be persisted", async ({ page }) => {
+  const command = submission(1, "2026-11-05T12:00:00.000Z");
+  await enqueueInBrowser(page, [command]);
+  await updateSequenceRecordInBrowser(page, command.scope, { last_sequence: "unavailable" });
+
+  const result = await replayInBrowser(page, command.scope);
+
+  expect(result.state).toBe("PENDING");
+  expect(result.calls).toEqual([]);
+  expect(result.pending).toEqual([{ sequence: 1, command: command.command }]);
 });
 
 test("keeps a command pending when the transport returns a malformed receipt", async ({ page }) => {
@@ -387,6 +536,33 @@ test("does not automatically replay a conflict after browser recovery", async ({
   expect(recovered.pending).toEqual([{ sequence: 1, command: command.command }]);
 });
 
+test("retains the durable intent when conflict persistence fails, then requires authorization after storage recovery", async ({ page }) => {
+  const command = submission(1, "2026-11-05T12:00:00.000Z");
+  await enqueueInBrowser(page, [command]);
+
+  const rejected = await replayInBrowser(page, command.scope, {
+    responses: { 1: [{ status: "invalidate-sequence-before-rejection", reason: "stale_role_assignment" }] },
+  });
+  const failedStorage = await sequenceRecordInBrowser(page, command.scope);
+  await updateSequenceRecordInBrowser(page, command.scope, { last_sequence: 1 });
+  await page.reload();
+  const recovered = await recoverAfterIntentInBrowser(page, command.scope);
+
+  expect(rejected.state).toBe("CONFLICT_STOP");
+  expect(failedStorage.conflict_stop).toBeUndefined();
+  expect(failedStorage.replay_intent).toMatchObject({
+    submission_id: command.command.client_submission_id,
+    sequence: 1,
+  });
+  expect(recovered.before).toBe("CONFLICT_STOP");
+  expect(recovered.automatic).toBe("CONFLICT_STOP");
+  expect(recovered.withoutAuthorization).toBe("CONFLICT_STOP");
+  expect(recovered.afterAuthorization).toBe("RECOVERY");
+  expect(recovered.replayed).toBe("CAUGHT_UP");
+  expect(recovered.calls).toEqual([command.command.client_submission_id]);
+  expect(recovered.pending).toEqual([]);
+});
+
 test("keeps the conflict stop when a later command is queued before browser recovery", async ({ page }) => {
   const commands = [
     submission(1, "2026-11-05T12:00:00.000Z"),
@@ -470,9 +646,13 @@ test("requires explicit renewed authorization before leaving conflict stop", asy
   expect(result.pending).toEqual([]);
 });
 
-test("serializes competing tabs so only the lock holder can submit", async ({ page, context }) => {
-  const command = submission(1, "2026-11-05T12:00:00.000Z");
-  await enqueueInBrowser(page, [command]);
+test("serializes different scorers replaying the same group across tabs", async ({ page, context }) => {
+  const firstCommand = submission(1, "2026-11-05T12:00:00.000Z");
+  const secondCommand = submission(2, "2026-11-04T12:00:00.000Z", {
+    scorerId: secondPlayerId,
+    assignmentId: secondAssignmentId,
+  });
+  await enqueueInBrowser(page, [firstCommand]);
   await page.evaluate(async (scope) => {
     const { createConnectionState } = await import("/scoring/connection_state.js");
     let resolveStarted;
@@ -501,11 +681,12 @@ test("serializes competing tabs so only the lock holder can submit", async ({ pa
     window.__heldController = controller;
     window.__heldReplay = controller.replay();
     await started;
-  }, command.scope);
+  }, firstCommand.scope);
 
   const secondPage = await context.newPage();
   await secondPage.goto("/");
-  const secondTab = await replayInBrowser(secondPage, command.scope);
+  await enqueueInBrowser(secondPage, [secondCommand]);
+  const secondTab = await replayInBrowser(secondPage, secondCommand.scope);
   const heldState = await page.evaluate(() => ({
     state: window.__heldController.state,
     calls: window.__heldCalls,
@@ -515,10 +696,11 @@ test("serializes competing tabs so only the lock holder can submit", async ({ pa
 
   expect(heldState.state).toBe("REPLAYING");
   expect(heldState.calls).toEqual([{
-    submissionId: command.command.client_submission_id,
+    submissionId: firstCommand.command.client_submission_id,
     sequence: 1,
   }]);
   expect(secondTab.state).toBe("PENDING");
   expect(secondTab.calls).toEqual([]);
+  expect(secondTab.pending).toEqual([{ sequence: 1, command: secondCommand.command }]);
   expect(firstTabState).toBe("CAUGHT_UP");
 });

@@ -1,11 +1,14 @@
 import {
   acknowledgeSubmission,
-  clearConflictStop,
   enqueueSubmission,
   persistConflictStop,
-  readConflictStop,
   recoverPending,
 } from "./queue.js";
+import {
+  clearReplayMarkersForRecovery,
+  persistReplayIntent,
+  readReplayMarkers,
+} from "./indexed_db.js";
 import { scopeKeyFor } from "./submission_serializer.js";
 
 export const CONNECTION_STATES = Object.freeze({
@@ -30,11 +33,12 @@ export function createConnectionState(options) {
   const scope = options.scope;
   const scopeKey = scopeKeyFor(scope);
   const databaseOptions = options.databaseOptions || {};
+  const replaySessionId = globalThis.crypto?.randomUUID?.() || null;
   const isOnline = options.isOnline || (() => globalThis.navigator?.onLine !== false);
   const lockManager = Object.hasOwn(options, "lockManager")
     ? options.lockManager
     : globalThis.navigator?.locks;
-  const lockName = `golf-scoring-replay:${scopeKey}`;
+  const lockName = replayLockName(scope);
   let state = CONNECTION_STATES.offline;
   let conflict;
 
@@ -55,9 +59,14 @@ export function createConnectionState(options) {
       return state;
     }
 
-    const storedConflict = await readConflictStop(scope, databaseOptions);
-    if (storedConflict) {
-      conflict = storedConflict;
+    const markers = await readReplayMarkers(scopeKey, databaseOptions);
+    if (markers.conflict_stop) {
+      conflict = markers.conflict_stop;
+      state = CONNECTION_STATES.conflictStop;
+      return state;
+    }
+    if (markers.replay_intent && markers.replay_intent.session_id !== replaySessionId) {
+      conflict = unresolvedIntentConflict(markers.replay_intent);
       state = CONNECTION_STATES.conflictStop;
       return state;
     }
@@ -72,10 +81,25 @@ export function createConnectionState(options) {
   }
 
   async function replay() {
-    await refresh();
+    try {
+      await refresh();
+    } catch (_error) {
+      state = CONNECTION_STATES.pending;
+      return state;
+    }
     if (state === CONNECTION_STATES.conflictStop) return state;
+    if (!replaySessionId) {
+      state = CONNECTION_STATES.pending;
+      return state;
+    }
 
-    const initialPending = await recoverPending(scope, databaseOptions);
+    let initialPending;
+    try {
+      initialPending = await recoverPending(scope, databaseOptions);
+    } catch (_error) {
+      state = CONNECTION_STATES.pending;
+      return state;
+    }
     if (initialPending.length === 0) return state;
     if (!isOnline()) {
       state = CONNECTION_STATES.pending;
@@ -103,9 +127,17 @@ export function createConnectionState(options) {
               state = CONNECTION_STATES.caughtUp;
               return state;
             }
-            const storedConflict = await readConflictStop(scope, databaseOptions);
-            if (storedConflict) {
-              conflict = storedConflict;
+            const markers = await readReplayMarkers(scopeKey, databaseOptions);
+            if (markers.conflict_stop) {
+              conflict = markers.conflict_stop;
+              state = CONNECTION_STATES.conflictStop;
+              return state;
+            }
+            if (markers.replay_intent && (
+              markers.replay_intent.session_id !== replaySessionId ||
+              !samePendingCommand(markers.replay_intent, pending[0])
+            )) {
+              conflict = unresolvedIntentConflict(markers.replay_intent);
               state = CONNECTION_STATES.conflictStop;
               return state;
             }
@@ -123,6 +155,40 @@ export function createConnectionState(options) {
               active_round_entry_ids: structuredClone(record.metadata.active_round_entry_ids),
               sequence: record.sequence,
             };
+            const replayIntent = markers.replay_intent || {
+              submission_id: record.command.client_submission_id,
+              sequence: record.sequence,
+              session_id: replaySessionId,
+            };
+
+            let intentPersisted;
+            try {
+              intentPersisted = await persistReplayIntent(scopeKey, replayIntent, databaseOptions);
+            } catch (_error) {
+              state = CONNECTION_STATES.pending;
+              return state;
+            }
+            if (!intentPersisted) {
+              let latestMarkers;
+              try {
+                latestMarkers = await readReplayMarkers(scopeKey, databaseOptions);
+              } catch (_error) {
+                state = CONNECTION_STATES.pending;
+                return state;
+              }
+              if (latestMarkers.conflict_stop) {
+                conflict = latestMarkers.conflict_stop;
+                state = CONNECTION_STATES.conflictStop;
+                return state;
+              }
+              if (latestMarkers.replay_intent) {
+                conflict = unresolvedIntentConflict(latestMarkers.replay_intent);
+                state = CONNECTION_STATES.conflictStop;
+                return state;
+              }
+              state = CONNECTION_STATES.pending;
+              return state;
+            }
 
             state = CONNECTION_STATES.replaying;
             let response;
@@ -154,7 +220,10 @@ export function createConnectionState(options) {
 
             let acknowledged;
             try {
-              acknowledged = await acknowledgeSubmission(record, response.receipt, databaseOptions);
+              acknowledged = await acknowledgeSubmission(record, response.receipt, {
+                ...databaseOptions,
+                replayIntent,
+              });
             } catch (_error) {
               state = CONNECTION_STATES.pending;
               return state;
@@ -176,10 +245,28 @@ export function createConnectionState(options) {
     if (state !== CONNECTION_STATES.conflictStop) await refresh();
     if (state !== CONNECTION_STATES.conflictStop || typeof authorize !== "function") return state;
 
-    const stopped = conflict || await readConflictStop(scope, databaseOptions);
-    if (!stopped) return state;
+    let markers;
+    try {
+      markers = await readReplayMarkers(scopeKey, databaseOptions);
+    } catch (_error) {
+      return state;
+    }
 
-    const pending = await recoverPending(scope, databaseOptions);
+    if (markers.conflict_stop && markers.replay_intent && !sameConflictCommand(markers.conflict_stop, markers.replay_intent)) {
+      return state;
+    }
+    const stopped = markers.conflict_stop || conflict || (
+      markers.replay_intent && unresolvedIntentConflict(markers.replay_intent)
+    );
+    if (!stopped) return state;
+    if (markers.replay_intent && !sameConflictCommand(stopped, markers.replay_intent)) return state;
+
+    let pending;
+    try {
+      pending = await recoverPending(scope, databaseOptions);
+    } catch (_error) {
+      return state;
+    }
     const record = pending.find((item) =>
       item.sequence === stopped.sequence &&
       sameId(item.command.client_submission_id, stopped.submission_id)
@@ -200,7 +287,17 @@ export function createConnectionState(options) {
 
     if (!validRecoveryAuthorization(authorization, scopeKey, stopped, record)) return state;
 
-    const cleared = await clearConflictStop(scope, stopped, databaseOptions);
+    let cleared;
+    try {
+      cleared = await clearReplayMarkersForRecovery(
+        scopeKey,
+        markers.conflict_stop,
+        markers.replay_intent,
+        databaseOptions,
+      );
+    } catch (_error) {
+      return state;
+    }
     if (!cleared) return state;
 
     conflict = undefined;
@@ -237,4 +334,30 @@ function sameId(left, right) {
   return typeof left === "string" &&
     typeof right === "string" &&
     left.toLowerCase() === right.toLowerCase();
+}
+
+function replayLockName(scope) {
+  return `golf-scoring-replay:${JSON.stringify([
+    scope.event_id.toLowerCase(),
+    scope.round_id.toLowerCase(),
+    scope.playing_group_id.toLowerCase(),
+  ])}`;
+}
+
+function samePendingCommand(intent, record) {
+  return intent.sequence === record.sequence &&
+    sameId(intent.submission_id, record.command.client_submission_id);
+}
+
+function sameConflictCommand(conflict, intent) {
+  return conflict.sequence === intent.sequence &&
+    sameId(conflict.submission_id, intent.submission_id);
+}
+
+function unresolvedIntentConflict(intent) {
+  return {
+    submission_id: intent.submission_id,
+    sequence: intent.sequence,
+    reason: "replay_intent_unresolved",
+  };
 }

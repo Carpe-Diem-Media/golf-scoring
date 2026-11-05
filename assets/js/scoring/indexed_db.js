@@ -215,6 +215,13 @@ export async function readPendingRecords(scopeKey, options = {}) {
 }
 
 export async function acknowledgePendingRecord(record, receipt, options = {}) {
+  let replayIntent;
+  try {
+    replayIntent = validateReplayIntent(options.replayIntent);
+  } catch (_error) {
+    return false;
+  }
+
   if (
     record?.state !== "RECOVERED" ||
     typeof record.record_key !== "string" ||
@@ -229,7 +236,58 @@ export async function acknowledgePendingRecord(record, receipt, options = {}) {
 
   const db = await openScoringDatabase(options);
   try {
-    return await acknowledgeInTransaction(db, record);
+    return await acknowledgeInTransaction(db, record, replayIntent);
+  } finally {
+    db.close();
+  }
+}
+
+export async function readReplayMarkers(scopeKey, options = {}) {
+  if (typeof scopeKey !== "string" || scopeKey.length === 0) {
+    throw new InvalidStoredRecordError("A scoring scope key is required to read replay markers");
+  }
+
+  const db = await openScoringDatabase(options);
+  try {
+    return await readReplayMarkersInTransaction(db, scopeKey);
+  } finally {
+    db.close();
+  }
+}
+
+export async function persistReplayIntent(scopeKey, replayIntent, options = {}) {
+  const candidate = validateReplayIntent(replayIntent);
+  if (typeof scopeKey !== "string" || scopeKey.length === 0) {
+    throw new InvalidStoredRecordError("A scoring scope key is required to persist replay intent");
+  }
+
+  const db = await openScoringDatabase(options);
+  try {
+    return await persistReplayIntentInTransaction(db, scopeKey, candidate);
+  } finally {
+    db.close();
+  }
+}
+
+export async function clearReplayMarkersForRecovery(
+  scopeKey,
+  expectedConflict,
+  expectedReplayIntent,
+  options = {},
+) {
+  const conflict = expectedConflict === null
+    ? null
+    : validateConflictStop(expectedConflict);
+  const intent = expectedReplayIntent === null
+    ? null
+    : validateReplayIntent(expectedReplayIntent);
+  if (typeof scopeKey !== "string" || scopeKey.length === 0) {
+    throw new InvalidStoredRecordError("A scoring scope key is required to recover replay markers");
+  }
+
+  const db = await openScoringDatabase(options);
+  try {
+    return await clearReplayMarkersForRecoveryInTransaction(db, scopeKey, conflict, intent);
   } finally {
     db.close();
   }
@@ -566,10 +624,210 @@ function readInTransaction(db, scopeKey) {
   });
 }
 
-function acknowledgeInTransaction(db, record) {
+function readReplayMarkersInTransaction(db, scopeKey) {
   return new Promise((resolve, reject) => {
-    const transaction = db.transaction(SCORING_STORE_NAMES.pending, "readwrite");
+    const transaction = db.transaction(SCORING_STORE_NAMES.sequences, "readonly");
+    const request = transaction.objectStore(SCORING_STORE_NAMES.sequences).get(scopeKey);
+    let markers = { conflict_stop: null, replay_intent: null };
+    let transactionError;
+
+    request.onsuccess = () => {
+      const sequenceRecord = request.result;
+      if (!sequenceRecord) return;
+      if (sequenceRecord.scope_key !== scopeKey) {
+        transactionError = new InvalidStoredRecordError("Stored replay markers have an invalid scoring scope");
+        try { transaction.abort(); } catch (_abortError) { /* Transaction already closed. */ }
+        return;
+      }
+
+      try {
+        markers = {
+          conflict_stop: sequenceRecord.conflict_stop === undefined
+            ? null
+            : validateConflictStop(sequenceRecord.conflict_stop),
+          replay_intent: sequenceRecord.replay_intent === undefined
+            ? null
+            : validateReplayIntent(sequenceRecord.replay_intent),
+        };
+        if (
+          markers.conflict_stop &&
+          markers.replay_intent &&
+          !sameConflictCommand(markers.conflict_stop, markers.replay_intent)
+        ) {
+          throw new InvalidStoredRecordError("Stored replay conflict and intent do not identify the same command");
+        }
+      } catch (error) {
+        transactionError = error;
+        try { transaction.abort(); } catch (_abortError) { /* Transaction already closed. */ }
+      }
+    };
+    request.onerror = (event) => {
+      transactionError = event.target?.error || request.error;
+    };
+    transaction.onerror = (event) => {
+      transactionError ||= event.target?.error || transaction.error;
+    };
+    transaction.onabort = () => {
+      reject(transactionError || transaction.error || new Error("IndexedDB replay marker read transaction aborted"));
+    };
+    transaction.oncomplete = () => resolve(markers);
+  });
+}
+
+function persistReplayIntentInTransaction(db, scopeKey, candidate) {
+  return new Promise((resolve, reject) => {
+    const transaction = db.transaction(
+      [SCORING_STORE_NAMES.pending, SCORING_STORE_NAMES.sequences],
+      "readwrite",
+    );
     const pending = transaction.objectStore(SCORING_STORE_NAMES.pending);
+    const sequences = transaction.objectStore(SCORING_STORE_NAMES.sequences);
+    const sequenceRequest = sequences.get(scopeKey);
+    let persisted = false;
+    let transactionError;
+
+    const failClosed = (error) => {
+      transactionError = error;
+      try { transaction.abort(); } catch (_abortError) { /* Transaction already closed. */ }
+    };
+
+    sequenceRequest.onsuccess = () => {
+      const sequenceRecord = sequenceRequest.result;
+      if (
+        !sequenceRecord ||
+        sequenceRecord.scope_key !== scopeKey ||
+        !Number.isSafeInteger(sequenceRecord.last_sequence) ||
+        sequenceRecord.last_sequence < candidate.sequence
+      ) {
+        failClosed(new InvalidStoredRecordError("Replay intent does not match a stored queue sequence"));
+        return;
+      }
+      if (sequenceRecord.conflict_stop !== undefined) {
+        persisted = false;
+        return;
+      }
+
+      let currentIntent = null;
+      try {
+        if (sequenceRecord.replay_intent !== undefined) {
+          currentIntent = validateReplayIntent(sequenceRecord.replay_intent);
+        }
+      } catch (error) {
+        failClosed(error);
+        return;
+      }
+      if (currentIntent && !sameReplayIntent(currentIntent, candidate)) return;
+
+      const pendingRequest = pending.index(SUBMISSION_ID_INDEX).get(candidate.submission_id.toLowerCase());
+      pendingRequest.onsuccess = () => {
+        const stored = pendingRequest.result;
+        if (
+          !stored ||
+          stored.state !== "PERSISTED" ||
+          stored.scope_key !== scopeKey ||
+          stored.sequence !== candidate.sequence ||
+          typeof stored.command?.client_submission_id !== "string" ||
+          stored.command.client_submission_id.toLowerCase() !== candidate.submission_id.toLowerCase() ||
+          stored.submission_id_key !== candidate.submission_id.toLowerCase()
+        ) {
+          persisted = false;
+          return;
+        }
+
+        if (!currentIntent) {
+          sequences.put({ ...sequenceRecord, replay_intent: candidate });
+        }
+        persisted = true;
+      };
+      pendingRequest.onerror = (event) => {
+        failClosed(event.target?.error || pendingRequest.error);
+      };
+    };
+    sequenceRequest.onerror = (event) => {
+      failClosed(event.target?.error || sequenceRequest.error);
+    };
+    transaction.onerror = (event) => {
+      transactionError ||= event.target?.error || transaction.error;
+    };
+    transaction.onabort = () => {
+      reject(transactionError || transaction.error || new Error("IndexedDB replay intent transaction aborted"));
+    };
+    transaction.oncomplete = () => resolve(persisted);
+  });
+}
+
+function clearReplayMarkersForRecoveryInTransaction(db, scopeKey, expectedConflict, expectedIntent) {
+  return new Promise((resolve, reject) => {
+    const transaction = db.transaction(SCORING_STORE_NAMES.sequences, "readwrite");
+    const store = transaction.objectStore(SCORING_STORE_NAMES.sequences);
+    const request = store.get(scopeKey);
+    let cleared = false;
+    let transactionError;
+
+    request.onsuccess = () => {
+      const sequenceRecord = request.result;
+      if (!sequenceRecord || sequenceRecord.scope_key !== scopeKey) return;
+
+      let currentConflict = null;
+      let currentIntent = null;
+      try {
+        if (sequenceRecord.conflict_stop !== undefined) {
+          currentConflict = validateConflictStop(sequenceRecord.conflict_stop);
+        }
+        if (sequenceRecord.replay_intent !== undefined) {
+          currentIntent = validateReplayIntent(sequenceRecord.replay_intent);
+        }
+      } catch (error) {
+        transactionError = error;
+        try { transaction.abort(); } catch (_abortError) { /* Transaction already closed. */ }
+        return;
+      }
+
+      if (
+        currentConflict &&
+        currentIntent &&
+        !sameConflictCommand(currentConflict, currentIntent)
+      ) {
+        transactionError = new InvalidStoredRecordError("Stored replay conflict and intent do not identify the same command");
+        try { transaction.abort(); } catch (_abortError) { /* Transaction already closed. */ }
+        return;
+      }
+
+      if (
+        (expectedConflict === null ? currentConflict !== null : !currentConflict || !sameConflictStop(currentConflict, expectedConflict)) ||
+        (expectedIntent === null ? currentIntent !== null : !currentIntent || !sameReplayIntent(currentIntent, expectedIntent))
+      ) {
+        return;
+      }
+      if (!currentConflict && !currentIntent) return;
+
+      const updated = { ...sequenceRecord };
+      delete updated.conflict_stop;
+      delete updated.replay_intent;
+      store.put(updated);
+      cleared = true;
+    };
+    request.onerror = (event) => {
+      transactionError = event.target?.error || request.error;
+    };
+    transaction.onerror = (event) => {
+      transactionError ||= event.target?.error || transaction.error;
+    };
+    transaction.onabort = () => {
+      reject(transactionError || transaction.error || new Error("IndexedDB replay marker recovery transaction aborted"));
+    };
+    transaction.oncomplete = () => resolve(cleared);
+  });
+}
+
+function acknowledgeInTransaction(db, record, expectedIntent) {
+  return new Promise((resolve, reject) => {
+    const transaction = db.transaction(
+      [SCORING_STORE_NAMES.pending, SCORING_STORE_NAMES.sequences],
+      "readwrite",
+    );
+    const pending = transaction.objectStore(SCORING_STORE_NAMES.pending);
+    const sequences = transaction.objectStore(SCORING_STORE_NAMES.sequences);
     const request = pending.get(record.record_key);
     let acknowledged = false;
     let transactionError;
@@ -590,8 +848,37 @@ function acknowledgeInTransaction(db, record) {
         return;
       }
 
-      pending.delete(record.record_key);
-      acknowledged = true;
+      const sequenceRequest = sequences.get(record.scope_key);
+      sequenceRequest.onsuccess = () => {
+        const sequenceRecord = sequenceRequest.result;
+        let currentIntent;
+        try {
+          currentIntent = validateReplayIntent(sequenceRecord?.replay_intent);
+        } catch (error) {
+          transactionError = error;
+          try { transaction.abort(); } catch (_abortError) { /* Transaction already closed. */ }
+          return;
+        }
+        if (
+          !sequenceRecord ||
+          sequenceRecord.scope_key !== record.scope_key ||
+          sequenceRecord.conflict_stop !== undefined ||
+          !sameReplayIntent(currentIntent, expectedIntent) ||
+          currentIntent.sequence !== record.sequence ||
+          !sameId(currentIntent.submission_id, record.command.client_submission_id)
+        ) {
+          return;
+        }
+
+        const updatedSequence = { ...sequenceRecord };
+        delete updatedSequence.replay_intent;
+        pending.delete(record.record_key);
+        sequences.put(updatedSequence);
+        acknowledged = true;
+      };
+      sequenceRequest.onerror = (event) => {
+        transactionError = event.target?.error || sequenceRequest.error;
+      };
     };
     request.onerror = (event) => {
       transactionError = event.target?.error || request.error;
@@ -767,6 +1054,39 @@ function validateConflictStop(value) {
     sequence: value.sequence,
     reason: value.reason,
   };
+}
+
+function validateReplayIntent(value) {
+  if (
+    !value ||
+    typeof value !== "object" ||
+    Array.isArray(value) ||
+    !UUID.test(value.submission_id || "") ||
+    !Number.isSafeInteger(value.sequence) ||
+    value.sequence < 1 ||
+    !UUID.test(value.session_id || "") ||
+    Object.keys(value).some((key) => !["submission_id", "sequence", "session_id"].includes(key))
+  ) {
+    throw new InvalidStoredRecordError("Stored scoring replay intent is invalid");
+  }
+
+  return {
+    submission_id: value.submission_id,
+    sequence: value.sequence,
+    session_id: value.session_id,
+  };
+}
+
+function sameReplayIntent(left, right) {
+  return Boolean(left && right) &&
+    sameId(left.submission_id, right.submission_id) &&
+    left.sequence === right.sequence &&
+    sameId(left.session_id, right.session_id);
+}
+
+function sameConflictCommand(conflict, intent) {
+  return conflict.sequence === intent.sequence &&
+    sameId(conflict.submission_id, intent.submission_id);
 }
 
 function sameConflictStop(left, right) {
