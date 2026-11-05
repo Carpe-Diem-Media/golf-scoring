@@ -1,7 +1,11 @@
 import {
   DuplicateSubmissionError,
   InvalidStoredRecordError,
+  acknowledgePendingRecord,
+  clearConflictStop as clearConflictStopRecord,
+  persistConflictStop as persistConflictStopRecord,
   persistValidatedRecord,
+  readConflictStop as readConflictStopRecord,
   readPendingRecords,
 } from "./indexed_db.js";
 import {
@@ -33,6 +37,43 @@ export async function recoverPending(scope, options = {}) {
   const scopeKey = scopeKeyFor(scope);
   const storedRecords = await readPendingRecords(scopeKey, options);
   return storedRecords.map((record) => recoverRecord(record, scopeKey));
+}
+
+export async function acknowledgeSubmission(record, receipt, options = {}) {
+  return acknowledgePendingRecord(record, receipt, options);
+}
+
+export async function persistConflictStop(record, reason, options = {}) {
+  if (
+    record?.state !== "RECOVERED" ||
+    typeof record.scope_key !== "string" ||
+    !Number.isSafeInteger(record.sequence) ||
+    record.sequence < 1 ||
+    typeof record.command?.client_submission_id !== "string"
+  ) {
+    throw new InvalidStoredRecordError("A recovered queue record is required to stop replay");
+  }
+
+  const safeReason = typeof reason === "string" && /^[a-zA-Z0-9_:-]{1,128}$/.test(reason)
+    ? reason
+    : "server_rejected";
+  return persistConflictStopRecord(
+    record.scope_key,
+    {
+      submission_id: record.command.client_submission_id,
+      sequence: record.sequence,
+      reason: safeReason,
+    },
+    options,
+  );
+}
+
+export async function readConflictStop(scope, options = {}) {
+  return readConflictStopRecord(scopeKeyFor(scope), options);
+}
+
+export async function clearConflictStop(scope, expectedConflict, options = {}) {
+  return clearConflictStopRecord(scopeKeyFor(scope), expectedConflict, options);
 }
 
 function recoverRecord(record, requestedScopeKey) {
