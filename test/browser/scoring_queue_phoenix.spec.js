@@ -114,6 +114,47 @@ test("an authenticated LiveView reconciles an accepted non-final hole after its 
   expect(await pendingSubmissionIds(page)).toEqual([]);
 });
 
+test("an authenticated LiveView keeps Hole 3 next after reconciling Hole 1 with Hole 2 pending", async ({ page, context }) => {
+  test.skip(
+    !fixture || fixture.scenario !== "partial_recovery_two_holes",
+    "The Phoenix integration runner supplies a two-hole partial-recovery fixture",
+  );
+
+  await addSessionCookie(context);
+
+  const traffic = await captureQueueTraffic(context, {
+    dropAcceptedReplyAtSubmissionNumbers: [1, 2],
+  });
+  const [holeOne, holeTwo] = await queueTwoHolesOffline(page, context);
+
+  expect(holeOne.expected_group_score_revision).toBe(0);
+  expect(holeTwo.expected_group_score_revision).toBe(1);
+  expect(holeOne.client_submission_id).not.toBe(holeTwo.client_submission_id);
+
+  await reconnectAndSubmit(page, context, traffic);
+  await expect.poll(() => traffic.replies.filter(({ event }) => event === "submit_queued_hole").length).toBe(1);
+  expect(traffic.replies.find(({ event }) => event === "submit_queued_hole").response.status).toBe("accepted");
+
+  await page.reload();
+  await expect.poll(() => traffic.resolvedIds.length).toBe(1);
+  await expect.poll(() => traffic.submissionIds.length).toBe(2);
+  await expect.poll(() => traffic.replies.filter(({ event }) => event === "submit_queued_hole").length).toBe(2);
+  await expect(page.locator("#current-hole")).toHaveText("Hole 3");
+  await expect(page.locator("#scoring-sync-label")).toHaveText("Pending sync");
+  await expect(page.locator("#scoring-pending-count")).toHaveText("1 pending");
+
+  const remaining = await pendingCommands(page);
+  expect(remaining).toHaveLength(1);
+  expect(remaining[0].client_submission_id).toBe(holeTwo.client_submission_id);
+  expect(remaining[0].expected_group_score_revision).toBe(1);
+  expect(traffic.resolvedIds).toEqual([holeOne.client_submission_id]);
+  expect(traffic.submissionIds).toEqual([
+    holeOne.client_submission_id,
+    holeTwo.client_submission_id,
+  ]);
+  expect(new Set(traffic.submissionIds).size).toBe(2);
+});
+
 test("an unaccepted Hole 1 command remains pending without a server write", async ({ page, context }) => {
   test.skip(!fixture || fixture.scenario !== "unaccepted_hole_1", "The Phoenix integration runner supplies an unaccepted Hole 1 fixture");
 
@@ -268,6 +309,30 @@ async function queueHoleOffline(page, context, holeNumber) {
   await expect(page.locator("#current-hole")).toHaveText(`Hole ${holeNumber + 1}`);
 }
 
+async function queueTwoHolesOffline(page, context) {
+  await page.goto(fixture.base_url + fixture.scorecard_path);
+  await expect(page.locator("#current-hole")).toHaveText("Hole 1");
+  await expect(page.locator("#scoring-sync-label")).toHaveText("Saved");
+  await context.setOffline(true);
+  await page.waitForFunction(() => !navigator.onLine);
+
+  const commands = [];
+  for (const holeNumber of [1, 2]) {
+    for (const entryId of fixture.round_entry_ids) {
+      await page.locator(`[name="scorecard[results][${entryId}][outcome]"]`).selectOption("holed_out");
+      await page.locator(`[name="scorecard[results][${entryId}][gross_strokes]"]`).fill("4");
+    }
+
+    await page.locator("#submit-group-hole").click();
+    await expect(page.locator("#scoring-sync-label")).toHaveText("Pending sync");
+    await expect(page.locator("#scoring-pending-count")).toHaveText(`${holeNumber} pending`);
+    await expect(page.locator("#current-hole")).toHaveText(`Hole ${holeNumber + 1}`);
+    commands.push((await pendingCommands(page))[holeNumber - 1]);
+  }
+
+  return commands;
+}
+
 async function reconnectAndSubmit(page, context, traffic) {
   await context.setOffline(false);
   await page.waitForFunction(() => navigator.onLine);
@@ -288,6 +353,7 @@ async function waitForCondition(condition, timeoutMs) {
 async function captureQueueTraffic(context, {
   dropFirstAcceptedReply = false,
   dropFirstSubmission = false,
+  dropAcceptedReplyAtSubmissionNumbers = [],
   mismatchFirstResolutionReceipt = false,
 } = {}) {
   let firstSubmissionRef = null;
@@ -295,6 +361,7 @@ async function captureQueueTraffic(context, {
   let droppedFirstSubmission = false;
   let mismatchedResolutionReceipt = false;
   const submissionIds = [];
+  const submissionNumberByRef = new Map();
   const resolvedIds = [];
   const eventByRef = new Map();
   const replies = [];
@@ -311,6 +378,7 @@ async function captureQueueTraffic(context, {
 
         if (payload.event === "submit_queued_hole") {
           submissionIds.push(command?.client_submission_id);
+          submissionNumberByRef.set(ref, submissionIds.length);
           if (submissionIds.length === 1) {
             firstSubmissionRef = ref;
             if (dropFirstSubmission && !droppedFirstSubmission) {
@@ -356,6 +424,14 @@ async function captureQueueTraffic(context, {
         response?.status === "accepted"
       ) {
         droppedAcceptedReply = true;
+        return;
+      }
+
+      if (
+        event === "phx_reply" &&
+        response?.status === "accepted" &&
+        dropAcceptedReplyAtSubmissionNumbers.includes(submissionNumberByRef.get(ref))
+      ) {
         return;
       }
 

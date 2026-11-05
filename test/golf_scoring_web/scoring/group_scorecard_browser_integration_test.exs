@@ -174,6 +174,37 @@ defmodule GolfScoringWeb.Scoring.GroupScorecardBrowserIntegrationTest do
            ).rows == [[4]]
   end
 
+  test "authenticated browser preserves progression after reconciling Hole 1 with Hole 2 pending",
+       %{
+         conn: conn
+       } do
+    setup = PaperRecoveryFixtures.setup_submit_fixture!(2)
+
+    run_authenticated_browser!(conn, setup, "partial_recovery_two_holes")
+
+    hole_one = route_hole_at_revision!(setup, 0)
+    hole_two = route_hole_at_revision!(setup, 1)
+
+    for hole <- [hole_one, hole_two] do
+      assert [[1]] =
+               Repo.query!(
+                 "SELECT count(*)::int FROM hole_submissions WHERE round_hole_id = $1::uuid",
+                 [Ecto.UUID.dump!(hole.id)]
+               ).rows
+
+      assert [[2]] =
+               Repo.query!(
+                 "SELECT count(*)::int FROM hole_results WHERE round_hole_id = $1::uuid",
+                 [Ecto.UUID.dump!(hole.id)]
+               ).rows
+    end
+
+    assert Repo.query!(
+             "SELECT scoring_revision FROM playing_groups WHERE id = $1::uuid",
+             [Ecto.UUID.dump!(setup.group.id)]
+           ).rows == [[2]]
+  end
+
   test "authenticated browser keeps a never-accepted Hole 1 pending without writing a score", %{
     conn: conn
   } do

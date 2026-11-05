@@ -184,6 +184,44 @@ async function mountScorecard(page, responseMode = "accepted") {
   }, responseMode);
 }
 
+test("recalculates progression from queued commands after a newer scorecard projection arrives", async ({ page }) => {
+  await mountScorecard(page);
+
+  const updatedProjection = { ...projection(), revision: 1 };
+  await page.evaluate(async (value) => {
+    const { enqueueSubmission } = await import("/scoring/queue.js");
+    const command = {
+      client_submission_id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+      playing_group_id: value.scope.playing_group_id,
+      round_hole_id: value.route[1].id,
+      expected_group_score_revision: 1,
+      role_assignment_version: value.assignment.assignment_version,
+      captured_at: "2026-11-05T08:00:00.000Z",
+      results: value.active_round_entry_ids.map((round_entry_id) => ({
+        round_entry_id,
+        outcome: "holed_out",
+        gross_strokes: 4,
+      })),
+    };
+    await enqueueSubmission({
+      scope: value.scope,
+      assignment: value.assignment,
+      active_round_entry_ids: value.active_round_entry_ids,
+      command,
+    });
+
+    const root = document.querySelector("#group-scorecard");
+    root.dataset.scoringQueueProjection = JSON.stringify(value);
+    window.__scorecardHook.updated();
+  }, updatedProjection);
+
+  await expect.poll(() => page.evaluate(() => window.__scorecardHook.nextRevision)).toBe(2);
+  await expect(page.locator("#current-hole")).toHaveText("Hole 16");
+  await expect(page.locator("#scoring-pending-count")).toHaveText("1 pending");
+  await expect(page.locator('[name="scorecard[expected_group_score_revision]"]')).toHaveValue("2");
+  await expect(page.locator('[name="scorecard[round_hole_id]"]')).toHaveValue(ids.holes[2]);
+});
+
 test("queues holes through a real outage, restores after reload, then replays in order", async ({ page, context }) => {
   await mountScorecard(page);
   await context.setOffline(true);

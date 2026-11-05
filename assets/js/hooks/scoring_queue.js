@@ -114,21 +114,17 @@ export const ScoringQueue = {
       this.pendingCount = pending.length;
 
       if (await this.resumeUnacknowledgedCommand(pending)) {
+        const remaining = await recoverPending(this.projection.scope);
+        this.pendingCount = remaining.length;
+        await this.recalculateNextRevision(remaining);
+        this.renderCurrentHole();
         this.initializingQueue = false;
         this.renderStatus();
         await this.replayPending();
         return;
       }
 
-      if (
-        this.controller.state !== CONNECTION_STATES.conflictStop &&
-        !this.isContiguous(pending, this.serverRevision)
-      ) {
-        await persistConflictStop(pending[0], "local_progression_mismatch");
-        await this.controller.refresh();
-      } else if (this.controller.state !== CONNECTION_STATES.conflictStop) {
-        this.nextRevision = this.serverRevision + pending.length;
-      }
+      await this.recalculateNextRevision(pending);
 
       this.renderCurrentHole();
       this.initializingQueue = false;
@@ -150,22 +146,16 @@ export const ScoringQueue = {
       this.pendingCount = pending.length;
 
       if (await this.resumeUnacknowledgedCommand(pending)) {
+        const remaining = await recoverPending(this.projection.scope);
+        this.pendingCount = remaining.length;
+        await this.recalculateNextRevision(remaining);
+        this.renderCurrentHole();
         this.renderStatus();
         await this.replayPending();
         return;
       }
 
-      if (pending.length === 0) {
-        this.nextRevision = Math.max(this.nextRevision, this.serverRevision);
-      } else if (
-        this.controller.state !== CONNECTION_STATES.conflictStop &&
-        !this.isContiguous(pending, this.serverRevision)
-      ) {
-        await persistConflictStop(pending[0], "local_progression_mismatch");
-        await this.controller.refresh();
-      } else if (this.controller.state !== CONNECTION_STATES.conflictStop) {
-        this.nextRevision = Math.max(this.nextRevision, this.serverRevision + pending.length);
-      }
+      await this.recalculateNextRevision(pending, { preserveCurrent: true });
 
       this.renderCurrentHole();
       this.renderStatus();
@@ -206,6 +196,22 @@ export const ScoringQueue = {
       },
     });
 
+    return true;
+  },
+
+  async recalculateNextRevision(pending, { preserveCurrent = false } = {}) {
+    if (this.controller.state === CONNECTION_STATES.conflictStop) return false;
+
+    if (!this.isContiguous(pending, this.serverRevision)) {
+      await persistConflictStop(pending[0], "local_progression_mismatch");
+      await this.controller.refresh();
+      return false;
+    }
+
+    const nextRevision = this.serverRevision + pending.length;
+    this.nextRevision = preserveCurrent
+      ? Math.max(this.nextRevision, nextRevision)
+      : nextRevision;
     return true;
   },
 
