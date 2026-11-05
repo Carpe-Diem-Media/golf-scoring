@@ -60,8 +60,10 @@ defmodule GolfScoringWeb.Scoring.GroupScorecardLiveTest do
         assert has_element?(view, "#scorecard-player-#{index}")
       end
 
-      html = render_submit(view, "submit_hole", hole_params(setup, 0, hd(setup.route).id))
+      {response, html} =
+        submit_queued_hole!(view, setup, hole_params(setup, 0, hd(setup.route).id))
 
+      assert response.status == :accepted
       assert html =~ "Hole saved"
       assert has_element?(view, "#current-hole", "Hole 2")
       assert has_element?(view, "#holes-remaining", "17 remaining")
@@ -69,6 +71,105 @@ defmodule GolfScoringWeb.Scoring.GroupScorecardLiveTest do
       assert length(hole_submissions(setup)) == 1
       assert Ash.get!(PlayingGroup, setup.group.id, authorize?: false).scoring_revision == 1
     end
+  end
+
+  test "submits a queued hole through the scoring service and returns a whitelisted receipt", %{
+    conn: conn
+  } do
+    setup = PaperRecoveryFixtures.setup_submit_fixture!(2)
+    scorer_entry = hd(setup.entries)
+    {view, _html} = open_scorecard!(conn, setup, scorer_entry)
+    submission_id = Ecto.UUID.generate()
+    captured_at = "2026-11-05T08:00:00.123Z"
+    params = queued_hole_params(setup, 0, hd(setup.route).id, submission_id, captured_at)
+
+    render_hook(view, "submit_queued_hole", params)
+
+    %{proxy: {ref, _topic, _}} = view
+    assert_receive {^ref, {:reply, response}}
+    assert response.status == :accepted
+
+    receipt = response.receipt
+
+    assert MapSet.new(Map.keys(receipt)) ==
+             MapSet.new([
+               :id,
+               :client_submission_id,
+               :round_id,
+               :playing_group_id,
+               :round_hole_id,
+               :expected_group_score_revision,
+               :group_role_assignment_id,
+               :role_assignment_version,
+               :submitted_by_round_entry_id,
+               :captured_at,
+               :payload_fingerprint,
+               :submitted_payload,
+               :source
+             ])
+
+    assert receipt.client_submission_id == submission_id
+    assert receipt.round_id == setup.round.id
+    assert receipt.playing_group_id == setup.group.id
+    assert receipt.round_hole_id == hd(setup.route).id
+    assert receipt.expected_group_score_revision == 0
+    assert receipt.role_assignment_version == 1
+    assert receipt.submitted_by_round_entry_id == scorer_entry.id
+    assert receipt.captured_at == "2026-11-05T08:00:00.123000Z"
+    assert receipt.source == "normal"
+    assert is_binary(receipt.payload_fingerprint)
+    assert receipt.submitted_payload.actor.type == "player"
+    assert receipt.submitted_payload.actor.round_entry_id == scorer_entry.id
+    assert length(receipt.submitted_payload.results) == 2
+    refute Map.has_key?(receipt.submitted_payload, :mystery)
+    assert length(hole_results(setup)) == 2
+    assert length(hole_submissions(setup)) == 1
+  end
+
+  test "projects authorized queue identity and route facts without grant credentials", %{
+    conn: conn
+  } do
+    setup = PaperRecoveryFixtures.setup_submit_fixture!(2)
+    scorer_entry = hd(setup.entries)
+    {_view, html} = open_scorecard!(conn, setup, scorer_entry)
+
+    [_, encoded_projection] =
+      Regex.run(~r/data-scoring-queue-projection="([^"]+)"/, html)
+
+    projection = encoded_projection |> String.replace("&quot;", "\"") |> Jason.decode!()
+
+    assert projection["scope"]["event_id"] == setup.event.id
+    assert projection["scope"]["round_id"] == setup.round.id
+    assert projection["scope"]["playing_group_id"] == setup.group.id
+    assert projection["scope"]["scorer"]["round_entry_id"] == scorer_entry.id
+    assert projection["assignment"]["round_entry_id"] == scorer_entry.id
+    assert projection["assignment"]["assignment_version"] == 1
+    assert length(projection["route"]) == 18
+    assert projection["route"] |> hd() |> Map.has_key?("players")
+    refute Map.has_key?(projection, "grant_id")
+    refute Map.has_key?(projection, "grant_token")
+    refute html =~ "grant_token"
+    refute html =~ "mystery"
+  end
+
+  test "waits for local queue verification before showing saved", %{conn: conn} do
+    setup = PaperRecoveryFixtures.setup_submit_fixture!(2)
+    {_view, html} = open_scorecard!(conn, setup, hd(setup.entries))
+
+    assert html =~ ~s(<span id="scoring-sync-label">Checking sync</span>)
+  end
+
+  test "rejects a queued command for a hole outside the current route position", %{conn: conn} do
+    setup = PaperRecoveryFixtures.setup_submit_fixture!(2)
+    {view, _html} = open_scorecard!(conn, setup)
+    wrong_hole = Enum.at(setup.route, 1)
+
+    {response, _html} =
+      submit_queued_hole!(view, setup, hole_params(setup, 0, wrong_hole.id))
+
+    assert response == %{status: :rejected, reason: :wrong_hole}
+    assert hole_results(setup) == []
+    assert hole_submissions(setup) == []
   end
 
   test "renders distinct event and round identifiers for separate scorecards", %{conn: conn} do
@@ -180,8 +281,9 @@ defmodule GolfScoringWeb.Scoring.GroupScorecardLiveTest do
     assert html =~ "Handicap adjusted 4"
     assert html =~ "Stableford 3"
 
-    html = render_submit(view, "submit_hole", params)
+    {response, html} = submit_queued_hole!(view, setup, params)
 
+    assert response.status == :accepted
     assert html =~ "Hole saved"
     assert length(hole_results(setup)) == 2
   end
@@ -193,13 +295,9 @@ defmodule GolfScoringWeb.Scoring.GroupScorecardLiveTest do
     params =
       hole_params(setup, 0, hd(setup.route).id, %{2 => %{"outcome" => "", "gross_strokes" => ""}})
 
-    _html = render_submit(view, "submit_hole", params)
+    {response, _html} = submit_queued_hole!(view, setup, params)
 
-    assert has_element?(
-             view,
-             "#scorecard-feedback",
-             "Complete every golfer's result before submitting."
-           )
+    assert response == %{status: :rejected, reason: :invalid_submission}
 
     assert has_element?(view, "#current-hole", "Hole 1")
     assert hole_results(setup) == []
@@ -237,8 +335,9 @@ defmodule GolfScoringWeb.Scoring.GroupScorecardLiveTest do
         }
       })
 
-    html = render_submit(view, "submit_hole", picked_up)
+    {response, html} = submit_queued_hole!(view, setup, picked_up)
 
+    assert response.status == :accepted
     assert html =~ "Hole saved"
 
     card =
@@ -252,17 +351,21 @@ defmodule GolfScoringWeb.Scoring.GroupScorecardLiveTest do
     assert picked_up_result.gross_strokes == nil
   end
 
-  test "an accepted receipt advances once even if the old form is submitted again", %{conn: conn} do
+  test "replaying the same queued command returns its receipt without writing twice", %{
+    conn: conn
+  } do
     setup = PaperRecoveryFixtures.setup_submit_fixture!(2)
     {view, _html} = open_scorecard!(conn, setup)
-    old_params = hole_params(setup, 0, hd(setup.route).id)
+    params = hole_params(setup, 0, hd(setup.route).id)
 
-    render_submit(view, "submit_hole", old_params)
+    {first_response, _html} = submit_queued_hole!(view, setup, params)
+    assert first_response.status == :accepted
     assert has_element?(view, "#current-hole", "Hole 2")
 
-    html = render_submit(view, "submit_hole", old_params)
+    {duplicate_response, _html} = submit_queued_hole!(view, setup, params)
 
-    assert html =~ "This scorecard has moved to a newer hole."
+    assert duplicate_response.status == :accepted
+    assert duplicate_response.receipt.id == first_response.receipt.id
     assert has_element?(view, "#current-hole", "Hole 2")
     assert length(hole_results(setup)) == 2
     assert length(hole_submissions(setup)) == 1
@@ -278,11 +381,12 @@ defmodule GolfScoringWeb.Scoring.GroupScorecardLiveTest do
     stale_params_a = hole_params(setup, 0, hd(setup.route).id)
     stale_params_b = hole_params(setup, 0, hd(setup.route).id)
 
-    render_submit(view_a, "submit_hole", stale_params_a)
-    html = render_submit(view_b, "submit_hole", stale_params_b)
+    {current_response, _html} = submit_queued_hole!(view_a, setup, stale_params_a)
+    {stale_response, _html} = submit_queued_hole!(view_b, setup, stale_params_b)
 
-    assert html =~ "This scorecard has moved to a newer hole."
-    assert has_element?(view_b, "#current-hole", "Hole 2")
+    assert current_response.status == :accepted
+    assert stale_response == %{status: :rejected, reason: :stale_group_revision}
+    assert has_element?(view_b, "#current-hole", "Hole 1")
     assert length(hole_results(setup)) == 2
     assert length(hole_submissions(setup)) == 1
     assert Ash.get!(PlayingGroup, setup.group.id, authorize?: false).scoring_revision == 1
@@ -298,7 +402,11 @@ defmodule GolfScoringWeb.Scoring.GroupScorecardLiveTest do
     html =
       Enum.reduce(0..4, html, fn revision, _html ->
         hole = route_hole_at_revision!(setup, revision)
-        render_submit(view, "submit_hole", hole_params(setup, revision, hole.id))
+
+        {_response, html} =
+          submit_queued_hole!(view, setup, hole_params(setup, revision, hole.id))
+
+        html
       end)
 
     assert html =~ "5 of 18 holes complete"
@@ -324,21 +432,19 @@ defmodule GolfScoringWeb.Scoring.GroupScorecardLiveTest do
 
     assert assignment.assignment_version == 2
 
-    html =
-      render_submit(
-        old_view,
-        "submit_hole",
-        hole_params(setup, 0, hd(setup.route).id)
-      )
+    {old_response, _html} =
+      submit_queued_hole!(old_view, setup, hole_params(setup, 0, hd(setup.route).id), 1)
 
-    assert has_element?(old_view, "#scorecard-unavailable")
-    assert html =~ "The scorer assignment changed. This scorecard is no longer active."
+    assert old_response == %{status: :rejected, reason: :stale_authority}
     assert hole_results(setup) == []
     assert hole_submissions(setup) == []
 
     {new_view, _html} = open_scorecard!(conn, setup, new_scorer)
-    html = render_submit(new_view, "submit_hole", hole_params(setup, 0, hd(setup.route).id))
 
+    {new_response, html} =
+      submit_queued_hole!(new_view, setup, hole_params(setup, 0, hd(setup.route).id), 2)
+
+    assert new_response.status == :accepted
     assert html =~ "Hole saved"
     assert has_element?(new_view, "#current-hole", "Hole 2")
     assert length(hole_results(setup)) == 2
@@ -360,10 +466,10 @@ defmodule GolfScoringWeb.Scoring.GroupScorecardLiveTest do
     {view, _html} = open_scorecard!(conn, setup)
     PaperRecoveryFixtures.set_round_state!(setup.round, :scoring_closed)
 
-    html = render_submit(view, "submit_hole", hole_params(setup, 0, hd(setup.route).id))
+    {response, html} = submit_queued_hole!(view, setup, hole_params(setup, 0, hd(setup.route).id))
 
-    assert has_element?(view, "#scorecard-unavailable")
-    assert html =~ "Scoring is unavailable while this round is not open."
+    assert response == %{status: :rejected, reason: :round_closed}
+    assert html =~ "Group scorecard"
     assert hole_results(setup) == []
     assert hole_submissions(setup) == []
   end
@@ -378,8 +484,9 @@ defmodule GolfScoringWeb.Scoring.GroupScorecardLiveTest do
     refute html =~ "GLS-35 Mystery"
     refute html =~ "best"
 
-    html = render_submit(view, "submit_hole", hole_params(setup, 0, hd(setup.route).id))
+    {response, html} = submit_queued_hole!(view, setup, hole_params(setup, 0, hd(setup.route).id))
 
+    assert response.status == :accepted
     assert html =~ "Hole saved"
     assert has_element?(view, "#current-hole", "Hole 2")
     refute html =~ "GLS-35 Mystery"
@@ -411,9 +518,13 @@ defmodule GolfScoringWeb.Scoring.GroupScorecardLiveTest do
 
     {view, _html} = live!(grant_conn, setup)
     final_hole = route_hole_at_revision!(setup, 17)
-    html = render_submit(view, "submit_hole", hole_params(setup, 17, final_hole.id))
+    {response, html} = submit_queued_hole!(view, setup, hole_params(setup, 17, final_hole.id))
 
+    assert response.status == :accepted
     assert html =~ "Group play complete"
+    assert String.contains?(html, "phx-hook=\"ScoringQueue\"")
+    assert String.contains?(html, "id=\"scoring-sync-label\">Checking sync")
+    assert String.contains?(html, "active:scale-[0.98]")
     assert has_element?(view, "#group-play-complete")
     assert has_element?(view, "#group-play-complete .text-base-content", "Round complete")
     assert has_element?(view, "#event-round-context", setup.event.id)
@@ -468,6 +579,54 @@ defmodule GolfScoringWeb.Scoring.GroupScorecardLiveTest do
         "round_hole_id" => hole_id,
         "client_submission_id" => Ecto.UUID.generate(),
         "captured_at" => DateTime.utc_now() |> DateTime.to_iso8601(),
+        "results" => results
+      }
+    }
+  end
+
+  defp submit_queued_hole!(view, setup, %{"scorecard" => values}, assignment_version \\ 1) do
+    command = %{
+      "client_submission_id" => values["client_submission_id"],
+      "playing_group_id" => setup.group.id,
+      "round_hole_id" => values["round_hole_id"],
+      "expected_group_score_revision" => values["expected_group_score_revision"],
+      "role_assignment_version" => Integer.to_string(assignment_version),
+      "captured_at" => values["captured_at"],
+      "results" =>
+        Enum.map(values["results"], fn {round_entry_id, result} ->
+          Map.put(result, "round_entry_id", round_entry_id)
+        end)
+    }
+
+    render_hook(view, "submit_queued_hole", %{"command" => command})
+    %{proxy: {ref, _topic, _}} = view
+    assert_receive {^ref, {:reply, response}}
+
+    {response, render(view)}
+  end
+
+  defp queued_hole_params(setup, revision, hole_id, submission_id, captured_at, updates \\ %{}) do
+    results =
+      setup.entries
+      |> Enum.with_index()
+      |> Enum.map(fn {entry, index} ->
+        values =
+          Map.merge(
+            %{"outcome" => "holed_out", "gross_strokes" => "4", "strokes_taken" => ""},
+            Map.get(updates, index, %{})
+          )
+
+        Map.put(values, "round_entry_id", entry.id)
+      end)
+
+    %{
+      "command" => %{
+        "client_submission_id" => submission_id,
+        "playing_group_id" => setup.group.id,
+        "round_hole_id" => hole_id,
+        "expected_group_score_revision" => Integer.to_string(revision),
+        "role_assignment_version" => "1",
+        "captured_at" => captured_at,
         "results" => results
       }
     }
