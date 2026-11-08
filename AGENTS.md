@@ -5,6 +5,12 @@ This is a web application written using the Phoenix web framework.
 - Run `devcore-project run test -- mix precommit` when code changes are complete, and fix any pending issues
 - Use the already included and available `:req` (`Req`) library for HTTP requests, **avoid** `:httpoison`, `:tesla`, and `:httpc`. Req is included by default and is the preferred HTTP client for Phoenix apps
 
+### Draft PR review requirement
+
+- After every meaningful work checkpoint, review the complete diff for secrets, commit and push the branch, then open or update a single Draft GitHub PR targeting `main` for independent review. Reuse the task's existing PR.
+- Report the PR URL, exact HEAD SHA, changed files, test results and CI status.
+- Stop for independent review before the next task. Do not mark Ready for Review, merge or bypass failing CI without explicit owner authorization.
+
 ### Local development and database
 
 - Use the existing workstation DevCore services. Read `.devcore/project.conf` and `.devcore/render-map.tsv` before changing database or environment configuration.
