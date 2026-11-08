@@ -13,23 +13,77 @@ defmodule GolfScoring.Competition.Services.RequireReviewForCorrectedScoreTest do
   alias GolfScoring.Scoring.Services.PaperRecoveryFixtures, as: Fixtures
 
   @tag :cleanup_safety
-  test "cleanup rejects identities outside the allocated test environment, database and role" do
-    identity = [["golf_scoring_test", "golf_scoring_test"]]
-    assert :ok = validate_cleanup_identity!(:test, identity)
+  test "unboxed writes accept only the allocated local or trusted GitHub Actions identity" do
+    local = %{"CI" => nil, "GITHUB_ACTIONS" => nil, "GITHUB_REPOSITORY" => nil}
 
-    for {environment, rows} <- [
-          {:dev, identity},
-          {:prod, identity},
-          {:test, [["golf_scoring_dev", "golf_scoring_test"]]},
-          {:test, [["golf_scoring_test", "golf_scoring_dev"]]},
-          {:test, [["golf_scoring_test", "golf_scoring_ci"]]},
-          {:test, []}
+    github = %{
+      "CI" => "true",
+      "GITHUB_ACTIONS" => "true",
+      "GITHUB_REPOSITORY" => "JCSchoeman96/golf-scoring"
+    }
+
+    local_rows = [["golf_scoring_test", "golf_scoring_test"]]
+    ci_rows = [["golf_scoring_test", "golf_scoring_ci"]]
+    assert :ok = validate_test_identity!(:test, local_rows, local)
+    assert :ok = validate_test_identity!(:test, ci_rows, github)
+
+    for {environment, rows, runner} <- [
+          {:dev, local_rows, local},
+          {:prod, ci_rows, github},
+          {:test, [["golf_scoring_dev", "golf_scoring_test"]], local},
+          {:test, [["golf_scoring_test", "golf_scoring_dev"]], local},
+          {:test, ci_rows, local},
+          {:test, local_rows, github},
+          {:test, [], local},
+          {:test, ci_rows, Map.put(github, "GITHUB_REPOSITORY", "other/project")},
+          {:test, ci_rows, Map.put(github, "GITHUB_ACTIONS", "false")},
+          {:test, local_rows, Map.put(local, "GITHUB_REPOSITORY", "other/project")},
+          {:test, local_rows, Map.put(local, "CI", "true")}
         ] do
       assert_raise RuntimeError,
-                   "refusing cleanup outside the allocated test database and role",
+                   "refusing unboxed writes outside the allocated test database and role",
                    fn ->
-                     validate_cleanup_identity!(environment, rows)
+                     validate_test_identity!(environment, rows, runner)
                    end
+    end
+  end
+
+  test "unboxed fixture setup rolls back all writes when setup fails" do
+    parent = self()
+
+    assert {:error, :setup_failed} =
+             verified_unboxed_transaction(fn ->
+               fixture = fixture!()
+               send(parent, {:rolled_back_fixture, fixture.event.id})
+               Repo.rollback(:setup_failed)
+             end)
+
+    assert_receive {:rolled_back_fixture, event_id}
+
+    assert [[0]] =
+             Repo.query!("SELECT count(*)::integer FROM events WHERE id = $1::uuid", [
+               uuid(event_id)
+             ]).rows
+  end
+
+  test "verified cleanup removes its committed fixture and preserves unrelated data" do
+    unrelated = fixture!()
+    {:ok, committed} = verified_unboxed_transaction(fn -> fixture!() end)
+
+    try do
+      assert {:ok, _} = cleanup!(committed)
+
+      assert [[0]] =
+               Repo.query!("SELECT count(*)::integer FROM events WHERE id = $1::uuid", [
+                 uuid(committed.event.id)
+               ]).rows
+
+      assert [[1]] =
+               Repo.query!("SELECT count(*)::integer FROM events WHERE id = $1::uuid", [
+                 uuid(unrelated.event.id)
+               ]).rows
+    after
+      cleanup!(committed)
     end
   end
 
@@ -242,7 +296,7 @@ defmodule GolfScoring.Competition.Services.RequireReviewForCorrectedScoreTest do
 
   @tag :real_concurrency
   test "two independent transactions serialize review and the second observes an unchanged review timestamp" do
-    f = Sandbox.unboxed_run(Repo, fn -> fixture!() end)
+    {:ok, f} = verified_unboxed_transaction(fn -> fixture!() end)
     parent = self()
 
     holder =
@@ -300,7 +354,7 @@ defmodule GolfScoring.Competition.Services.RequireReviewForCorrectedScoreTest do
 
   @tag :real_concurrency
   test "membership replacement waits for the round lock then rechecks the scoring lifecycle" do
-    f = Sandbox.unboxed_run(Repo, fn -> fixture!() end)
+    {:ok, f} = verified_unboxed_transaction(fn -> fixture!() end)
     parent = self()
 
     holder =
@@ -513,20 +567,35 @@ defmodule GolfScoring.Competition.Services.RequireReviewForCorrectedScoreTest do
     end
   end
 
-  defp validate_cleanup_identity!(:test, [["golf_scoring_test", "golf_scoring_test"]]), do: :ok
+  defp validate_test_identity!(:test, [["golf_scoring_test", "golf_scoring_test"]], %{
+         "CI" => nil,
+         "GITHUB_ACTIONS" => nil,
+         "GITHUB_REPOSITORY" => nil
+       }),
+       do: :ok
 
-  defp validate_cleanup_identity!(_environment, _rows),
-    do: raise("refusing cleanup outside the allocated test database and role")
+  defp validate_test_identity!(:test, [["golf_scoring_test", "golf_scoring_ci"]], %{
+         "CI" => "true",
+         "GITHUB_ACTIONS" => "true",
+         "GITHUB_REPOSITORY" => "JCSchoeman96/golf-scoring"
+       }),
+       do: :ok
 
-  defp cleanup!(f) do
+  defp validate_test_identity!(_environment, _rows, _runner),
+    do: raise("refusing unboxed writes outside the allocated test database and role")
+
+  defp verified_unboxed_transaction(callback) do
     Sandbox.unboxed_run(Repo, fn ->
       Repo.transaction(fn ->
         rows = Repo.query!("SELECT current_database(), current_user").rows
-        validate_cleanup_identity!(Mix.env(), rows)
-        delete_fixture_rows!(f)
+        runner = Map.new(["CI", "GITHUB_ACTIONS", "GITHUB_REPOSITORY"], &{&1, System.get_env(&1)})
+        validate_test_identity!(Mix.env(), rows, runner)
+        callback.()
       end)
     end)
   end
+
+  defp cleanup!(f), do: verified_unboxed_transaction(fn -> delete_fixture_rows!(f) end)
 
   defp delete_fixture_rows!(f) do
     round = uuid(f.round.id)

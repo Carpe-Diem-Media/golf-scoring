@@ -150,7 +150,7 @@ jobs:
     timeout-minutes: 20
 
     env:
-      TEST_DATABASE_USERNAME: golf_scoring_test
+      TEST_DATABASE_USERNAME: golf_scoring_ci
       TEST_DATABASE_PASSWORD: golf_scoring_ci
       TEST_DATABASE_HOST: localhost
       TEST_DATABASE_PORT: "5432"
@@ -161,7 +161,7 @@ jobs:
         image: postgres:18
 
         env:
-          POSTGRES_USER: golf_scoring_test
+          POSTGRES_USER: golf_scoring_ci
           POSTGRES_PASSWORD: golf_scoring_ci
           POSTGRES_DB: golf_scoring_test
 
@@ -169,7 +169,7 @@ jobs:
           - 5432:5432
 
         options: >-
-          --health-cmd "pg_isready -U golf_scoring_test -d golf_scoring_test"
+          --health-cmd "pg_isready -U golf_scoring_ci -d golf_scoring_test"
           --health-interval 10s
           --health-timeout 5s
           --health-retries 5
