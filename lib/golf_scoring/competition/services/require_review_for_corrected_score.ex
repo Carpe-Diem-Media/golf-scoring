@@ -69,6 +69,17 @@ defmodule GolfScoring.Competition.Services.RequireReviewForCorrectedScore do
   end
 
   @doc false
+  def correction_scope?(evidence) do
+    scope = Process.get(@scope_key)
+
+    Repo.in_transaction?() and is_map(scope) and
+      scope.transaction_id == transaction_id() and
+      Map.take(scope, Map.keys(evidence)) == evidence and
+      scope_current?(scope) and
+      Enum.all?(scope.sides, fn {side, result} -> result_state(result, side) == "provisional" end)
+  end
+
+  @doc false
   def verified_review?(context, result_id, side_id) do
     scope = Process.get(@scope_key)
     proof = Process.get(@proof_key)

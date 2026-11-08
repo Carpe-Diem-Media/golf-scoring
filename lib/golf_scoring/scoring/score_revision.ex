@@ -2,8 +2,8 @@ defmodule GolfScoring.Scoring.ScoreRevision do
   @moduledoc """
   Append-only evidence of a change to a hole result.
 
-  A future correction service must establish actor authority and serialize the
-  revision change under the scorecard lock. This resource has no mutation actions.
+  Creation is restricted to the atomic staff correction coordinator under the
+  scorecard lock. No update or destroy actions are exposed.
   """
 
   use Ash.Resource, domain: GolfScoring.Scoring, data_layer: AshPostgres.DataLayer
@@ -53,6 +53,26 @@ defmodule GolfScoring.Scoring.ScoreRevision do
   end
 
   actions do
+    create :record_correction_internal do
+      public? false
+
+      accept [
+        :hole_result_id,
+        :scorecard_id,
+        :round_id,
+        :actor_staff_user_id,
+        :original_revision,
+        :resulting_revision,
+        :original_outcome,
+        :original_gross_strokes,
+        :new_outcome,
+        :new_gross_strokes,
+        :reason
+      ]
+
+      change {GolfScoring.Scoring.CorrectionWriteGuard, operation: :evidence}
+    end
+
     read :read do
       primary? true
       public? false

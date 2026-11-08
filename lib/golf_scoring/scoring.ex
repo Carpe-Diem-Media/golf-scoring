@@ -14,6 +14,7 @@ defmodule GolfScoring.Scoring do
   alias GolfScoring.Scoring.Services.BuildHandicapSnapshot
   alias GolfScoring.Scoring.Services.ConfirmHandicapInput
   alias GolfScoring.Scoring.Services.ConfirmHandicapInputForPlayerGrant
+  alias GolfScoring.Scoring.Services.CorrectHoleResult
   alias GolfScoring.Scoring.Services.LoadGroupScorecard
   alias GolfScoring.Scoring.Services.OverrideHandicapBasis
   alias GolfScoring.Scoring.Services.SubmitGroupHole
@@ -57,6 +58,17 @@ defmodule GolfScoring.Scoring do
 
   def build_competition_handicap(round_entry_id, round_competition_id, attrs) do
     BuildCompetitionHandicap.run(round_entry_id, round_competition_id, attrs)
+  end
+
+  @doc """
+  Corrects a recorded holed-out gross score as trusted same-event staff.
+
+  Requires expected_revision, new_gross_strokes and reason. Owns its transaction;
+  nested use is rejected. Success includes the committed evidence and a separate
+  notification delivery status. Unsupported review/dispute workflows fail closed.
+  """
+  def correct_hole_result(actor, event_id, round_id, command) do
+    CorrectHoleResult.run(actor, event_id, round_id, command)
   end
 
   def submit_group_hole(actor, event_id, round_id, command) do
