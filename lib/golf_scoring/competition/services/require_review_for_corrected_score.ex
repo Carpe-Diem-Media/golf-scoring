@@ -73,14 +73,22 @@ defmodule GolfScoring.Competition.Services.RequireReviewForCorrectedScore do
     scope = Process.get(@scope_key)
     proof = Process.get(@proof_key)
 
-    Repo.in_transaction?() and is_map(scope) and is_map(proof) and
-      Map.get(context, :corrected_score_review) == proof and
-      proof.token == scope.token and proof.transaction_id == transaction_id() and
-      proof.result_id == result_id and proof.side_id == side_id and
-      {side_id, result_id} in scope.sides and
+    coordinator_proof?(context, scope, proof) and
+      proof_targets_result?(scope, proof, result_id, side_id) and
       scope_current?(scope) and
       blocker(scope, proof.score_revision_id, proof.revision) == {:ok, proof.verification_id} and
       result_state(result_id, side_id) == "provisional"
+  end
+
+  defp coordinator_proof?(context, scope, proof) do
+    Repo.in_transaction?() and is_map(scope) and is_map(proof) and
+      Map.get(context, :corrected_score_review) == proof and
+      proof.token == scope.token and proof.transaction_id == transaction_id()
+  end
+
+  defp proof_targets_result?(scope, proof, result_id, side_id) do
+    proof.result_id == result_id and proof.side_id == side_id and
+      {side_id, result_id} in scope.sides
   end
 
   defp lock_scope!(actor_id, event_id, round_id, hole_id) do
@@ -214,6 +222,26 @@ defmodule GolfScoring.Competition.Services.RequireReviewForCorrectedScore do
   end
 
   defp require_review!(scope, revision_id, expected_revision) do
+    validate_review_scope!(scope)
+
+    with {:ok, revision_id} <- Ecto.UUID.cast(revision_id),
+         true <- is_integer(expected_revision) and expected_revision > 1,
+         {:ok, verification_id} <- blocker(scope, revision_id, expected_revision) do
+      proof = %{
+        token: scope.token,
+        transaction_id: scope.transaction_id,
+        score_revision_id: revision_id,
+        revision: expected_revision,
+        verification_id: verification_id
+      }
+
+      {:ok, Enum.map(scope.sides, &require_side_review!(&1, proof))}
+    else
+      _ -> Repo.rollback(:correction_blocker_not_found)
+    end
+  end
+
+  defp validate_review_scope!(scope) do
     unless Repo.in_transaction?(),
       do: raise(ArgumentError, "review capability requires its owning transaction")
 
@@ -222,47 +250,32 @@ defmodule GolfScoring.Competition.Services.RequireReviewForCorrectedScore do
 
     unless scope_current?(scope), do: Repo.rollback(:affected_side_scope_changed)
     require_supported_states!(scope)
+  end
 
-    with {:ok, revision_id} <- Ecto.UUID.cast(revision_id),
-         true <- is_integer(expected_revision) and expected_revision > 1,
-         {:ok, verification_id} <- blocker(scope, revision_id, expected_revision) do
-      results =
-        Enum.map(scope.sides, fn {side_id, result_id} ->
-          result = Ash.get!(CompetitionSideResult, result_id, authorize?: false)
+  defp require_side_review!({side_id, result_id}, proof) do
+    result = Ash.get!(CompetitionSideResult, result_id, authorize?: false)
 
-          if result.state == :review_required do
-            result
-          else
-            proof = %{
-              token: scope.token,
-              transaction_id: scope.transaction_id,
-              result_id: result_id,
-              side_id: side_id,
-              score_revision_id: revision_id,
-              revision: expected_revision,
-              verification_id: verification_id
-            }
-
-            Process.put(@proof_key, proof)
-
-            try do
-              result
-              |> Changeset.for_update(:require_review_for_corrected_score_internal, %{})
-              |> Changeset.set_context(%{corrected_score_review: proof})
-              |> Ash.update(authorize?: false)
-              |> case do
-                {:ok, updated} -> updated
-                {:error, error} -> Repo.rollback(error)
-              end
-            after
-              Process.delete(@proof_key)
-            end
-          end
-        end)
-
-      {:ok, results}
+    if result.state == :review_required do
+      result
     else
-      _ -> Repo.rollback(:correction_blocker_not_found)
+      update_side_review!(result, Map.merge(proof, %{side_id: side_id, result_id: result_id}))
+    end
+  end
+
+  defp update_side_review!(result, proof) do
+    Process.put(@proof_key, proof)
+
+    try do
+      result
+      |> Changeset.for_update(:require_review_for_corrected_score_internal, %{})
+      |> Changeset.set_context(%{corrected_score_review: proof})
+      |> Ash.update(authorize?: false)
+      |> case do
+        {:ok, updated} -> updated
+        {:error, error} -> Repo.rollback(error)
+      end
+    after
+      Process.delete(@proof_key)
     end
   end
 

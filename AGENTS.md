@@ -2,13 +2,16 @@ This is a web application written using the Phoenix web framework.
 
 ## Project guidelines
 
-- Run `devcore-project run test -- mix precommit` when code changes are complete, and fix any pending issues
+- Before database-backed tests, run `devcore-project doctor` and verify `MIX_ENV=test`, `current_database() = golf_scoring_test` and `current_user = golf_scoring_test` on the actual connection. Stop on any mismatch.
+- Run tests with `MIX_ENV=test devcore-project run test -- mix run -e 'Mix.Tasks.Test.run([])'`. Pass test paths to `Mix.Tasks.Test.run/1` for focused runs.
+- Run `mix format --check-formatted`, `mix compile --warnings-as-errors`, `mix credo --strict` and `mix ash.codegen --check` separately through `MIX_ENV=test devcore-project run test -- <command>`.
 - Use the already included and available `:req` (`Req`) library for HTTP requests, **avoid** `:httpoison`, `:tesla`, and `:httpc`. Req is included by default and is the preferred HTTP client for Phoenix apps
 
 ### Draft PR review requirement
 
 - After every meaningful work checkpoint, review the complete diff for secrets, commit and push the branch, then open or update a single Draft GitHub PR targeting `main` for independent review. Reuse the task's existing PR.
 - Report the PR URL, exact HEAD SHA, changed files, test results and CI status.
+- Never run local `mix test`, `mix precommit`, `ash.setup` or database reset/drop aliases.
 - Stop for independent review before the next task. Do not mark Ready for Review, merge or bypass failing CI without explicit owner authorization.
 
 ### Local development and database

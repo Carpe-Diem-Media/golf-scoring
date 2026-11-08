@@ -12,6 +12,27 @@ defmodule GolfScoring.Competition.Services.RequireReviewForCorrectedScoreTest do
   alias GolfScoring.Scoring
   alias GolfScoring.Scoring.Services.PaperRecoveryFixtures, as: Fixtures
 
+  @tag :cleanup_safety
+  test "cleanup rejects identities outside the allocated test environment, database and role" do
+    identity = [["golf_scoring_test", "golf_scoring_test"]]
+    assert :ok = validate_cleanup_identity!(:test, identity)
+
+    for {environment, rows} <- [
+          {:dev, identity},
+          {:prod, identity},
+          {:test, [["golf_scoring_dev", "golf_scoring_test"]]},
+          {:test, [["golf_scoring_test", "golf_scoring_dev"]]},
+          {:test, [["golf_scoring_test", "golf_scoring_ci"]]},
+          {:test, []}
+        ] do
+      assert_raise RuntimeError,
+                   "refusing cleanup outside the allocated test database and role",
+                   fn ->
+                     validate_cleanup_identity!(environment, rows)
+                   end
+    end
+  end
+
   test "all affected competitions enter review, unrelated sides stay provisional and retries do not write" do
     f = fixture!()
 
@@ -492,47 +513,57 @@ defmodule GolfScoring.Competition.Services.RequireReviewForCorrectedScoreTest do
     end
   end
 
+  defp validate_cleanup_identity!(:test, [["golf_scoring_test", "golf_scoring_test"]]), do: :ok
+
+  defp validate_cleanup_identity!(_environment, _rows),
+    do: raise("refusing cleanup outside the allocated test database and role")
+
   defp cleanup!(f) do
     Sandbox.unboxed_run(Repo, fn ->
       Repo.transaction(fn ->
-        round = uuid(f.round.id)
-
-        for {sql, params} <- [
-              {"DELETE FROM score_verifications WHERE round_id = $1::uuid", [round]},
-              {"DELETE FROM score_revisions WHERE round_id = $1::uuid", [round]},
-              {"DELETE FROM hole_results WHERE round_id = $1::uuid", [round]},
-              {"DELETE FROM hole_submissions WHERE round_id = $1::uuid", [round]},
-              {"DELETE FROM audit_events WHERE context->>'round_id' = $1", [f.round.id]},
-              {"DELETE FROM scorecards WHERE round_id = $1::uuid", [round]},
-              {"DELETE FROM competition_handicaps WHERE round_id = $1::uuid", [round]},
-              {"DELETE FROM handicap_snapshots WHERE round_id = $1::uuid", [round]},
-              {"DELETE FROM competition_side_results WHERE competition_side_id IN (SELECT id FROM competition_sides WHERE round_id = $1::uuid)",
-               [round]},
-              {"DELETE FROM competition_side_memberships WHERE round_id = $1::uuid", [round]},
-              {"DELETE FROM competition_sides WHERE round_id = $1::uuid", [round]},
-              {"DELETE FROM group_role_assignments WHERE round_id = $1::uuid", [round]},
-              {"DELETE FROM round_entries WHERE round_id = $1::uuid", [round]},
-              {"DELETE FROM playing_groups WHERE round_id = $1::uuid", [round]},
-              {"DELETE FROM round_competitions WHERE round_id = $1::uuid", [round]},
-              {"DELETE FROM round_tee_hole_snapshots WHERE round_tee_profile_snapshot_id IN (SELECT id FROM round_tee_profile_snapshots WHERE round_id = $1::uuid)",
-               [round]},
-              {"DELETE FROM round_tee_profile_snapshots WHERE round_id = $1::uuid", [round]},
-              {"DELETE FROM round_holes WHERE round_id = $1::uuid", [round]},
-              {"DELETE FROM rounds WHERE id = $1::uuid", [round]},
-              {"DELETE FROM tee_rating_profiles WHERE id = $1::uuid", [uuid(f.tee_profile.id)]},
-              {"DELETE FROM tee_sets WHERE id = $1::uuid", [uuid(f.tee_set.id)]},
-              {"DELETE FROM course_holes WHERE course_id = $1::uuid", [uuid(f.course.id)]},
-              {"DELETE FROM courses WHERE id = $1::uuid", [uuid(f.course.id)]},
-              {"DELETE FROM event_staff_assignments WHERE event_id = $1::uuid",
-               [uuid(f.event.id)]},
-              {"DELETE FROM events WHERE id = $1::uuid", [uuid(f.event.id)]},
-              {"DELETE FROM staff_users WHERE id = $1::uuid", [uuid(f.admin.id)]}
-            ],
-            do: Repo.query!(sql, params)
-
-        for entry <- f.entries,
-            do: Repo.query!("DELETE FROM players WHERE id = $1::uuid", [uuid(entry.player_id)])
+        rows = Repo.query!("SELECT current_database(), current_user").rows
+        validate_cleanup_identity!(Mix.env(), rows)
+        delete_fixture_rows!(f)
       end)
     end)
+  end
+
+  defp delete_fixture_rows!(f) do
+    round = uuid(f.round.id)
+
+    for {sql, params} <- [
+          {"DELETE FROM score_verifications WHERE round_id = $1::uuid", [round]},
+          {"DELETE FROM score_revisions WHERE round_id = $1::uuid", [round]},
+          {"DELETE FROM hole_results WHERE round_id = $1::uuid", [round]},
+          {"DELETE FROM hole_submissions WHERE round_id = $1::uuid", [round]},
+          {"DELETE FROM audit_events WHERE context->>'round_id' = $1", [f.round.id]},
+          {"DELETE FROM scorecards WHERE round_id = $1::uuid", [round]},
+          {"DELETE FROM competition_handicaps WHERE round_id = $1::uuid", [round]},
+          {"DELETE FROM handicap_snapshots WHERE round_id = $1::uuid", [round]},
+          {"DELETE FROM competition_side_results WHERE competition_side_id IN (SELECT id FROM competition_sides WHERE round_id = $1::uuid)",
+           [round]},
+          {"DELETE FROM competition_side_memberships WHERE round_id = $1::uuid", [round]},
+          {"DELETE FROM competition_sides WHERE round_id = $1::uuid", [round]},
+          {"DELETE FROM group_role_assignments WHERE round_id = $1::uuid", [round]},
+          {"DELETE FROM round_entries WHERE round_id = $1::uuid", [round]},
+          {"DELETE FROM playing_groups WHERE round_id = $1::uuid", [round]},
+          {"DELETE FROM round_competitions WHERE round_id = $1::uuid", [round]},
+          {"DELETE FROM round_tee_hole_snapshots WHERE round_tee_profile_snapshot_id IN (SELECT id FROM round_tee_profile_snapshots WHERE round_id = $1::uuid)",
+           [round]},
+          {"DELETE FROM round_tee_profile_snapshots WHERE round_id = $1::uuid", [round]},
+          {"DELETE FROM round_holes WHERE round_id = $1::uuid", [round]},
+          {"DELETE FROM rounds WHERE id = $1::uuid", [round]},
+          {"DELETE FROM tee_rating_profiles WHERE id = $1::uuid", [uuid(f.tee_profile.id)]},
+          {"DELETE FROM tee_sets WHERE id = $1::uuid", [uuid(f.tee_set.id)]},
+          {"DELETE FROM course_holes WHERE course_id = $1::uuid", [uuid(f.course.id)]},
+          {"DELETE FROM courses WHERE id = $1::uuid", [uuid(f.course.id)]},
+          {"DELETE FROM event_staff_assignments WHERE event_id = $1::uuid", [uuid(f.event.id)]},
+          {"DELETE FROM events WHERE id = $1::uuid", [uuid(f.event.id)]},
+          {"DELETE FROM staff_users WHERE id = $1::uuid", [uuid(f.admin.id)]}
+        ],
+        do: Repo.query!(sql, params)
+
+    for entry <- f.entries,
+        do: Repo.query!("DELETE FROM players WHERE id = $1::uuid", [uuid(entry.player_id)])
   end
 end
