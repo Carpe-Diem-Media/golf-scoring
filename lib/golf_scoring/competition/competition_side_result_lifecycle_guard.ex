@@ -1,7 +1,8 @@
 defmodule GolfScoring.Competition.CompetitionSideResultLifecycleGuard do
-  @moduledoc "Guards CompetitionSideResult transitions; only the pre-play coordinator can exclude a provisional result."
+  @moduledoc "Guards coordinator-owned correction review and pre-play exclusion; other readiness transitions remain unavailable."
 
   alias GolfScoring.Competition.Services.ExcludeCompetitionSideBeforeHole
+  alias GolfScoring.Competition.Services.RequireReviewForCorrectedScore
 
   use Ash.Resource.Change
 
@@ -11,13 +12,40 @@ defmodule GolfScoring.Competition.CompetitionSideResultLifecycleGuard do
   def change(changeset, opts, _context) do
     operation = Keyword.fetch!(opts, :operation)
 
-    if operation == :exclude_before_hole_internal do
-      guard_preplay_exclusion(changeset)
-    else
-      Ash.Changeset.before_action(changeset, fn changeset ->
-        Ash.Changeset.add_error(changeset, field: :state, message: transition_message(operation))
-      end)
+    case operation do
+      :exclude_before_hole_internal ->
+        guard_preplay_exclusion(changeset)
+
+      :require_review_for_corrected_score_internal ->
+        guard_correction_review(changeset)
+
+      _ ->
+        Ash.Changeset.before_action(changeset, fn changeset ->
+          Ash.Changeset.add_error(changeset,
+            field: :state,
+            message: transition_message(operation)
+          )
+        end)
     end
+  end
+
+  defp guard_correction_review(changeset) do
+    Ash.Changeset.before_action(changeset, fn changeset ->
+      if provisional_result?(changeset.data) and
+           RequireReviewForCorrectedScore.verified_review?(
+             changeset.context,
+             changeset.data.id,
+             changeset.data.competition_side_id
+           ) do
+        Ash.Changeset.force_change_attribute(changeset, :state, :review_required)
+      else
+        Ash.Changeset.add_error(changeset,
+          field: :state,
+          message:
+            "correction review requires locked current evidence in its coordinator transaction"
+        )
+      end
+    end)
   end
 
   defp guard_preplay_exclusion(changeset) do

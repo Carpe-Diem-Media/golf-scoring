@@ -25,6 +25,8 @@ defmodule GolfScoring.Scoring do
     resource GolfScoring.Scoring.Scorecard
     resource GolfScoring.Scoring.HoleResult
     resource GolfScoring.Scoring.ScoreVerification
+    resource GolfScoring.Scoring.ScoreQuery
+    resource GolfScoring.Scoring.ScoreRevision
     resource GolfScoring.Scoring.HoleSubmission
   end
 

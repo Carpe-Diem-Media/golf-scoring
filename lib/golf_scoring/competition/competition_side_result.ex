@@ -94,6 +94,16 @@ defmodule GolfScoring.Competition.CompetitionSideResult do
               operation: :mark_review_required}
     end
 
+    update :require_review_for_corrected_score_internal do
+      public? false
+      accept []
+      require_atomic? false
+      atomic_upgrade? false
+
+      change {GolfScoring.Competition.CompetitionSideResultLifecycleGuard,
+              operation: :require_review_for_corrected_score_internal}
+    end
+
     update :mark_ready_to_finalize do
       public? false
       accept []
