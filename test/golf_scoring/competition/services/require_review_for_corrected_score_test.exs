@@ -67,24 +67,55 @@ defmodule GolfScoring.Competition.Services.RequireReviewForCorrectedScoreTest do
   end
 
   test "verified cleanup removes its committed fixture and preserves unrelated data" do
-    unrelated = fixture!()
-    {:ok, committed} = verified_unboxed_transaction(fn -> fixture!() end)
+    committed = recorded_cleanup_fixture!()
 
     try do
-      assert {:ok, _} = cleanup!(committed)
+      unrelated = recorded_cleanup_fixture!()
 
-      assert [[0]] =
-               Repo.query!("SELECT count(*)::integer FROM events WHERE id = $1::uuid", [
-                 uuid(committed.event.id)
-               ]).rows
+      try do
+        assert {:ok, _} = cleanup!(committed)
 
-      assert [[1]] =
-               Repo.query!("SELECT count(*)::integer FROM events WHERE id = $1::uuid", [
-                 uuid(unrelated.event.id)
-               ]).rows
+        assert {:ok, {[[0]], [[1]], [[1]]}} =
+                 verified_unboxed_transaction(fn ->
+                   {
+                     Repo.query!("SELECT count(*)::integer FROM events WHERE id = $1::uuid", [
+                       uuid(committed.event.id)
+                     ]).rows,
+                     Repo.query!("SELECT count(*)::integer FROM events WHERE id = $1::uuid", [
+                       uuid(unrelated.event.id)
+                     ]).rows,
+                     Repo.query!(
+                       "SELECT count(*)::integer FROM score_revisions WHERE id = $1::uuid",
+                       [uuid(unrelated.revision_id)]
+                     ).rows
+                   }
+                 end)
+      after
+        cleanup!(unrelated)
+      end
     after
       cleanup!(committed)
     end
+  end
+
+  defp recorded_cleanup_fixture! do
+    {:ok, fixture} = verified_unboxed_transaction(fn -> fixture!() end)
+    # Retain exact ownership immediately, even if a later setup/assertion fails.
+    on_exit({:owned_cleanup_fixture, fixture.event.id}, fn -> cleanup!(fixture) end)
+
+    IO.puts(
+      "GLS-41 owned fixture " <>
+        inspect(%{
+          event_id: fixture.event.id,
+          round_id: fixture.round.id,
+          revision_id: fixture.revision_id,
+          hole_result_id: fixture.hole_id,
+          scorecard_id: fixture.card_id,
+          side_result_ids: fixture.affected_result_ids ++ [fixture.unrelated_result_id]
+        })
+    )
+
+    fixture
   end
 
   test "all affected competitions enter review, unrelated sides stay provisional and retries do not write" do
@@ -296,7 +327,7 @@ defmodule GolfScoring.Competition.Services.RequireReviewForCorrectedScoreTest do
 
   @tag :real_concurrency
   test "two independent transactions serialize review and the second observes an unchanged review timestamp" do
-    {:ok, f} = verified_unboxed_transaction(fn -> fixture!() end)
+    f = recorded_cleanup_fixture!()
     parent = self()
 
     holder =
@@ -354,7 +385,7 @@ defmodule GolfScoring.Competition.Services.RequireReviewForCorrectedScoreTest do
 
   @tag :real_concurrency
   test "membership replacement waits for the round lock then rechecks the scoring lifecycle" do
-    {:ok, f} = verified_unboxed_transaction(fn -> fixture!() end)
+    f = recorded_cleanup_fixture!()
     parent = self()
 
     holder =
@@ -407,6 +438,99 @@ defmodule GolfScoring.Competition.Services.RequireReviewForCorrectedScoreTest do
       send(holder.pid, :release)
       Task.shutdown(holder, 15_000)
       cleanup!(f)
+    end
+  end
+
+  @tag :real_concurrency
+  test "cleanup conceals its disabled guard and protects unrelated committed evidence" do
+    f = recorded_cleanup_fixture!()
+    unrelated = recorded_cleanup_fixture!()
+    parent = self()
+
+    holder =
+      Task.async(fn ->
+        receive do
+          :start -> cleanup!(f)
+        end
+      end)
+
+    handler = {__MODULE__, make_ref()}
+
+    :ok =
+      :telemetry.attach(handler, [:golf_scoring, :repo, :query], &__MODULE__.hold_cleanup/4, %{
+        owner: holder.pid,
+        parent: parent
+      })
+
+    send(holder.pid, :start)
+
+    try do
+      assert_receive {:cleanup_held, holder_pid}, 10_000
+
+      {:ok, visible} =
+        verified_unboxed_transaction(fn ->
+          Repo.query!(
+            "SELECT tgenabled::text FROM pg_trigger WHERE tgrelid = 'public.score_revisions'::regclass AND tgname = 'score_revisions_immutable_rows'"
+          ).rows
+        end)
+
+      assert visible == [["A"]]
+
+      contender =
+        Task.async(fn ->
+          verified_unboxed_transaction(fn ->
+            send(parent, {:cleanup_contender, backend_pid!()})
+
+            Repo.query(
+              "UPDATE score_revisions SET reason = 'rewrite attempt' WHERE id = $1::uuid",
+              [uuid(unrelated.revision_id)],
+              mode: :savepoint
+            )
+          end)
+        end)
+
+      try do
+        assert_receive {:cleanup_contender, contender_pid}, 10_000
+        assert holder_pid != contender_pid
+        await_blocked!(contender_pid, holder_pid)
+        send(holder.pid, :release)
+        assert {:ok, _} = Task.await(holder, 15_000)
+
+        assert {:ok, {:error, %Postgrex.Error{postgres: %{pg_code: "55000"}}}} =
+                 Task.await(contender, 15_000)
+
+        {:ok, rows} =
+          verified_unboxed_transaction(fn ->
+            Repo.query!("SELECT reason FROM score_revisions WHERE id = $1::uuid", [
+              uuid(unrelated.revision_id)
+            ]).rows
+          end)
+
+        assert rows == [["test"]]
+      after
+        send(holder.pid, :release)
+        Task.shutdown(contender, 15_000)
+      end
+    after
+      :telemetry.detach(handler)
+      send(holder.pid, :release)
+      Task.shutdown(holder, 15_000)
+      cleanup!(f)
+      cleanup!(unrelated)
+    end
+  end
+
+  @doc false
+  def hold_cleanup(_event, _measurements, metadata, %{owner: owner, parent: parent}) do
+    if self() == owner and
+         String.contains?(metadata.query, "DISABLE TRIGGER score_revisions_immutable_rows") do
+      send(parent, {:cleanup_held, backend_pid!()})
+
+      receive do
+        :release -> :ok
+      after
+        10_000 -> raise "timed out holding test cleanup transaction"
+      end
     end
   end
 
@@ -595,7 +719,31 @@ defmodule GolfScoring.Competition.Services.RequireReviewForCorrectedScoreTest do
     end)
   end
 
-  defp cleanup!(f), do: verified_unboxed_transaction(fn -> delete_fixture_rows!(f) end)
+  defp cleanup!(f) do
+    verified_unboxed_transaction(fn ->
+      # Test-only DDL, after same-connection identity validation. The exclusive
+      # lock is held until commit, so other sessions cannot use a disabled guard.
+      Repo.query!("SET LOCAL lock_timeout = '5s'")
+      Repo.query!("LOCK TABLE public.score_revisions IN ACCESS EXCLUSIVE MODE")
+
+      Repo.query!(
+        "ALTER TABLE public.score_revisions DISABLE TRIGGER score_revisions_immutable_rows"
+      )
+
+      try do
+        delete_fixture_rows!(f)
+      after
+        Repo.query!(
+          "ALTER TABLE public.score_revisions ENABLE ALWAYS TRIGGER score_revisions_immutable_rows"
+        )
+      end
+
+      assert [["A"], ["A"]] =
+               Repo.query!(
+                 "SELECT tgenabled::text FROM pg_trigger WHERE tgrelid = 'public.score_revisions'::regclass AND tgname IN ('score_revisions_immutable_rows', 'score_revisions_immutable_truncate') ORDER BY tgname"
+               ).rows
+    end)
+  end
 
   defp delete_fixture_rows!(f) do
     round = uuid(f.round.id)

@@ -345,7 +345,7 @@ defmodule GolfScoring.Scoring.Services.CorrectHoleResultTest do
 
   @tag :real_concurrency
   test "correction waiting behind verification supersedes the newly committed certification" do
-    {:ok, f} = verified_unboxed_transaction(fn -> fixture!() |> with_verifier!() end)
+    f = recorded_cleanup_fixture!()
     parent = self()
 
     holder =
@@ -407,7 +407,7 @@ defmodule GolfScoring.Scoring.Services.CorrectHoleResultTest do
   end
 
   defp with_competing_correction(operation) do
-    {:ok, f} = verified_unboxed_transaction(fn -> fixture!() |> with_verifier!() end)
+    f = recorded_cleanup_fixture!()
     Phoenix.PubSub.subscribe(GolfScoring.PubSub, "round:#{f.round.id}")
     parent = self()
 
@@ -745,7 +745,49 @@ defmodule GolfScoring.Scoring.Services.CorrectHoleResultTest do
     end)
   end
 
-  defp cleanup!(f), do: verified_unboxed_transaction(fn -> delete_fixture_rows!(f) end)
+  defp recorded_cleanup_fixture! do
+    {:ok, fixture} = verified_unboxed_transaction(fn -> fixture!() |> with_verifier!() end)
+    on_exit({:owned_cleanup_fixture, fixture.event.id}, fn -> cleanup!(fixture) end)
+
+    IO.puts(
+      "GLS-41 owned fixture " <>
+        inspect(%{
+          event_id: fixture.event.id,
+          round_id: fixture.round.id,
+          hole_result_id: fixture.hole_id,
+          scorecard_id: fixture.card_id,
+          side_result_ids: fixture.affected_result_ids ++ [fixture.unrelated_result_id]
+        })
+    )
+
+    fixture
+  end
+
+  defp cleanup!(f) do
+    verified_unboxed_transaction(fn ->
+      # Test-only DDL, after same-connection identity validation. The exclusive
+      # lock is held until commit, so other sessions cannot use a disabled guard.
+      Repo.query!("SET LOCAL lock_timeout = '5s'")
+      Repo.query!("LOCK TABLE public.score_revisions IN ACCESS EXCLUSIVE MODE")
+
+      Repo.query!(
+        "ALTER TABLE public.score_revisions DISABLE TRIGGER score_revisions_immutable_rows"
+      )
+
+      try do
+        delete_fixture_rows!(f)
+      after
+        Repo.query!(
+          "ALTER TABLE public.score_revisions ENABLE ALWAYS TRIGGER score_revisions_immutable_rows"
+        )
+      end
+
+      assert [["A"], ["A"]] =
+               Repo.query!(
+                 "SELECT tgenabled::text FROM pg_trigger WHERE tgrelid = 'public.score_revisions'::regclass AND tgname IN ('score_revisions_immutable_rows', 'score_revisions_immutable_truncate') ORDER BY tgname"
+               ).rows
+    end)
+  end
 
   defp delete_fixture_rows!(f) do
     round = uuid(f.round.id)
