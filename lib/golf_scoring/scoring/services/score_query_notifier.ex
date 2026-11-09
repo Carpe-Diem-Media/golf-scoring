@@ -1,7 +1,13 @@
 defmodule GolfScoring.Scoring.Services.ScoreQueryNotifier do
   @moduledoc false
 
-  def publish(opened, server \\ GolfScoring.PubSub) do
+  def publish(opened, server \\ GolfScoring.PubSub),
+    do: broadcast(opened, :score_query_opened, server)
+
+  def publish_escalated(escalated, server \\ GolfScoring.PubSub),
+    do: broadcast(escalated, :score_query_escalated, server)
+
+  defp broadcast(opened, event, server) do
     query = opened.score_query
 
     payload = %{
@@ -14,7 +20,7 @@ defmodule GolfScoring.Scoring.Services.ScoreQueryNotifier do
       affected_side_result_ids: Enum.map(opened.side_results, & &1.id)
     }
 
-    Phoenix.PubSub.broadcast(server, "round:#{query.round_id}", {:score_query_opened, payload})
+    Phoenix.PubSub.broadcast(server, "round:#{query.round_id}", {event, payload})
   rescue
     _ -> {:error, :pubsub_unavailable}
   catch

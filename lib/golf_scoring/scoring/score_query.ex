@@ -4,7 +4,8 @@ defmodule GolfScoring.Scoring.ScoreQuery do
 
   Open and escalated queries are unresolved; resolved and dismissed queries are
   terminal. Staff creation is restricted to OpenScoreQuery and its atomic review
-  transaction. Escalation and terminal transitions remain unavailable.
+  transaction. Staff escalation is restricted to EscalateScoreQuery with atomic audit.
+  Terminal transitions remain unavailable.
   """
 
   use Ash.Resource, domain: GolfScoring.Scoring, data_layer: AshPostgres.DataLayer
@@ -68,6 +69,14 @@ defmodule GolfScoring.Scoring.ScoreQuery do
       ]
 
       change GolfScoring.Scoring.ScoreQueryOpenGuard
+    end
+
+    update :escalate_internal do
+      public? false
+      accept []
+      require_atomic? false
+      atomic_upgrade? false
+      change GolfScoring.Scoring.ScoreQueryEscalationGuard
     end
 
     read :read do

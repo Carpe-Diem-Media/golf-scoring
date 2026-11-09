@@ -15,6 +15,7 @@ defmodule GolfScoring.Scoring do
   alias GolfScoring.Scoring.Services.ConfirmHandicapInput
   alias GolfScoring.Scoring.Services.ConfirmHandicapInputForPlayerGrant
   alias GolfScoring.Scoring.Services.CorrectHoleResult
+  alias GolfScoring.Scoring.Services.EscalateScoreQuery
   alias GolfScoring.Scoring.Services.LoadGroupScorecard
   alias GolfScoring.Scoring.Services.OpenScoreQuery
   alias GolfScoring.Scoring.Services.OverrideHandicapBasis
@@ -59,6 +60,19 @@ defmodule GolfScoring.Scoring do
 
   def build_competition_handicap(round_entry_id, round_competition_id, attrs) do
     BuildCompetitionHandicap.run(round_entry_id, round_competition_id, attrs)
+  end
+
+  @doc """
+  Escalates an open current-revision dispute as trusted same-event staff.
+
+  Requires score_query_id, expected_revision and an escalation reason. Allows
+  Event Admin, Competition Manager and Scoring Support. The service owns its
+  outer transaction; duplicate escalation is a conflict. Audit is atomic and
+  notification status is separate from committed success. Admin-attention UI
+  and player escalation remain separate release gates.
+  """
+  def escalate_score_query(actor, event_id, round_id, command) do
+    EscalateScoreQuery.run(actor, event_id, round_id, command)
   end
 
   @doc """
