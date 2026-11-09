@@ -16,6 +16,7 @@ defmodule GolfScoring.Scoring do
   alias GolfScoring.Scoring.Services.ConfirmHandicapInputForPlayerGrant
   alias GolfScoring.Scoring.Services.CorrectHoleResult
   alias GolfScoring.Scoring.Services.LoadGroupScorecard
+  alias GolfScoring.Scoring.Services.OpenScoreQuery
   alias GolfScoring.Scoring.Services.OverrideHandicapBasis
   alias GolfScoring.Scoring.Services.SubmitGroupHole
   alias GolfScoring.Scoring.Services.VerifyHoleResult
@@ -58,6 +59,18 @@ defmodule GolfScoring.Scoring do
 
   def build_competition_handicap(round_entry_id, round_competition_id, attrs) do
     BuildCompetitionHandicap.run(round_entry_id, round_competition_id, attrs)
+  end
+
+  @doc """
+  Opens a current-revision dispute as trusted same-event staff.
+
+  Requires hole_result_id, expected_revision and a nonblank reason. The service
+  owns its transaction and reviews the Scorecard and all affected provisional
+  sides atomically with the query and audit. Notification status is separate
+  from committed success. Player initiation and query resolution are unavailable.
+  """
+  def query_hole_result(actor, event_id, round_id, command) do
+    OpenScoreQuery.run(actor, event_id, round_id, command)
   end
 
   @doc """

@@ -48,6 +48,14 @@ defmodule GolfScoring.Scoring.Scorecard do
       accept [:round_id, :round_entry_id]
     end
 
+    update :require_review_for_open_query_internal do
+      public? false
+      accept []
+      require_atomic? false
+      atomic_upgrade? false
+      change GolfScoring.Scoring.ScorecardQueryReviewGuard
+    end
+
     update :mark_in_progress_internal do
       public? false
       accept []

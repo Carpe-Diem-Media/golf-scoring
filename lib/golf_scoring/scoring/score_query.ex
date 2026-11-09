@@ -3,8 +3,8 @@ defmodule GolfScoring.Scoring.ScoreQuery do
   A dispute against one revision of a hole result.
 
   Open and escalated queries are unresolved; resolved and dismissed queries are
-  terminal. Future services must guard transitions and current revision under
-  the scorecard lock. This resource exposes no mutation actions.
+  terminal. Staff creation is restricted to OpenScoreQuery and its atomic review
+  transaction. Escalation and terminal transitions remain unavailable.
   """
 
   use Ash.Resource, domain: GolfScoring.Scoring, data_layer: AshPostgres.DataLayer
@@ -55,6 +55,21 @@ defmodule GolfScoring.Scoring.ScoreQuery do
   end
 
   actions do
+    create :open_internal do
+      public? false
+
+      accept [
+        :hole_result_id,
+        :scorecard_id,
+        :round_id,
+        :hole_result_revision,
+        :requested_by_staff_user_id,
+        :reason
+      ]
+
+      change GolfScoring.Scoring.ScoreQueryOpenGuard
+    end
+
     read :read do
       primary? true
       public? false

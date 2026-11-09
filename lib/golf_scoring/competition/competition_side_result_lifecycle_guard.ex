@@ -1,8 +1,9 @@
 defmodule GolfScoring.Competition.CompetitionSideResultLifecycleGuard do
-  @moduledoc "Guards coordinator-owned correction review and pre-play exclusion; other readiness transitions remain unavailable."
+  @moduledoc "Guards coordinator-owned query/correction review and pre-play exclusion; other readiness transitions remain unavailable."
 
   alias GolfScoring.Competition.Services.ExcludeCompetitionSideBeforeHole
   alias GolfScoring.Competition.Services.RequireReviewForCorrectedScore
+  alias GolfScoring.Scoring.Services.OpenScoreQuery
 
   use Ash.Resource.Change
 
@@ -15,6 +16,9 @@ defmodule GolfScoring.Competition.CompetitionSideResultLifecycleGuard do
     case operation do
       :exclude_before_hole_internal ->
         guard_preplay_exclusion(changeset)
+
+      :require_review_for_open_query_internal ->
+        Ash.Changeset.before_action(changeset, &OpenScoreQuery.prepare_review(&1, :side))
 
       :require_review_for_corrected_score_internal ->
         guard_correction_review(changeset)
