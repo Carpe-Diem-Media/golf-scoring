@@ -15,6 +15,7 @@ defmodule GolfScoring.Scoring do
   alias GolfScoring.Scoring.Services.ConfirmHandicapInput
   alias GolfScoring.Scoring.Services.ConfirmHandicapInputForPlayerGrant
   alias GolfScoring.Scoring.Services.CorrectHoleResult
+  alias GolfScoring.Scoring.Services.DecideScoreQuery
   alias GolfScoring.Scoring.Services.EscalateScoreQuery
   alias GolfScoring.Scoring.Services.LoadGroupScorecard
   alias GolfScoring.Scoring.Services.OpenScoreQuery
@@ -73,6 +74,30 @@ defmodule GolfScoring.Scoring do
   """
   def escalate_score_query(actor, event_id, round_id, command) do
     EscalateScoreQuery.run(actor, event_id, round_id, command)
+  end
+
+  @doc """
+  Terminates an open or escalated dispute as trusted same-event staff.
+
+  Requires `score_query_id`, `expected_revision`, `reason`, and `decision`
+  (`:resolve_no_change` or `:dismiss`). Allows Event Admin and Competition Manager only.
+  Correction-based resolution is unsupported. The service owns its outer transaction.
+  """
+  def decide_score_query(actor, event_id, round_id, command) do
+    DecideScoreQuery.run(actor, event_id, round_id, command)
+  end
+
+  def resolve_score_query_no_change(actor, event_id, round_id, command) do
+    DecideScoreQuery.run(
+      actor,
+      event_id,
+      round_id,
+      Map.put(command, :decision, :resolve_no_change)
+    )
+  end
+
+  def dismiss_score_query(actor, event_id, round_id, command) do
+    DecideScoreQuery.run(actor, event_id, round_id, Map.put(command, :decision, :dismiss))
   end
 
   @doc """
