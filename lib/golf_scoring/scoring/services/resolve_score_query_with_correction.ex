@@ -14,6 +14,7 @@ defmodule GolfScoring.Scoring.Services.ResolveScoreQueryWithCorrection do
   alias GolfScoring.Repo
   alias GolfScoring.Scoring.ScoreQuery
   alias GolfScoring.Scoring.Services.CorrectHoleResult
+  alias GolfScoring.Scoring.Services.CorrectionNotifier
 
   @scope_key {__MODULE__, :scope}
   @query_gate_key {__MODULE__, :query}
@@ -97,15 +98,28 @@ defmodule GolfScoring.Scoring.Services.ResolveScoreQueryWithCorrection do
     case Repo.transaction(fn ->
            transaction_resolve(actor, event_id, round_id, command, query)
          end) do
-      {:ok, {:ok, result}} -> {:ok, result}
-      {:error, _} = error -> error
+      {:ok, {:ok, result}} ->
+        {:ok, Map.put(result, :notification, CorrectionNotifier.publish(result))}
+
+      {:error, _} = error ->
+        error
     end
   end
 
   defp transaction_resolve(actor, event_id, round_id, command, query) do
-    Review.with_locked_scope(actor, event_id, round_id, query.hole_result_id, fn review ->
-      resolve_locked!(actor, event_id, round_id, command, query, review)
-    end)
+    Process.put(@scope_key, %{
+      query_id: query.id,
+      query_revision: command.revision,
+      transaction_id: transaction_id()
+    })
+
+    try do
+      Review.with_locked_scope(actor, event_id, round_id, query.hole_result_id, fn review ->
+        resolve_locked!(actor, event_id, round_id, command, query, review)
+      end)
+    after
+      Process.delete(@scope_key)
+    end
   end
 
   defp resolve_locked!(actor, event_id, round_id, command, query, review) do
@@ -120,67 +134,57 @@ defmodule GolfScoring.Scoring.Services.ResolveScoreQueryWithCorrection do
       reason: command.reason
     }
 
-    Process.put(@scope_key, %{
+    correction =
+      CorrectHoleResult.correct_locked_for_query_resolution!(
+        actor,
+        event_id,
+        round_id,
+        correction_command,
+        review,
+        query.id
+      )
+
+    query_gate = %{
       query_id: query.id,
+      actor_id: actor.id,
+      event_id: event_id,
+      round_id: round_id,
+      hole_id: query.hole_result_id,
+      card_id: query.scorecard_id,
       query_revision: command.revision,
-      transaction_id: transaction_id()
-    })
+      reason: command.reason,
+      original: Map.take(query, @evidence_fields),
+      original_status: query.status,
+      resulting_revision: correction.hole_result.revision,
+      token: make_ref(),
+      transaction_id: transaction_id(),
+      phase: :ready
+    }
+
+    Process.put(@query_gate_key, query_gate)
 
     try do
-      correction =
-        CorrectHoleResult.correct_locked_for_query_resolution!(
-          actor,
-          event_id,
-          round_id,
-          correction_command,
-          review,
-          query.id
-        )
+      resolved =
+        query
+        |> Changeset.for_update(:resolve_with_correction_internal, %{})
+        |> Changeset.set_context(%{score_query_resolution: query_gate.token})
+        |> Ash.update(authorize?: false)
+        |> unwrap!()
 
-      query_gate = %{
-        query_id: query.id,
-        actor_id: actor.id,
-        event_id: event_id,
-        round_id: round_id,
-        hole_id: query.hole_result_id,
-        card_id: query.scorecard_id,
-        query_revision: command.revision,
-        reason: command.reason,
-        original: Map.take(query, @evidence_fields),
-        original_status: query.status,
-        resulting_revision: correction.hole_result.revision,
-        token: make_ref(),
-        transaction_id: transaction_id(),
-        phase: :ready
-      }
+      case Process.get(@query_gate_key) do
+        %{phase: :complete, query_audit: audit} ->
+          {:ok,
+           Map.merge(correction, %{
+             score_query: resolved,
+             query_audit: audit,
+             event_id: event_id
+           })}
 
-      Process.put(@query_gate_key, query_gate)
-
-      try do
-        resolved =
-          query
-          |> Changeset.for_update(:resolve_with_correction_internal, %{})
-          |> Changeset.set_context(%{score_query_resolution: query_gate.token})
-          |> Ash.update(authorize?: false)
-          |> unwrap!()
-
-        case Process.get(@query_gate_key) do
-          %{phase: :complete, query_audit: audit} ->
-            {:ok,
-             Map.merge(correction, %{
-               score_query: resolved,
-               query_audit: audit,
-               event_id: event_id
-             })}
-
-          _ ->
-            Repo.rollback(:incomplete_query_resolution)
-        end
-      after
-        Process.delete(@query_gate_key)
+        _ ->
+          Repo.rollback(:incomplete_query_resolution)
       end
     after
-      Process.delete(@scope_key)
+      Process.delete(@query_gate_key)
     end
   end
 

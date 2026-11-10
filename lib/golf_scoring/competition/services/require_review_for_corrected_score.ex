@@ -207,10 +207,20 @@ defmodule GolfScoring.Competition.Services.RequireReviewForCorrectedScore do
     rows = side_rows(entry_id, round_id)
 
     cond do
-      rows == [] -> Repo.rollback(:no_affected_sides)
-      Enum.any?(rows, fn [_, result] -> is_nil(result) end) -> Repo.rollback(:missing_side_result)
-      length(rows) != length(Enum.uniq(rows)) -> Repo.rollback(:invalid_side_scope)
-      true -> Enum.map(rows, &List.to_tuple/1)
+      rows == [] and ResolveScoreQueryWithCorrection.active_scope?() ->
+        []
+
+      rows == [] ->
+        Repo.rollback(:no_affected_sides)
+
+      Enum.any?(rows, fn [_, result] -> is_nil(result) end) ->
+        Repo.rollback(:missing_side_result)
+
+      length(rows) != length(Enum.uniq(rows)) ->
+        Repo.rollback(:invalid_side_scope)
+
+      true ->
+        Enum.map(rows, &List.to_tuple/1)
     end
   end
 

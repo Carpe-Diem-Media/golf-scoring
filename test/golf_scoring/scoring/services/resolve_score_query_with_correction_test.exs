@@ -7,6 +7,7 @@ defmodule GolfScoring.Scoring.Services.ResolveScoreQueryWithCorrectionTest do
   alias GolfScoring.Competition.RoundCompetition
   alias GolfScoring.Scoring
   alias GolfScoring.Scoring.ScoreQuery
+  alias GolfScoring.Scoring.Services.CorrectionNotifier
   alias GolfScoring.Scoring.Services.PaperRecoveryFixtures, as: Fixtures
 
   test "authorized resolution with correction from open" do
@@ -139,6 +140,116 @@ defmodule GolfScoring.Scoring.Services.ResolveScoreQueryWithCorrectionTest do
       assert {:error, _} = resolve(f, attrs)
       assert snapshot(f) == before
     end
+  end
+
+  test "publishes correction notification only after commit" do
+    f = opened_fixture!()
+    Phoenix.PubSub.subscribe(GolfScoring.PubSub, "round:#{f.round.id}")
+
+    assert {:ok, result} = resolve(f, %{new_gross_strokes: 6, reason: "notify"})
+
+    assert result.notification == :ok
+    assert_receive {:hole_result_corrected, payload}
+
+    assert payload == %{
+             event_id: f.event.id,
+             round_id: f.round.id,
+             playing_group_id: f.group.id,
+             hole_result_id: f.hole_id,
+             scorecard_id: f.card_id,
+             resulting_revision: 2,
+             affected_side_result_ids: Enum.map(result.side_results, & &1.id)
+           }
+
+    refute_receive {:hole_result_corrected, _}
+    committed = snapshot(f)
+
+    assert {:error, :pubsub_unavailable} =
+             CorrectionNotifier.publish(result, GLS41MissingPubSub)
+
+    assert snapshot(f) == committed
+  end
+
+  test "noncompetitive open dispute resolves with correction and no side reviews" do
+    f = fixture!()
+
+    Repo.query!("DELETE FROM competition_side_memberships WHERE round_entry_id = $1::uuid", [
+      uuid(hd(f.entries).id)
+    ])
+
+    f = open!(f)
+
+    assert {:ok, result} = resolve(f, %{reason: "noncompetitive correction"})
+
+    assert result.score_query.status == :resolved
+    assert result.side_results == []
+    assert result.score_revision.source_query_id == f.query_id
+    assert card_state(f) == "review_required"
+  end
+
+  test "ordinary correction still rejects entries without affected competition sides" do
+    f = fixture!()
+
+    Repo.query!("DELETE FROM competition_side_memberships WHERE round_entry_id = $1::uuid", [
+      uuid(hd(f.entries).id)
+    ])
+
+    before = hole_snapshot(f)
+
+    assert {:error, :no_affected_sides} =
+             Scoring.correct_hole_result(f.admin, f.event.id, f.round.id, %{
+               hole_result_id: f.hole_id,
+               expected_revision: 1,
+               new_gross_strokes: 6,
+               reason: "ordinary"
+             })
+
+    assert hole_snapshot(f) == before
+  end
+
+  test "query-resolution audit failure rolls back correction and verification work" do
+    f = opened_fixture!()
+    before = snapshot(f)
+
+    Repo.query!(
+      "CREATE FUNCTION pg_temp.reject_query_resolve_audit() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'simulated query audit failure'; END $$"
+    )
+
+    Repo.query!(
+      "CREATE TRIGGER gls41_test_query_resolve_audit BEFORE INSERT ON audit_events FOR EACH ROW WHEN (NEW.action = 'resolve_score_query_with_correction') EXECUTE FUNCTION pg_temp.reject_query_resolve_audit()"
+    )
+
+    assert {:error, _} = resolve(f, %{reason: "x"})
+    assert snapshot(f) == before
+    assert query_status(f) == "open"
+
+    assert [["holed_out", 1, 4]] =
+             Repo.query!(
+               "SELECT outcome, revision, gross_strokes FROM hole_results WHERE id = $1::uuid",
+               [uuid(f.hole_id)]
+             ).rows
+
+    assert [[0]] =
+             Repo.query!(
+               "SELECT count(*)::integer FROM score_revisions WHERE hole_result_id = $1::uuid",
+               [uuid(f.hole_id)]
+             ).rows
+
+    assert [[0]] =
+             Repo.query!(
+               "SELECT count(*)::integer FROM score_verifications WHERE hole_result_id = $1::uuid",
+               [uuid(f.hole_id)]
+             ).rows
+
+    assert [[0]] =
+             Repo.query!(
+               """
+               SELECT count(*)::integer FROM audit_events
+               WHERE action IN ('correct_hole_result', 'resolve_score_query_with_correction')
+                 AND (target_id = $1::uuid OR target_id = $2::uuid)
+               """,
+               [uuid(f.query_id), uuid(f.hole_id)]
+             ).rows
   end
 
   test "audit failure rolls back correction and query resolution" do
@@ -453,6 +564,30 @@ defmodule GolfScoring.Scoring.Services.ResolveScoreQueryWithCorrectionTest do
       ]).rows
       |> hd()
       |> hd()
+
+  defp hole_snapshot(f) do
+    %{
+      hole:
+        Repo.query!(
+          "SELECT revision, outcome, gross_strokes FROM hole_results WHERE id = $1::uuid",
+          [uuid(f.hole_id)]
+        ).rows,
+      revisions:
+        Repo.query!(
+          "SELECT id FROM score_revisions WHERE hole_result_id = $1::uuid ORDER BY id",
+          [uuid(f.hole_id)]
+        ).rows,
+      verifications:
+        Repo.query!(
+          "SELECT id, hole_result_revision, status FROM score_verifications WHERE hole_result_id = $1::uuid ORDER BY id",
+          [uuid(f.hole_id)]
+        ).rows
+    }
+  end
+
+  defmodule GLS41MissingPubSub do
+    def broadcast(_server, _topic, _message), do: raise("pubsub unavailable")
+  end
 
   defp card_state(f),
     do:

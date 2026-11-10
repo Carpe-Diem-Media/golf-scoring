@@ -92,12 +92,11 @@ defmodule GolfScoring.Scoring.Services.CorrectHoleResult do
     validate_target!(original, scope, command, query_resolution: query_id)
     evidence = evidence(original, actor.id, command, query_id)
 
-    run_correction!(actor, event_id, round_id, command, review, original, scope, evidence)
-    |> unwrap_correction!()
-  end
+    {:ok, correction} =
+      run_correction!(actor, event_id, round_id, command, review, original, scope, evidence)
 
-  defp unwrap_correction!({:ok, correction}), do: correction
-  defp unwrap_correction!(_), do: Repo.rollback(:incomplete_correction)
+    correction
+  end
 
   defp correct_locked!(actor, event_id, round_id, command, review) do
     original = Ash.get!(HoleResult, command.hole_result_id, authorize?: false)
