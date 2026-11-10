@@ -19,6 +19,7 @@ defmodule GolfScoring.Competition.Services.RequireReviewForCorrectedScore do
   alias GolfScoring.Competition.CompetitionSideResult
   alias GolfScoring.LockProtocol
   alias GolfScoring.Repo
+  alias GolfScoring.Scoring.Services.ResolveScoreQueryWithCorrection
 
   @scope_key {__MODULE__, :scope}
   @proof_key {__MODULE__, :proof}
@@ -76,7 +77,15 @@ defmodule GolfScoring.Competition.Services.RequireReviewForCorrectedScore do
       scope.transaction_id == transaction_id() and
       Map.take(scope, Map.keys(evidence)) == evidence and
       scope_current?(scope) and
-      Enum.all?(scope.sides, fn {side, result} -> result_state(result, side) == "provisional" end)
+      supported_side_states?(scope.sides)
+  end
+
+  defp supported_side_states?(sides) do
+    states = Enum.map(sides, fn {side, result} -> result_state(result, side) end)
+
+    Enum.all?(states, &(&1 == "provisional")) or
+      (ResolveScoreQueryWithCorrection.active_scope?() and
+         Enum.all?(states, &(&1 in ["provisional", "review_required"])))
   end
 
   @doc false

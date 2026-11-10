@@ -4,6 +4,7 @@ defmodule GolfScoring.Scoring.ScoreQueryDecisionGuard do
   use Ash.Resource.Change
 
   alias GolfScoring.Scoring.Services.DecideScoreQuery
+  alias GolfScoring.Scoring.Services.ResolveScoreQueryWithCorrection
 
   @impl true
   def change(changeset, _opts, _context) do
@@ -13,6 +14,12 @@ defmodule GolfScoring.Scoring.ScoreQueryDecisionGuard do
 
       :dismiss_internal ->
         Ash.Changeset.around_action(changeset, &DecideScoreQuery.around_dismiss/2)
+
+      :resolve_with_correction_internal ->
+        Ash.Changeset.around_action(
+          changeset,
+          &ResolveScoreQueryWithCorrection.around_resolve_with_correction/2
+        )
     end
   end
 end

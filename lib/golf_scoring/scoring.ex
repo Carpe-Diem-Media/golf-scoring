@@ -20,6 +20,7 @@ defmodule GolfScoring.Scoring do
   alias GolfScoring.Scoring.Services.LoadGroupScorecard
   alias GolfScoring.Scoring.Services.OpenScoreQuery
   alias GolfScoring.Scoring.Services.OverrideHandicapBasis
+  alias GolfScoring.Scoring.Services.ResolveScoreQueryWithCorrection
   alias GolfScoring.Scoring.Services.SubmitGroupHole
   alias GolfScoring.Scoring.Services.VerifyHoleResult
 
@@ -104,6 +105,15 @@ defmodule GolfScoring.Scoring do
   end
 
   def dismiss_score_query(_actor, _event_id, _round_id, _command), do: {:error, :invalid_input}
+
+  @doc """
+  Resolves an open or escalated dispute by correcting the associated HoleResult.
+
+  Requires `score_query_id`, `expected_revision`, `new_gross_strokes`, and `reason`.
+  Holed-out gross correction only. The workflow owns the outer transaction.
+  """
+  def resolve_score_query_with_correction(actor, event_id, round_id, command),
+    do: ResolveScoreQueryWithCorrection.run(actor, event_id, round_id, command)
 
   @doc """
   Opens a current-revision dispute as trusted same-event staff.

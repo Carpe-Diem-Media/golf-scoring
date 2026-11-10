@@ -85,12 +85,29 @@ defmodule GolfScoring.Scoring.Services.CorrectHoleResult do
     end
   end
 
+  @doc false
+  def correct_locked_for_query_resolution!(actor, event_id, round_id, command, review, query_id) do
+    original = Ash.get!(HoleResult, command.hole_result_id, authorize?: false)
+    scope = load_scope!(original)
+    validate_target!(original, scope, command, query_resolution: query_id)
+    evidence = evidence(original, actor.id, command, query_id)
+
+    run_correction!(actor, event_id, round_id, command, review, original, scope, evidence)
+    |> unwrap_correction!()
+  end
+
+  defp unwrap_correction!({:ok, correction}), do: correction
+  defp unwrap_correction!(_), do: Repo.rollback(:incomplete_correction)
+
   defp correct_locked!(actor, event_id, round_id, command, review) do
     original = Ash.get!(HoleResult, command.hole_result_id, authorize?: false)
     scope = load_scope!(original)
-    validate_target!(original, scope, command)
-    evidence = evidence(original, actor.id, command)
+    validate_target!(original, scope, command, [])
+    evidence = evidence(original, actor.id, command, nil)
+    run_correction!(actor, event_id, round_id, command, review, original, scope, evidence)
+  end
 
+  defp run_correction!(actor, event_id, round_id, command, review, original, scope, evidence) do
     gate = %{
       token: make_ref(),
       transaction_id: transaction_id(),
@@ -140,7 +157,18 @@ defmodule GolfScoring.Scoring.Services.CorrectHoleResult do
     end
   end
 
-  defp validate_target!(original, scope, command) do
+  defp validate_target!(original, scope, command, opts) do
+    validate_correction_values!(original, command)
+
+    case Keyword.get(opts, :query_resolution) do
+      nil -> validate_ordinary_correction_target!(original, scope)
+      query_id -> validate_query_resolution_target!(original, scope, query_id)
+    end
+
+    :ok
+  end
+
+  defp validate_correction_values!(original, command) do
     cond do
       original.revision != command.expected_revision ->
         Repo.rollback(:stale_revision)
@@ -151,6 +179,13 @@ defmodule GolfScoring.Scoring.Services.CorrectHoleResult do
       original.gross_strokes == command.new_gross_strokes ->
         Repo.rollback(:unchanged_score)
 
+      true ->
+        :ok
+    end
+  end
+
+  defp validate_ordinary_correction_target!(original, scope) do
+    cond do
       scope.card_state not in ["in_progress", "complete"] ->
         Repo.rollback(:unsupported_scorecard_state)
 
@@ -162,6 +197,26 @@ defmodule GolfScoring.Scoring.Services.CorrectHoleResult do
     end
   end
 
+  defp validate_query_resolution_target!(original, scope, query_id) do
+    cond do
+      scope.card_state != "review_required" ->
+        Repo.rollback(:unsupported_scorecard_state)
+
+      !matching_open_query?(original.id, query_id) ->
+        Repo.rollback(:invalid_query_scope)
+
+      true ->
+        :ok
+    end
+  end
+
+  defp matching_open_query?(hole_id, query_id) do
+    Repo.query!(
+      "SELECT 1 FROM score_queries WHERE id = $1::uuid AND hole_result_id = $2::uuid AND status IN ('open', 'escalated') LIMIT 1",
+      [uuid(query_id), uuid(hole_id)]
+    ).rows != []
+  end
+
   defp unresolved_query?(id) do
     Repo.query!(
       "SELECT 1 FROM score_queries WHERE hole_result_id = $1::uuid AND status IN ('open', 'escalated') LIMIT 1",
@@ -169,7 +224,7 @@ defmodule GolfScoring.Scoring.Services.CorrectHoleResult do
     ).rows != []
   end
 
-  defp evidence(original, actor_id, command) do
+  defp evidence(original, actor_id, command, source_query_id) do
     %{
       hole_result_id: original.id,
       scorecard_id: original.scorecard_id,
@@ -181,6 +236,7 @@ defmodule GolfScoring.Scoring.Services.CorrectHoleResult do
       original_gross_strokes: original.gross_strokes,
       new_gross_strokes: command.new_gross_strokes,
       actor_staff_user_id: actor_id,
+      source_query_id: source_query_id,
       reason: command.reason
     }
   end
@@ -228,8 +284,14 @@ defmodule GolfScoring.Scoring.Services.CorrectHoleResult do
 
     current = Ash.get!(HoleResult, gate.original.id, authorize?: false)
 
+    source_ok =
+      case gate.evidence[:source_query_id] do
+        nil -> is_nil(Changeset.get_attribute(changeset, :source_query_id))
+        id -> Changeset.get_attribute(changeset, :source_query_id) == id
+      end
+
     unless actual == gate.evidence and
-             is_nil(Changeset.get_attribute(changeset, :source_query_id)) and
+             source_ok and
              is_nil(Changeset.get_attribute(changeset, :actor_round_entry_id)) and
              current.revision == gate.evidence.resulting_revision and
              current.gross_strokes == gate.evidence.new_gross_strokes and

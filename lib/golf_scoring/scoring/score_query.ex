@@ -96,6 +96,14 @@ defmodule GolfScoring.Scoring.ScoreQuery do
       change GolfScoring.Scoring.ScoreQueryDecisionGuard
     end
 
+    update :resolve_with_correction_internal do
+      public? false
+      accept []
+      require_atomic? false
+      atomic_upgrade? false
+      change GolfScoring.Scoring.ScoreQueryDecisionGuard
+    end
+
     read :read do
       primary? true
       public? false

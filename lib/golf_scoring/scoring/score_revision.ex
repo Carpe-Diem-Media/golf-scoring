@@ -61,6 +61,7 @@ defmodule GolfScoring.Scoring.ScoreRevision do
         :scorecard_id,
         :round_id,
         :actor_staff_user_id,
+        :source_query_id,
         :original_revision,
         :resulting_revision,
         :original_outcome,
