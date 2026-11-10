@@ -1,6 +1,7 @@
 defmodule GolfScoring.Competition.CompetitionSideResultLifecycleGuard do
   @moduledoc "Guards coordinator-owned query/correction review and pre-play exclusion; other readiness transitions remain unavailable."
 
+  alias GolfScoring.Competition.Services.AcceptCompetitionSideRetirement
   alias GolfScoring.Competition.Services.ExcludeCompetitionSideBeforeHole
   alias GolfScoring.Competition.Services.RequireReviewForCorrectedScore
   alias GolfScoring.Scoring.Services.OpenScoreQuery
@@ -16,6 +17,9 @@ defmodule GolfScoring.Competition.CompetitionSideResultLifecycleGuard do
     case operation do
       :exclude_before_hole_internal ->
         guard_preplay_exclusion(changeset)
+
+      :accept_retirement_internal ->
+        guard_retirement_review(changeset)
 
       :require_review_for_open_query_internal ->
         Ash.Changeset.before_action(changeset, &OpenScoreQuery.prepare_review(&1, :side))
@@ -48,6 +52,28 @@ defmodule GolfScoring.Competition.CompetitionSideResultLifecycleGuard do
           message:
             "correction review requires locked current evidence in its coordinator transaction"
         )
+      end
+    end)
+  end
+
+  defp guard_retirement_review(changeset) do
+    Ash.Changeset.before_action(changeset, fn changeset ->
+      evidence = Map.get(changeset.context, :competition_side_result_retirement)
+
+      cond do
+        valid_retirement_evidence?(changeset.context, evidence, changeset.data) and
+            retirement_ready_state?(changeset.data) ->
+          Ash.Changeset.force_change_attribute(changeset, :state, :review_required)
+
+        valid_retirement_evidence?(changeset.context, evidence, changeset.data) and
+            review_required_state?(changeset.data) ->
+          changeset
+
+        true ->
+          Ash.Changeset.add_error(changeset,
+            field: :state,
+            message: "retirement acceptance requires a verified coordinator transaction"
+          )
       end
     end)
   end
@@ -117,6 +143,25 @@ defmodule GolfScoring.Competition.CompetitionSideResultLifecycleGuard do
   end
 
   defp valid_exclusion_provenance?(_evidence), do: false
+
+  defp valid_retirement_evidence?(context, evidence, result) do
+    AcceptCompetitionSideRetirement.verified_retirement_review?(
+      context,
+      result.id,
+      result.competition_side_id,
+      evidence
+    )
+  end
+
+  defp retirement_ready_state?(%{state: state}),
+    do: state in [:provisional, "provisional"]
+
+  defp retirement_ready_state?(_), do: false
+
+  defp review_required_state?(%{state: state}),
+    do: state in [:review_required, "review_required"]
+
+  defp review_required_state?(_), do: false
 
   defp transition_message(:mark_review_required),
     do: "#{@future_dependency_message} for mark_review_required"

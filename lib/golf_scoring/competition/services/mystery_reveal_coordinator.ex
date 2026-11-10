@@ -4,6 +4,7 @@ defmodule GolfScoring.Competition.Services.MysteryRevealCoordinator do
   alias Ash.Changeset
   alias GolfScoring.Competition.MysteryReveal
   alias GolfScoring.Competition.Policies.MysteryRevealEligibility
+  alias GolfScoring.Competition.Services.AcceptCompetitionSideRetirement
   alias GolfScoring.Competition.Services.ExcludeCompetitionSideBeforeHole
   alias GolfScoring.LockProtocol
   alias GolfScoring.Repo
@@ -41,7 +42,11 @@ defmodule GolfScoring.Competition.Services.MysteryRevealCoordinator do
   def recheck_many(_, _, _, _), do: {:error, :unauthorized_mystery_recheck}
 
   defp consume_origin(%{owner: owner} = proof, scope)
-       when owner in [SubmitGroupHole, ExcludeCompetitionSideBeforeHole] do
+       when owner in [
+              SubmitGroupHole,
+              ExcludeCompetitionSideBeforeHole,
+              AcceptCompetitionSideRetirement
+            ] do
     owner.consume_mystery_recheck(proof, scope)
   end
 
@@ -354,26 +359,43 @@ defmodule GolfScoring.Competition.Services.MysteryRevealCoordinator do
          round_hole_id
        ) do
     with {:ok, route} <- group_hole_position(group_id, round_id, round_hole_id),
-         {:ok, rows} <- side_exclusion_rows(side_ids) do
+         {:ok, rows} <- side_competitive_scope_rows(side_ids) do
       side_rows = Enum.zip(side_ids, rows)
 
-      all_excluded_before_target? =
+      all_ineligible_before_target? =
         length(rows) == length(side_ids) and side_ids != [] and
           Enum.all?(side_rows, fn {side_id, row} ->
             row.side_id == side_id and
-              valid_exclusion_row?(
+              side_ineligible_before_target?(
                 row,
                 round_id,
                 round_competition_id,
                 group_id,
-                route.start_play_order
-              ) and row.effective_play_index <= route.target_play_index
+                route
+              )
           end)
 
-      if all_excluded_before_target?,
+      if all_ineligible_before_target?,
         do: {:ok, :not_applicable},
         else: {:ok, :unresolved}
     end
+  end
+
+  defp side_ineligible_before_target?(row, round_id, round_competition_id, group_id, route) do
+    (valid_exclusion_row?(
+       row,
+       round_id,
+       round_competition_id,
+       group_id,
+       route.start_play_order
+     ) and row.effective_play_index <= route.target_play_index) or
+      (valid_retirement_row?(
+         row,
+         round_id,
+         round_competition_id,
+         group_id,
+         route.start_play_order
+       ) and row.retired_effective_play_index <= route.target_play_index)
   end
 
   defp group_hole_position(group_id, round_id, round_hole_id) do
@@ -408,7 +430,7 @@ defmodule GolfScoring.Competition.Services.MysteryRevealCoordinator do
     end
   end
 
-  defp side_exclusion_rows(side_ids) do
+  defp side_competitive_scope_rows(side_ids) do
     rows =
       Repo.query!(
         """
@@ -417,12 +439,20 @@ defmodule GolfScoring.Competition.Services.MysteryRevealCoordinator do
                csr.excluded_effective_round_hole_id::text,
                csr.excluded_effective_play_index,
                csr.excluded_preplay_confirmed,
-               effective.round_id::text, effective.play_order::int
+               effective_excluded.round_id::text, effective_excluded.play_order::int,
+               retirement.playing_group_id::text,
+               retirement.effective_play_index,
+               retirement.preplay_boundary_confirmed,
+               effective_retired.round_id::text, effective_retired.play_order::int
         FROM unnest($1::uuid[]) AS required(side_id)
         LEFT JOIN competition_sides cs ON cs.id = required.side_id
         LEFT JOIN competition_side_results csr ON csr.competition_side_id = cs.id
-        LEFT JOIN round_holes effective
-          ON effective.id = csr.excluded_effective_round_hole_id
+        LEFT JOIN round_holes effective_excluded
+          ON effective_excluded.id = csr.excluded_effective_round_hole_id
+        LEFT JOIN competition_side_retirements retirement
+          ON retirement.competition_side_id = cs.id
+        LEFT JOIN round_holes effective_retired
+          ON effective_retired.id = retirement.effective_round_hole_id
         ORDER BY required.side_id
         """,
         [Enum.map(side_ids, &Ecto.UUID.dump!/1)]
@@ -437,7 +467,12 @@ defmodule GolfScoring.Competition.Services.MysteryRevealCoordinator do
                        effective_play_index,
                        preplay_confirmed,
                        effective_round_id,
-                       effective_play_order
+                       effective_play_order,
+                       retired_group_id,
+                       retired_effective_index,
+                       retired_preplay_confirmed,
+                       retired_effective_round_id,
+                       retired_effective_play_order
                      ] ->
         %{
           side_id: cast_optional_uuid(side_id),
@@ -449,7 +484,12 @@ defmodule GolfScoring.Competition.Services.MysteryRevealCoordinator do
           effective_play_index: effective_play_index,
           preplay_confirmed?: preplay_confirmed,
           effective_round_id: cast_optional_uuid(effective_round_id),
-          effective_play_order: effective_play_order
+          effective_play_order: effective_play_order,
+          retired_group_id: cast_optional_uuid(retired_group_id),
+          retired_effective_play_index: retired_effective_index,
+          retired_preplay_confirmed?: retired_preplay_confirmed,
+          retired_effective_round_id: cast_optional_uuid(retired_effective_round_id),
+          retired_effective_play_order: retired_effective_play_order
         }
       end)
 
@@ -462,6 +502,12 @@ defmodule GolfScoring.Competition.Services.MysteryRevealCoordinator do
     valid_excluded_side?(row, round_id, round_competition_id, group_id) and
       valid_effective_hole?(row, round_id) and
       valid_effective_play_index?(row, start_play_order)
+  end
+
+  defp valid_retirement_row?(row, round_id, round_competition_id, group_id, start_play_order) do
+    valid_retired_side?(row, round_id, round_competition_id, group_id) and
+      valid_retired_effective_hole?(row, round_id) and
+      valid_retired_effective_play_index?(row, start_play_order)
   end
 
   defp valid_excluded_side?(row, round_id, round_competition_id, group_id) do
@@ -479,6 +525,23 @@ defmodule GolfScoring.Competition.Services.MysteryRevealCoordinator do
       is_integer(row.effective_play_order) and
       Integer.mod(row.effective_play_order - start_play_order, @scheduled_holes) ==
         row.effective_play_index
+  end
+
+  defp valid_retired_side?(row, round_id, round_competition_id, group_id) do
+    not is_nil(row.retired_group_id) and row.side_round_id == round_id and
+      row.side_competition_id == round_competition_id and row.retired_group_id == group_id and
+      row.retired_preplay_confirmed? == true
+  end
+
+  defp valid_retired_effective_hole?(row, round_id) do
+    not is_nil(row.retired_effective_round_id) and row.retired_effective_round_id == round_id
+  end
+
+  defp valid_retired_effective_play_index?(row, start_play_order) do
+    is_integer(row.retired_effective_play_index) and row.retired_effective_play_index in 0..17 and
+      is_integer(row.retired_effective_play_order) and
+      Integer.mod(row.retired_effective_play_order - start_play_order, @scheduled_holes) ==
+        row.retired_effective_play_index
   end
 
   defp cast_optional_uuid(nil), do: nil

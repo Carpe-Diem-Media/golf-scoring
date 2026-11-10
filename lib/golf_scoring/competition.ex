@@ -3,6 +3,7 @@ defmodule GolfScoring.Competition do
 
   use Ash.Domain
 
+  alias GolfScoring.Competition.Services.AcceptCompetitionSideRetirement
   alias GolfScoring.Competition.Services.AssignGroupRole
   alias GolfScoring.Competition.Services.AssignRoundTee
   alias GolfScoring.Competition.Services.ConfigureMysteryHoleRule
@@ -62,6 +63,7 @@ defmodule GolfScoring.Competition do
 
     resource GolfScoring.Competition.CompetitionSideMembership
     resource GolfScoring.Competition.CompetitionSideResult
+    resource GolfScoring.Competition.CompetitionSideRetirement
     resource GolfScoring.Competition.GroupRoleAssignment
 
     resource GolfScoring.Competition.ScoringTrack do
@@ -201,6 +203,26 @@ defmodule GolfScoring.Competition do
       round_id,
       scoring_track_id,
       round_hole_id
+    )
+  end
+
+  def accept_competition_side_retirement(
+        actor,
+        event_id,
+        round_id,
+        round_competition_id,
+        competition_side_id,
+        playing_group_id,
+        attrs
+      ) do
+    AcceptCompetitionSideRetirement.run(
+      actor,
+      event_id,
+      round_id,
+      round_competition_id,
+      competition_side_id,
+      playing_group_id,
+      attrs
     )
   end
 end

@@ -9,6 +9,7 @@ defmodule GolfScoring.Competition.Services.LoadSideReviewReason do
   """
 
   alias GolfScoring.Accounts.StaffUser
+  alias GolfScoring.Competition.CompetitionSideRetirementEligibility
   alias GolfScoring.Repo
 
   @doc """
@@ -25,10 +26,12 @@ defmodule GolfScoring.Competition.Services.LoadSideReviewReason do
          {:ok, round_id} <- Ecto.UUID.cast(round_id),
          {:ok, result_id} <- Ecto.UUID.cast(result_id),
          rows when rows != [] <- read_rows(actor_id, event_id, round_id, result_id) do
-      [[state | _] | _] = rows
+      [[state, side_id | _] | _] = rows
+      side_id = Ecto.UUID.cast!(side_id)
 
       blockers =
-        for [_, hole_id, revision, evidence_id, verification_id] <- rows, not is_nil(hole_id) do
+        for [_, _side, hole_id, revision, evidence_id, verification_id] <- rows,
+            not is_nil(hole_id) do
           %{
             reason: :corrected_score_awaiting_verification,
             hole_result_id: hole_id,
@@ -45,7 +48,14 @@ defmodule GolfScoring.Competition.Services.LoadSideReviewReason do
           true -> :no_correction_blocker
         end
 
-      {:ok, %{status: status, blockers: blockers, other_blockers_evaluated?: false}}
+      {:ok,
+       %{
+         status: status,
+         blockers: blockers,
+         other_blockers_evaluated?: false,
+         placing_eligible?: CompetitionSideRetirementEligibility.placing_eligible?(side_id),
+         official_contribution_blocked_from_play_index: official_contribution_boundary(side_id)
+       }}
     else
       _ -> {:error, :not_found_or_forbidden}
     end
@@ -53,10 +63,17 @@ defmodule GolfScoring.Competition.Services.LoadSideReviewReason do
 
   def run(_, _, _, _), do: {:error, :not_found_or_forbidden}
 
+  defp official_contribution_boundary(side_id) do
+    case CompetitionSideRetirementEligibility.effective_play_index(side_id) do
+      {:ok, index} -> index
+      {:error, :retirement_not_accepted} -> nil
+    end
+  end
+
   defp read_rows(actor_id, event_id, round_id, result_id) do
     Repo.query!(
       """
-      SELECT csr.state, blocker.hole_result_id, blocker.revision, blocker.score_revision_id, blocker.verification_id
+      SELECT csr.state, side.id::text, blocker.hole_result_id, blocker.revision, blocker.score_revision_id, blocker.verification_id
       FROM competition_side_results csr
       JOIN competition_sides side ON side.id = csr.competition_side_id
       JOIN rounds r ON r.id = side.round_id
