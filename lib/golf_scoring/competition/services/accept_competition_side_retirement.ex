@@ -10,6 +10,7 @@ defmodule GolfScoring.Competition.Services.AcceptCompetitionSideRetirement do
   alias Ash.Changeset
   alias GolfScoring.Accounts.Checks.ActiveEventRole
   alias GolfScoring.Accounts.EventAuthorityLock
+  alias GolfScoring.Accounts.StaffUser
   alias GolfScoring.Audit
   alias GolfScoring.Competition.CompetitionSideResult
   alias GolfScoring.Competition.CompetitionSideRetirement
@@ -31,7 +32,7 @@ defmodule GolfScoring.Competition.Services.AcceptCompetitionSideRetirement do
           idempotent_retry?: boolean()
         }
 
-  @spec run(map(), term(), term(), term(), term(), term(), map()) ::
+  @spec run(StaffUser.t(), term(), term(), term(), term(), term(), map()) ::
           {:ok, result()} | {:error, term()}
   def run(
         actor,
@@ -42,8 +43,9 @@ defmodule GolfScoring.Competition.Services.AcceptCompetitionSideRetirement do
         playing_group_id,
         attrs
       )
-      when is_map(actor) and is_map(attrs) do
-    with {:ok, actor_id} <- Ecto.UUID.cast(Map.get(actor, :id)),
+      when is_map(attrs) do
+    with %StaffUser{id: actor_id} <- actor,
+         {:ok, actor_id} <- Ecto.UUID.cast(actor_id),
          {:ok, event_id} <- Ecto.UUID.cast(event_id),
          {:ok, round_id} <- Ecto.UUID.cast(round_id),
          {:ok, round_competition_id} <- Ecto.UUID.cast(round_competition_id),
@@ -84,7 +86,7 @@ defmodule GolfScoring.Competition.Services.AcceptCompetitionSideRetirement do
       )
     else
       {:error, _reason} = error -> error
-      _ -> {:error, :invalid_input}
+      _ -> {:error, :forbidden}
     end
   end
 

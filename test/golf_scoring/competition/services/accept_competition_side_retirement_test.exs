@@ -99,6 +99,24 @@ defmodule GolfScoring.Competition.Services.AcceptCompetitionSideRetirementTest d
              )
   end
 
+  test "forged actor maps are rejected even when the id matches an authorized administrator" do
+    {setup, checkpoint, effective} = prepared_fixture!()
+    side_id = side_id_for_entries(setup.entries)
+    before = retirement_row_count()
+
+    assert {:error, :forbidden} =
+             accept(
+               setup,
+               side_id,
+               checkpoint,
+               effective,
+               Ecto.UUID.generate(),
+               %{actor: %{id: setup.admin.id}}
+             )
+
+    assert retirement_row_count() == before
+  end
+
   test "forbidden staff, missing attestation, and scope mismatch fail closed" do
     {setup, checkpoint, effective} = prepared_fixture!()
     side_id = side_id_for_entries(setup.entries)
@@ -867,6 +885,10 @@ defmodule GolfScoring.Competition.Services.AcceptCompetitionSideRetirementTest d
       ).rows
 
     state
+  end
+
+  defp retirement_row_count do
+    Repo.query!("SELECT count(*)::int FROM competition_side_retirements").rows |> hd() |> hd()
   end
 
   defp count_retirement_audits(retirement_id) do
