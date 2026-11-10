@@ -7,9 +7,9 @@ defmodule GolfScoring.Scoring.ScoreVerification do
   A verified or overridden record can become superseded only after its result
   revision changes. Superseded evidence is retained and is terminal.
 
-  Verification uses the scorecard `:score_row` lock. Future correction actions
-  must use the same boundary, supersede prior evidence, and create pending
-  evidence for the new revision in their transaction.
+  Verification and correction share the scorecard `:score_row` lock. Internal
+  writes require a single-use capability from their owning coordinator; private
+  Ash actions and caller-supplied context alone do not authorize certification.
   """
 
   use Ash.Resource, domain: GolfScoring.Scoring, data_layer: AshPostgres.DataLayer
@@ -66,6 +66,7 @@ defmodule GolfScoring.Scoring.ScoreVerification do
 
     create :create_pending_internal do
       public? false
+      change GolfScoring.Scoring.ScoreVerificationWriteGuard
 
       accept [
         :round_id,
@@ -79,6 +80,7 @@ defmodule GolfScoring.Scoring.ScoreVerification do
 
     update :verify_internal do
       public? false
+      change GolfScoring.Scoring.ScoreVerificationWriteGuard
       require_atomic? false
       accept [:verifier_round_entry_id, :role_assignment_id, :role_assignment_version]
       validate attribute_equals(:status, :pending)
@@ -87,6 +89,7 @@ defmodule GolfScoring.Scoring.ScoreVerification do
 
     update :override_internal do
       public? false
+      change GolfScoring.Scoring.ScoreVerificationWriteGuard
       require_atomic? false
       accept [:overridden_by_staff_user_id, :override_reason]
       validate attribute_equals(:status, :pending)
@@ -95,6 +98,7 @@ defmodule GolfScoring.Scoring.ScoreVerification do
 
     update :supersede_internal do
       public? false
+      change GolfScoring.Scoring.ScoreVerificationWriteGuard
       require_atomic? false
       accept []
       validate one_of(:status, [:verified, :overridden])

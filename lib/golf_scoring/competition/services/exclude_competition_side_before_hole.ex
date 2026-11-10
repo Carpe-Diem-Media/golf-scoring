@@ -21,6 +21,7 @@ defmodule GolfScoring.Competition.Services.ExcludeCompetitionSideBeforeHole do
   @manager_roles [:event_admin, :competition_manager]
   @scheduled_holes 18
   @gate_key {__MODULE__, :exclusion_gate}
+  @mystery_gate_key {__MODULE__, :mystery_recheck}
 
   @type result :: %{side_result_id: Ecto.UUID.t(), mystery_reveal_created?: boolean()}
 
@@ -195,7 +196,13 @@ defmodule GolfScoring.Competition.Services.ExcludeCompetitionSideBeforeHole do
              result_id: excluded.id
            }),
          {:ok, reveal_result} <-
-           recheck_affected_rules(round_id, round_competition_id, route, effective_index) do
+           recheck_affected_rules(round_id, round_competition_id, route, effective_index, %{
+             actor_id: actor_id,
+             event_id: event_id,
+             group_id: playing_group_id,
+             side_id: side_id,
+             result_id: locked_result.id
+           }) do
       {:ok,
        %{
          side_result_id: excluded.id,
@@ -527,7 +534,7 @@ defmodule GolfScoring.Competition.Services.ExcludeCompetitionSideBeforeHole do
     end
   end
 
-  defp recheck_affected_rules(round_id, round_competition_id, route, effective_index) do
+  defp recheck_affected_rules(round_id, round_competition_id, route, effective_index, evidence) do
     route_position = Map.new(Enum.with_index(route), fn {hole, index} -> {hole.id, index} end)
 
     hole_ids =
@@ -550,11 +557,79 @@ defmodule GolfScoring.Competition.Services.ExcludeCompetitionSideBeforeHole do
         |> Enum.filter(&(Map.fetch!(route_position, &1) >= effective_index))
         |> Enum.uniq()
 
-      MysteryRevealCoordinator.recheck_many(round_id, round_competition_id, affected_hole_ids)
+      holes = Enum.sort_by(affected_hole_ids, &Ecto.UUID.dump!/1)
+
+      proof =
+        Map.merge(evidence, %{
+          owner: __MODULE__,
+          operation: :exclude_before_hole,
+          token: make_ref(),
+          pid: self(),
+          transaction_id: mystery_transaction_id(),
+          round_id: round_id,
+          competition_id: round_competition_id,
+          holes: holes,
+          effective_index: effective_index,
+          used?: false
+        })
+
+      if Process.get(@mystery_gate_key), do: Repo.rollback(:nested_mystery_recheck)
+      Process.put(@mystery_gate_key, proof)
+
+      try do
+        MysteryRevealCoordinator.recheck_many(round_id, round_competition_id, holes, proof)
+      after
+        Process.delete(@mystery_gate_key)
+      end
     else
       {:error, :mystery_rule_hole_not_in_round_route}
     end
   end
+
+  @doc false
+  def consume_mystery_recheck(proof, scope) do
+    gate = Process.get(@mystery_gate_key)
+
+    if is_map(gate) and gate == proof and not gate.used? and gate.pid == self() and
+         scope == Map.take(gate, [:round_id, :competition_id, :holes]) and
+         Repo.in_transaction?() and gate.transaction_id == mystery_transaction_id() and
+         persisted_mystery_exclusion?(gate) do
+      Process.put(@mystery_gate_key, %{gate | used?: true})
+      :ok
+    else
+      {:error, :unauthorized_mystery_recheck}
+    end
+  end
+
+  defp persisted_mystery_exclusion?(gate) do
+    Repo.query!(
+      """
+      SELECT 1 FROM competition_side_results csr
+      JOIN competition_sides cs ON cs.id = csr.competition_side_id
+      JOIN rounds r ON r.id = cs.round_id
+      WHERE csr.id = $1::uuid AND cs.id = $2::uuid AND r.id = $3::uuid
+        AND r.event_id = $4::uuid AND cs.round_competition_id = $5::uuid
+        AND csr.state = 'excluded' AND csr.excluded_playing_group_id = $6::uuid
+        AND csr.excluded_effective_play_index = $7 AND csr.excluded_preplay_confirmed
+        AND EXISTS (SELECT 1 FROM audit_events a WHERE a.target_id = csr.id
+                    AND a.action = 'exclude_competition_side_before_hole'
+                    AND a.actor_staff_user_id = $8::uuid)
+      """,
+      [
+        Ecto.UUID.dump!(gate.result_id),
+        Ecto.UUID.dump!(gate.side_id),
+        Ecto.UUID.dump!(gate.round_id),
+        Ecto.UUID.dump!(gate.event_id),
+        Ecto.UUID.dump!(gate.competition_id),
+        Ecto.UUID.dump!(gate.group_id),
+        gate.effective_index,
+        Ecto.UUID.dump!(gate.actor_id)
+      ]
+    ).rows == [[1]]
+  end
+
+  defp mystery_transaction_id,
+    do: Repo.query!("SELECT pg_current_xact_id()::text").rows |> hd() |> hd()
 
   defp broadcast_mystery_reveal_changed(round_id) do
     Phoenix.PubSub.broadcast(

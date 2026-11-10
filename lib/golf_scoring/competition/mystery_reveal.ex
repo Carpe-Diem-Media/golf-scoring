@@ -26,6 +26,7 @@ defmodule GolfScoring.Competition.MysteryReveal do
     create :create_internal do
       public? false
       accept [:mystery_hole_rule_id]
+      change GolfScoring.Competition.MysteryRevealGuard
     end
   end
 

@@ -84,6 +84,16 @@ defmodule GolfScoring.Competition.CompetitionSideResult do
       change set_attribute(:state, :provisional)
     end
 
+    update :require_review_for_open_query_internal do
+      public? false
+      accept []
+      require_atomic? false
+      atomic_upgrade? false
+
+      change {GolfScoring.Competition.CompetitionSideResultLifecycleGuard,
+              operation: :require_review_for_open_query_internal}
+    end
+
     update :mark_review_required do
       public? false
       accept []
@@ -92,6 +102,16 @@ defmodule GolfScoring.Competition.CompetitionSideResult do
 
       change {GolfScoring.Competition.CompetitionSideResultLifecycleGuard,
               operation: :mark_review_required}
+    end
+
+    update :require_review_for_corrected_score_internal do
+      public? false
+      accept []
+      require_atomic? false
+      atomic_upgrade? false
+
+      change {GolfScoring.Competition.CompetitionSideResultLifecycleGuard,
+              operation: :require_review_for_corrected_score_internal}
     end
 
     update :mark_ready_to_finalize do
@@ -136,6 +156,16 @@ defmodule GolfScoring.Competition.CompetitionSideResult do
 
       change {GolfScoring.Competition.CompetitionSideResultLifecycleGuard,
               operation: :exclude_before_hole_internal}
+    end
+
+    update :accept_retirement_internal do
+      public? false
+      accept []
+      require_atomic? false
+      atomic_upgrade? false
+
+      change {GolfScoring.Competition.CompetitionSideResultLifecycleGuard,
+              operation: :accept_retirement_internal}
     end
   end
 

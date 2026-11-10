@@ -56,6 +56,16 @@ defmodule GolfScoring.Scoring.HoleResult do
       primary? true
     end
 
+    update :correct_gross_internal do
+      public? false
+      require_atomic? false
+      atomic_upgrade? false
+      accept [:gross_strokes]
+      argument :expected_revision, :integer, allow_nil?: false, constraints: [min: 1]
+      change optimistic_lock(:revision)
+      change {GolfScoring.Scoring.CorrectionWriteGuard, operation: :update}
+    end
+
     create :record_internal do
       public? false
 

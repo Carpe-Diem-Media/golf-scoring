@@ -14,8 +14,13 @@ defmodule GolfScoring.Scoring do
   alias GolfScoring.Scoring.Services.BuildHandicapSnapshot
   alias GolfScoring.Scoring.Services.ConfirmHandicapInput
   alias GolfScoring.Scoring.Services.ConfirmHandicapInputForPlayerGrant
+  alias GolfScoring.Scoring.Services.CorrectHoleResult
+  alias GolfScoring.Scoring.Services.DecideScoreQuery
+  alias GolfScoring.Scoring.Services.EscalateScoreQuery
   alias GolfScoring.Scoring.Services.LoadGroupScorecard
+  alias GolfScoring.Scoring.Services.OpenScoreQuery
   alias GolfScoring.Scoring.Services.OverrideHandicapBasis
+  alias GolfScoring.Scoring.Services.ResolveScoreQueryWithCorrection
   alias GolfScoring.Scoring.Services.SubmitGroupHole
   alias GolfScoring.Scoring.Services.VerifyHoleResult
 
@@ -25,6 +30,8 @@ defmodule GolfScoring.Scoring do
     resource GolfScoring.Scoring.Scorecard
     resource GolfScoring.Scoring.HoleResult
     resource GolfScoring.Scoring.ScoreVerification
+    resource GolfScoring.Scoring.ScoreQuery
+    resource GolfScoring.Scoring.ScoreRevision
     resource GolfScoring.Scoring.HoleSubmission
   end
 
@@ -55,6 +62,80 @@ defmodule GolfScoring.Scoring do
 
   def build_competition_handicap(round_entry_id, round_competition_id, attrs) do
     BuildCompetitionHandicap.run(round_entry_id, round_competition_id, attrs)
+  end
+
+  @doc """
+  Escalates an open current-revision dispute as trusted same-event staff.
+
+  Requires score_query_id, expected_revision and an escalation reason. Allows
+  Event Admin, Competition Manager and Scoring Support. The service owns its
+  outer transaction; duplicate escalation is a conflict. Audit is atomic and
+  notification status is separate from committed success. Admin-attention UI
+  and player escalation remain separate release gates.
+  """
+  def escalate_score_query(actor, event_id, round_id, command) do
+    EscalateScoreQuery.run(actor, event_id, round_id, command)
+  end
+
+  @doc """
+  Terminates an open or escalated dispute as trusted same-event staff.
+
+  Requires `score_query_id`, `expected_revision`, `reason`, and `decision`
+  (`:resolve_no_change` or `:dismiss`). Allows Event Admin and Competition Manager only.
+  Correction-based resolution is unsupported. The service owns its outer transaction.
+  """
+  def decide_score_query(actor, event_id, round_id, command) do
+    DecideScoreQuery.run(actor, event_id, round_id, command)
+  end
+
+  def resolve_score_query_no_change(actor, event_id, round_id, command) when is_map(command) do
+    DecideScoreQuery.run(
+      actor,
+      event_id,
+      round_id,
+      Map.put(command, :decision, :resolve_no_change)
+    )
+  end
+
+  def resolve_score_query_no_change(_actor, _event_id, _round_id, _command),
+    do: {:error, :invalid_input}
+
+  def dismiss_score_query(actor, event_id, round_id, command) when is_map(command) do
+    DecideScoreQuery.run(actor, event_id, round_id, Map.put(command, :decision, :dismiss))
+  end
+
+  def dismiss_score_query(_actor, _event_id, _round_id, _command), do: {:error, :invalid_input}
+
+  @doc """
+  Resolves an open or escalated dispute by correcting the associated HoleResult.
+
+  Requires `score_query_id`, `expected_revision`, `new_gross_strokes`, and `reason`.
+  Holed-out gross correction only. The workflow owns the outer transaction.
+  """
+  def resolve_score_query_with_correction(actor, event_id, round_id, command),
+    do: ResolveScoreQueryWithCorrection.run(actor, event_id, round_id, command)
+
+  @doc """
+  Opens a current-revision dispute as trusted same-event staff.
+
+  Requires hole_result_id, expected_revision and a nonblank reason. The service
+  owns its transaction and reviews the Scorecard and all affected provisional
+  sides atomically with the query and audit. Notification status is separate
+  from committed success. Player initiation and query resolution are unavailable.
+  """
+  def query_hole_result(actor, event_id, round_id, command) do
+    OpenScoreQuery.run(actor, event_id, round_id, command)
+  end
+
+  @doc """
+  Corrects a recorded holed-out gross score as trusted same-event staff.
+
+  Requires expected_revision, new_gross_strokes and reason. Owns its transaction;
+  nested use is rejected. Success includes the committed evidence and a separate
+  notification delivery status. Unsupported review/dispute workflows fail closed.
+  """
+  def correct_hole_result(actor, event_id, round_id, command) do
+    CorrectHoleResult.run(actor, event_id, round_id, command)
   end
 
   def submit_group_hole(actor, event_id, round_id, command) do

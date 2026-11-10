@@ -4,35 +4,58 @@ defmodule GolfScoring.Competition.Services.MysteryRevealCoordinator do
   alias Ash.Changeset
   alias GolfScoring.Competition.MysteryReveal
   alias GolfScoring.Competition.Policies.MysteryRevealEligibility
+  alias GolfScoring.Competition.Services.AcceptCompetitionSideRetirement
+  alias GolfScoring.Competition.Services.ExcludeCompetitionSideBeforeHole
   alias GolfScoring.LockProtocol
   alias GolfScoring.Repo
+  alias GolfScoring.Scoring.Services.SubmitGroupHole
+
+  @creation_key {__MODULE__, :creation}
 
   @scheduled_holes 18
 
-  @spec recheck(Ecto.UUID.t(), Ecto.UUID.t()) ::
-          {:ok, %{created?: boolean()}} | {:error, term()}
-  def recheck(round_id, round_hole_id) do
-    with :ok <- require_transaction(),
-         {:ok, specs} <- rule_specs_for_holes(round_id, [round_hole_id]),
+  @doc "Proof-free rechecks are not authorized, even inside a transaction."
+  def recheck(_round_id, _round_hole_id), do: {:error, :unauthorized_mystery_recheck}
+
+  @doc false
+  def recheck_many(_round_id, _competition_id, _holes),
+    do: {:error, :unauthorized_mystery_recheck}
+
+  @doc false
+  def recheck(round_id, round_hole_id, proof) do
+    scope = %{round_id: round_id, competition_id: nil, holes: [round_hole_id]}
+
+    with :ok <- consume_origin(proof, scope),
+         {:ok, specs} <- rule_specs_for_holes(round_id, scope.holes),
          do: recheck_specs(specs, round_id)
   end
 
   @doc false
-  @spec recheck_many(Ecto.UUID.t(), Ecto.UUID.t(), [Ecto.UUID.t()]) ::
-          {:ok, %{created?: boolean()}} | {:error, term()}
-  def recheck_many(round_id, round_competition_id, round_hole_ids)
-      when is_list(round_hole_ids) do
-    with :ok <- require_transaction(),
-         {:ok, specs} <-
-           rule_specs_for_competition(round_id, round_competition_id, round_hole_ids),
+  def recheck_many(round_id, competition_id, holes, proof) when is_list(holes) do
+    scope = %{round_id: round_id, competition_id: competition_id, holes: canonical_holes(holes)}
+
+    with :ok <- consume_origin(proof, scope),
+         {:ok, specs} <- rule_specs_for_competition(round_id, competition_id, scope.holes),
          do: recheck_specs(specs, round_id)
   end
 
-  def recheck_many(_round_id, _round_competition_id, _round_hole_ids),
-    do: {:error, :invalid_mystery_recheck_scope}
+  def recheck_many(_, _, _, _), do: {:error, :unauthorized_mystery_recheck}
 
-  defp require_transaction do
-    if Repo.in_transaction?(), do: :ok, else: {:error, :transaction_required}
+  defp consume_origin(%{owner: owner} = proof, scope)
+       when owner in [
+              SubmitGroupHole,
+              ExcludeCompetitionSideBeforeHole,
+              AcceptCompetitionSideRetirement
+            ] do
+    owner.consume_mystery_recheck(proof, scope)
+  end
+
+  defp consume_origin(_, _), do: {:error, :unauthorized_mystery_recheck}
+
+  defp canonical_holes(holes) do
+    holes |> Enum.uniq() |> Enum.sort_by(&Ecto.UUID.dump!/1)
+  rescue
+    ArgumentError -> :invalid
   end
 
   defp rule_specs_for_holes(round_id, round_hole_ids) do
@@ -336,26 +359,77 @@ defmodule GolfScoring.Competition.Services.MysteryRevealCoordinator do
          round_hole_id
        ) do
     with {:ok, route} <- group_hole_position(group_id, round_id, round_hole_id),
-         {:ok, rows} <- side_exclusion_rows(side_ids) do
+         {:ok, rows} <- side_competitive_scope_rows(side_ids) do
       side_rows = Enum.zip(side_ids, rows)
 
-      all_excluded_before_target? =
+      all_ineligible_before_target? =
         length(rows) == length(side_ids) and side_ids != [] and
           Enum.all?(side_rows, fn {side_id, row} ->
             row.side_id == side_id and
-              valid_exclusion_row?(
+              side_ineligible_before_target?(
                 row,
                 round_id,
                 round_competition_id,
                 group_id,
-                route.start_play_order
-              ) and row.effective_play_index <= route.target_play_index
+                route
+              )
           end)
 
-      if all_excluded_before_target?,
+      if all_ineligible_before_target?,
         do: {:ok, :not_applicable},
         else: {:ok, :unresolved}
     end
+  end
+
+  defp side_ineligible_before_target?(row, round_id, round_competition_id, group_id, route) do
+    exclusion_proves_ineligible_before_target?(
+      row,
+      round_id,
+      round_competition_id,
+      group_id,
+      route
+    ) or
+      retirement_proves_ineligible_before_target?(
+        row,
+        round_id,
+        round_competition_id,
+        group_id,
+        route
+      )
+  end
+
+  defp exclusion_proves_ineligible_before_target?(
+         row,
+         round_id,
+         round_competition_id,
+         group_id,
+         route
+       ) do
+    valid_exclusion_row?(
+      row,
+      round_id,
+      round_competition_id,
+      group_id,
+      route.start_play_order
+    ) and row.effective_play_index <= route.target_play_index
+  end
+
+  # Retirement effective-hole attestation is not Mystery target-hole evidence; it may
+  # only support NOT_APPLICABLE when the rule's target is exactly that attested boundary.
+  defp retirement_proves_ineligible_before_target?(
+         row,
+         round_id,
+         round_competition_id,
+         group_id,
+         route
+       ) do
+    valid_retirement_row?(
+      row,
+      round_id,
+      round_competition_id,
+      group_id,
+      route.start_play_order
+    ) and row.retired_effective_play_index == route.target_play_index
   end
 
   defp group_hole_position(group_id, round_id, round_hole_id) do
@@ -390,7 +464,7 @@ defmodule GolfScoring.Competition.Services.MysteryRevealCoordinator do
     end
   end
 
-  defp side_exclusion_rows(side_ids) do
+  defp side_competitive_scope_rows(side_ids) do
     rows =
       Repo.query!(
         """
@@ -399,12 +473,20 @@ defmodule GolfScoring.Competition.Services.MysteryRevealCoordinator do
                csr.excluded_effective_round_hole_id::text,
                csr.excluded_effective_play_index,
                csr.excluded_preplay_confirmed,
-               effective.round_id::text, effective.play_order::int
+               effective_excluded.round_id::text, effective_excluded.play_order::int,
+               retirement.playing_group_id::text,
+               retirement.effective_play_index,
+               retirement.preplay_boundary_confirmed,
+               effective_retired.round_id::text, effective_retired.play_order::int
         FROM unnest($1::uuid[]) AS required(side_id)
         LEFT JOIN competition_sides cs ON cs.id = required.side_id
         LEFT JOIN competition_side_results csr ON csr.competition_side_id = cs.id
-        LEFT JOIN round_holes effective
-          ON effective.id = csr.excluded_effective_round_hole_id
+        LEFT JOIN round_holes effective_excluded
+          ON effective_excluded.id = csr.excluded_effective_round_hole_id
+        LEFT JOIN competition_side_retirements retirement
+          ON retirement.competition_side_id = cs.id
+        LEFT JOIN round_holes effective_retired
+          ON effective_retired.id = retirement.effective_round_hole_id
         ORDER BY required.side_id
         """,
         [Enum.map(side_ids, &Ecto.UUID.dump!/1)]
@@ -419,7 +501,12 @@ defmodule GolfScoring.Competition.Services.MysteryRevealCoordinator do
                        effective_play_index,
                        preplay_confirmed,
                        effective_round_id,
-                       effective_play_order
+                       effective_play_order,
+                       retired_group_id,
+                       retired_effective_index,
+                       retired_preplay_confirmed,
+                       retired_effective_round_id,
+                       retired_effective_play_order
                      ] ->
         %{
           side_id: cast_optional_uuid(side_id),
@@ -431,7 +518,12 @@ defmodule GolfScoring.Competition.Services.MysteryRevealCoordinator do
           effective_play_index: effective_play_index,
           preplay_confirmed?: preplay_confirmed,
           effective_round_id: cast_optional_uuid(effective_round_id),
-          effective_play_order: effective_play_order
+          effective_play_order: effective_play_order,
+          retired_group_id: cast_optional_uuid(retired_group_id),
+          retired_effective_play_index: retired_effective_index,
+          retired_preplay_confirmed?: retired_preplay_confirmed,
+          retired_effective_round_id: cast_optional_uuid(retired_effective_round_id),
+          retired_effective_play_order: retired_effective_play_order
         }
       end)
 
@@ -444,6 +536,12 @@ defmodule GolfScoring.Competition.Services.MysteryRevealCoordinator do
     valid_excluded_side?(row, round_id, round_competition_id, group_id) and
       valid_effective_hole?(row, round_id) and
       valid_effective_play_index?(row, start_play_order)
+  end
+
+  defp valid_retirement_row?(row, round_id, round_competition_id, group_id, start_play_order) do
+    valid_retired_side?(row, round_id, round_competition_id, group_id) and
+      valid_retired_effective_hole?(row, round_id) and
+      valid_retired_effective_play_index?(row, start_play_order)
   end
 
   defp valid_excluded_side?(row, round_id, round_competition_id, group_id) do
@@ -463,15 +561,61 @@ defmodule GolfScoring.Competition.Services.MysteryRevealCoordinator do
         row.effective_play_index
   end
 
+  defp valid_retired_side?(row, round_id, round_competition_id, group_id) do
+    not is_nil(row.retired_group_id) and row.side_round_id == round_id and
+      row.side_competition_id == round_competition_id and row.retired_group_id == group_id and
+      row.retired_preplay_confirmed? == true
+  end
+
+  defp valid_retired_effective_hole?(row, round_id) do
+    not is_nil(row.retired_effective_round_id) and row.retired_effective_round_id == round_id
+  end
+
+  defp valid_retired_effective_play_index?(row, start_play_order) do
+    is_integer(row.retired_effective_play_index) and row.retired_effective_play_index in 0..17 and
+      is_integer(row.retired_effective_play_order) and
+      Integer.mod(row.retired_effective_play_order - start_play_order, @scheduled_holes) ==
+        row.retired_effective_play_index
+  end
+
   defp cast_optional_uuid(nil), do: nil
   defp cast_optional_uuid(value), do: Ecto.UUID.cast!(value)
 
+  # This private call is reachable only after the locked current A2 evaluation.
   defp create_reveal(rule_id) do
-    case MysteryReveal
-         |> Changeset.for_create(:create_internal, %{mystery_hole_rule_id: rule_id})
-         |> Ash.create(authorize?: false) do
-      {:ok, _reveal} -> {:ok, true}
-      {:error, error} -> {:error, error}
+    proof = %{token: make_ref(), pid: self(), transaction_id: transaction_id(), rule_id: rule_id}
+    if Process.get(@creation_key), do: Repo.rollback(:nested_mystery_creation)
+    Process.put(@creation_key, proof)
+
+    try do
+      case MysteryReveal
+           |> Changeset.for_create(:create_internal, %{mystery_hole_rule_id: rule_id})
+           |> Changeset.set_context(%{mystery_reveal_creation: proof.token})
+           |> Ash.create(authorize?: false) do
+        {:ok, _reveal} -> {:ok, true}
+        {:error, error} -> {:error, error}
+      end
+    after
+      Process.delete(@creation_key)
     end
   end
+
+  @doc false
+  def consume_creation(token, rule_id) do
+    case Process.get(@creation_key) do
+      %{token: ^token, pid: pid, transaction_id: transaction, rule_id: ^rule_id}
+      when pid == self() ->
+        if Repo.in_transaction?() and transaction == transaction_id() do
+          Process.delete(@creation_key)
+          :ok
+        else
+          {:error, :unauthorized_mystery_creation}
+        end
+
+      _ ->
+        {:error, :unauthorized_mystery_creation}
+    end
+  end
+
+  defp transaction_id, do: Repo.query!("SELECT pg_current_xact_id()::text").rows |> hd() |> hd()
 end
