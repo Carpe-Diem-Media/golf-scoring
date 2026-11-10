@@ -18,6 +18,7 @@ defmodule GolfScoring.Scoring do
   alias GolfScoring.Scoring.Services.DecideScoreQuery
   alias GolfScoring.Scoring.Services.EscalateScoreQuery
   alias GolfScoring.Scoring.Services.LoadGroupScorecard
+  alias GolfScoring.Scoring.Services.LoadPlayerVerificationContext
   alias GolfScoring.Scoring.Services.OpenScoreQuery
   alias GolfScoring.Scoring.Services.OverrideHandicapBasis
   alias GolfScoring.Scoring.Services.ResolveScoreQueryWithCorrection
@@ -151,6 +152,16 @@ defmodule GolfScoring.Scoring do
   """
   def verify_hole_result(actor, event_id, round_id, command) do
     VerifyHoleResult.run(actor, event_id, round_id, command)
+  end
+
+  @doc """
+  Loads a current group verification projection for a trusted player grant.
+
+  Eligibility is advisory; verification rechecks authority and revision under lock.
+  Expired grants are rejected without applying the session helper's lazy expiry.
+  """
+  def load_player_verification_context(grant, event_id, round_id, group_id) do
+    LoadPlayerVerificationContext.run(grant, event_id, round_id, group_id)
   end
 
   @doc """
