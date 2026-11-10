@@ -6,6 +6,7 @@ defmodule GolfScoring.Scoring.ScoreVerificationTest do
   alias Ecto.Adapters.SQL.Sandbox
   alias GolfScoring.Accounts
   alias GolfScoring.Accounts.EventAuthorityLock
+  alias GolfScoring.Accounts.StaffUser
   alias GolfScoring.Audit.AuditEvent
   alias GolfScoring.Competition
   alias GolfScoring.Competition.GroupRoleAssignment
@@ -141,13 +142,40 @@ defmodule GolfScoring.Scoring.ScoreVerificationTest do
              )
   end
 
+  test "a map containing an authorized admin ID cannot override or write audit evidence" do
+    f = fixture!(2)
+    command = Map.put(command(f, f.scorer_result, f.verifier_assignment), :reason, "exception")
+
+    assert {:error, :invalid_actor} =
+             Scoring.override_hole_verification(
+               %{id: f.admin.id},
+               f.event.id,
+               f.round.id,
+               command
+             )
+
+    assert %{rows: [[0]]} =
+             Repo.query!(
+               "SELECT count(*) FROM score_verifications WHERE hole_result_id = $1::uuid",
+               [
+                 Ecto.UUID.dump!(f.scorer_result.id)
+               ]
+             )
+
+    assert %{rows: [[0]]} =
+             Repo.query!(
+               "SELECT count(*) FROM audit_events WHERE action = 'override_hole_verification' AND context->>'round_id' = $1",
+               [f.round.id]
+             )
+  end
+
   test "staff override requires a reason and records a single audit without impersonating a player" do
     f = fixture!(2)
     command = command(f, f.scorer_result, f.verifier_assignment)
 
     assert {:error, :forbidden} =
              Scoring.override_hole_verification(
-               %{id: Ecto.UUID.generate()},
+               %StaffUser{id: Ecto.UUID.generate()},
                f.event.id,
                f.round.id,
                Map.put(command, :reason, "exception")
