@@ -23,9 +23,11 @@ defmodule GolfScoring.Scoring.Services.CorrectHoleResult do
   alias GolfScoring.Scoring.HoleResult
   alias GolfScoring.Scoring.ScoreRevision
   alias GolfScoring.Scoring.ScoreVerification
+  alias GolfScoring.Scoring.ScoreVerificationWriteGuard
   alias GolfScoring.Scoring.Services.CorrectionNotifier
 
   @gate_key {__MODULE__, :write}
+  @verification_gate_key {__MODULE__, :verification_write}
 
   @doc "Corrects a gross score using expected_revision, new_gross_strokes and reason."
   def run(actor, event_id, round_id, command) do
@@ -298,7 +300,7 @@ defmodule GolfScoring.Scoring.Services.CorrectHoleResult do
       |> Ash.read_one!(authorize?: false)
 
     validate_old_verification!(old, gate)
-    supersede!(old)
+    supersede!(old, gate)
 
     ScoreVerification
     |> Changeset.for_create(:create_pending_internal, %{
@@ -309,7 +311,7 @@ defmodule GolfScoring.Scoring.Services.CorrectHoleResult do
       playing_group_id: gate.scope.group_id,
       subject_round_entry_id: gate.scope.entry_id
     })
-    |> Ash.create(authorize?: false)
+    |> write_verification(gate)
     |> unwrap!()
   end
 
@@ -323,14 +325,61 @@ defmodule GolfScoring.Scoring.Services.CorrectHoleResult do
            do: Repo.rollback(:conflicting_verification)
   end
 
-  defp supersede!(%{status: status} = old) when status in [:verified, :overridden] do
+  defp supersede!(%{status: status} = old, gate) when status in [:verified, :overridden] do
     old
     |> Changeset.for_update(:supersede_internal, %{})
-    |> Ash.update(authorize?: false)
+    |> write_verification(gate)
     |> unwrap!()
   end
 
-  defp supersede!(_), do: :ok
+  defp supersede!(_, _), do: :ok
+
+  # Only reached inside the validated correction's certification phase.
+  defp write_verification(changeset, correction) do
+    proof = %{
+      owner: __MODULE__,
+      operation: :correct,
+      authority: correction.evidence,
+      event_id: correction.event_id,
+      action: changeset.action.name,
+      scope: ScoreVerificationWriteGuard.scope(changeset),
+      record: changeset.data,
+      pid: self(),
+      token: make_ref(),
+      transaction_id: transaction_id(),
+      used?: false
+    }
+
+    if Process.get(@verification_gate_key), do: Repo.rollback(:nested_verification_write)
+    Process.put(@verification_gate_key, proof)
+
+    try do
+      changeset =
+        Changeset.set_context(changeset, %{
+          score_verification_write: %{owner: __MODULE__, token: proof.token}
+        })
+
+      case changeset.action_type do
+        :create -> Ash.create(changeset, authorize?: false)
+        :update -> Ash.update(changeset, authorize?: false)
+      end
+    after
+      Process.delete(@verification_gate_key)
+    end
+  end
+
+  @doc false
+  def consume_verification_write(changeset) do
+    proof = Process.get(@verification_gate_key)
+
+    if ScoreVerificationWriteGuard.matches?(changeset, proof, __MODULE__) and
+         Repo.in_transaction?() and proof.transaction_id == transaction_id() do
+      Process.put(@verification_gate_key, %{proof | used?: true})
+      :ok
+    else
+      {:error, :unauthorized_verification_write}
+    end
+  end
 
   defp audit!(gate, revision) do
     Audit.record_staff_event(

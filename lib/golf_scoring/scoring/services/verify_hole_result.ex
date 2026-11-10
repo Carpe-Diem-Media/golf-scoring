@@ -12,6 +12,9 @@ defmodule GolfScoring.Scoring.Services.VerifyHoleResult do
   alias GolfScoring.LockProtocol
   alias GolfScoring.Repo
   alias GolfScoring.Scoring.ScoreVerification
+  alias GolfScoring.Scoring.ScoreVerificationWriteGuard
+
+  @verification_gate_key {__MODULE__, :verification_write}
 
   def run(actor, event_id, round_id, command),
     do: execute(actor, event_id, round_id, command, :verify)
@@ -56,7 +59,7 @@ defmodule GolfScoring.Scoring.Services.VerifyHoleResult do
          {:ok, result} <- current_result(ids.result_id, scorecard_id),
          :ok <- validate_result(result, ids.round_id, ids.group_id, ids.revision),
          {:ok, evidence} <- eligibility(actor_context, assignments, result, command, operation),
-         {:ok, verification} <- certify(result, ids.group_id, evidence, operation) do
+         {:ok, verification} <- certify(result, ids.group_id, evidence, operation, ids.event_id) do
       verification
     else
       {:error, reason} -> Repo.rollback(reason)
@@ -217,7 +220,9 @@ defmodule GolfScoring.Scoring.Services.VerifyHoleResult do
 
   defp eligible_role?(_, _, _), do: false
 
-  defp certify(result, group_id, evidence, operation) do
+  defp certify(result, group_id, evidence, operation, event_id) do
+    authority = %{operation: operation, evidence: evidence, event_id: event_id}
+
     existing =
       ScoreVerification
       |> Ash.Query.filter(
@@ -225,14 +230,14 @@ defmodule GolfScoring.Scoring.Services.VerifyHoleResult do
       )
       |> Ash.read_one!(authorize?: false)
 
-    with {:ok, pending} <- pending(existing, result, group_id),
-         {:ok, verification} <- transition(pending, evidence, operation),
+    with {:ok, pending} <- pending(existing, result, group_id, authority),
+         {:ok, verification} <- transition(pending, evidence, operation, authority),
          :ok <- audit_override(verification, evidence, operation, pending.status) do
       {:ok, verification}
     end
   end
 
-  defp pending(nil, result, group_id) do
+  defp pending(nil, result, group_id, authority) do
     ScoreVerification
     |> Changeset.for_create(:create_pending_internal, %{
       hole_result_id: result.id,
@@ -242,10 +247,10 @@ defmodule GolfScoring.Scoring.Services.VerifyHoleResult do
       playing_group_id: group_id,
       subject_round_entry_id: result.subject_id
     })
-    |> Ash.create(authorize?: false)
+    |> write_verification(authority)
   end
 
-  defp pending(existing, result, group_id) do
+  defp pending(existing, result, group_id, _authority) do
     if existing.scorecard_id == result.scorecard_id and existing.round_id == result.round_id and
          existing.subject_round_entry_id == result.subject_id and
          existing.playing_group_id == group_id do
@@ -255,24 +260,73 @@ defmodule GolfScoring.Scoring.Services.VerifyHoleResult do
     end
   end
 
-  defp transition(%{status: :pending} = pending, evidence, operation) do
+  defp transition(%{status: :pending} = pending, evidence, operation, authority) do
     action = if operation == :verify, do: :verify_internal, else: :override_internal
-    pending |> Changeset.for_update(action, evidence) |> Ash.update(authorize?: false)
+    pending |> Changeset.for_update(action, evidence) |> write_verification(authority)
   end
 
-  defp transition(%{status: :verified} = existing, evidence, :verify) do
+  defp transition(%{status: :verified} = existing, evidence, :verify, _authority) do
     if Enum.all?(evidence, fn {key, value} -> Map.get(existing, key) == value end),
       do: {:ok, existing},
       else: {:error, :conflicting_certification}
   end
 
-  defp transition(%{status: :overridden} = existing, evidence, :override) do
+  defp transition(%{status: :overridden} = existing, evidence, :override, _authority) do
     if Enum.all?(evidence, fn {key, value} -> Map.get(existing, key) == value end),
       do: {:ok, existing},
       else: {:error, :conflicting_certification}
   end
 
-  defp transition(_, _, _), do: {:error, :conflicting_certification}
+  defp transition(_, _, _, _), do: {:error, :conflicting_certification}
+
+  # Issuance stays private and follows locked actor, assignment and revision checks.
+  defp write_verification(changeset, authority) do
+    proof = %{
+      owner: __MODULE__,
+      operation: authority.operation,
+      authority: authority,
+      action: changeset.action.name,
+      scope: ScoreVerificationWriteGuard.scope(changeset),
+      record: changeset.data,
+      pid: self(),
+      token: make_ref(),
+      transaction_id: verification_transaction_id(),
+      used?: false
+    }
+
+    if Process.get(@verification_gate_key), do: Repo.rollback(:nested_verification_write)
+    Process.put(@verification_gate_key, proof)
+
+    try do
+      changeset =
+        Changeset.set_context(changeset, %{
+          score_verification_write: %{owner: __MODULE__, token: proof.token}
+        })
+
+      case changeset.action_type do
+        :create -> Ash.create(changeset, authorize?: false)
+        :update -> Ash.update(changeset, authorize?: false)
+      end
+    after
+      Process.delete(@verification_gate_key)
+    end
+  end
+
+  @doc false
+  def consume_verification_write(changeset) do
+    proof = Process.get(@verification_gate_key)
+
+    if ScoreVerificationWriteGuard.matches?(changeset, proof, __MODULE__) and
+         Repo.in_transaction?() and proof.transaction_id == verification_transaction_id() do
+      Process.put(@verification_gate_key, %{proof | used?: true})
+      :ok
+    else
+      {:error, :unauthorized_verification_write}
+    end
+  end
+
+  defp verification_transaction_id,
+    do: Repo.query!("SELECT pg_current_xact_id()::text").rows |> hd() |> hd()
 
   defp audit_override(_, _, :verify, _), do: :ok
   defp audit_override(_, _, :override, :overridden), do: :ok

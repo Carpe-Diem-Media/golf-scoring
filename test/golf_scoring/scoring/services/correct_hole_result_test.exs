@@ -522,16 +522,20 @@ defmodule GolfScoring.Scoring.Services.CorrectHoleResultTest do
   end
 
   defp certification!(f, :pending) do
-    GolfScoring.Scoring.ScoreVerification
-    |> Changeset.for_create(:create_pending_internal, %{
-      hole_result_id: f.hole_id,
-      hole_result_revision: 1,
-      scorecard_id: f.card_id,
-      round_id: f.round.id,
-      playing_group_id: f.group.id,
-      subject_round_entry_id: hd(f.entries).id
-    })
-    |> Ash.create!(authorize?: false)
+    # Synthetic pre-existing pending history, not a production authorization path.
+    [[id]] =
+      Repo.query!(
+        "INSERT INTO score_verifications (hole_result_id, hole_result_revision, scorecard_id, round_id, playing_group_id, subject_round_entry_id) VALUES ($1::uuid, 1, $2::uuid, $3::uuid, $4::uuid, $5::uuid) RETURNING id::text",
+        [
+          uuid(f.hole_id),
+          uuid(f.card_id),
+          uuid(f.round.id),
+          uuid(f.group.id),
+          uuid(hd(f.entries).id)
+        ]
+      ).rows
+
+    Ash.get!(GolfScoring.Scoring.ScoreVerification, Ecto.UUID.cast!(id), authorize?: false)
   end
 
   defp snapshot(f) do

@@ -182,8 +182,8 @@ defmodule GolfScoring.Scoring.ScoreVerificationTest do
     assert [%{reason: "marker unavailable"}] = events
   end
 
-  test "only a certified non-current revision can be superseded" do
-    f = fixture!(2)
+  test "only authorized correction supersedes certified evidence and requires fresh verification" do
+    f = fixture!(2, true)
     assert {:ok, verified} = verify(f, f.verifier_grant, f.scorer_result, f.verifier_assignment)
 
     assert {:error, _} =
@@ -191,16 +191,17 @@ defmodule GolfScoring.Scoring.ScoreVerificationTest do
              |> Changeset.for_update(:supersede_internal, %{})
              |> Ash.update(authorize?: false)
 
-    Repo.query!("UPDATE hole_results SET revision = revision + 1 WHERE id = $1::uuid", [
-      Ecto.UUID.dump!(f.scorer_result.id)
-    ])
+    assert {:ok, correction} =
+             Scoring.correct_hole_result(f.admin, f.event.id, f.round.id, %{
+               hole_result_id: f.scorer_result.id,
+               expected_revision: 1,
+               new_gross_strokes: 6,
+               reason: "correct counted strokes"
+             })
 
-    assert {:ok, superseded} =
-             verified
-             |> Changeset.for_update(:supersede_internal, %{})
-             |> Ash.update(authorize?: false)
-
+    superseded = Ash.get!(GolfScoring.Scoring.ScoreVerification, verified.id, authorize?: false)
     assert superseded.status == :superseded
+    assert correction.verification.status == :pending
 
     assert {:error, :stale_revision} =
              verify(f, f.verifier_grant, f.scorer_result, f.verifier_assignment)
@@ -364,10 +365,31 @@ defmodule GolfScoring.Scoring.ScoreVerificationTest do
       role_assignment_version: assignment.assignment_version
     }
 
-  defp fixture!(count) do
+  defp fixture!(count, with_side? \\ false) do
     f = PaperRecoveryFixtures.setup_submit_fixture!(count)
     [scorer, verifier | _] = f.entries
     PaperRecoveryFixtures.set_round_state!(f.round, :draft)
+
+    if with_side? do
+      assert {:ok, side} =
+               Competition.create_competition_side(
+                 f.admin,
+                 f.event.id,
+                 f.round.id,
+                 f.competition.id,
+                 :partnership
+               )
+
+      assert {:ok, _} =
+               Competition.set_side_membership(
+                 f.admin,
+                 f.event.id,
+                 f.round.id,
+                 f.competition.id,
+                 side.id,
+                 Enum.map(f.entries, & &1.id)
+               )
+    end
 
     assert {:ok, verifier_assignment} =
              Competition.assign_designated_verifier(
