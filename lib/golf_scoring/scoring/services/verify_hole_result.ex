@@ -8,6 +8,7 @@ defmodule GolfScoring.Scoring.Services.VerifyHoleResult do
   alias GolfScoring.Accounts.EventAuthorityLock
   alias GolfScoring.Accounts.PlayerAccessGrant
   alias GolfScoring.Accounts.PlayerAccessGrantGuard
+  alias GolfScoring.Accounts.StaffUser
   alias GolfScoring.Audit
   alias GolfScoring.LockProtocol
   alias GolfScoring.Repo
@@ -85,7 +86,7 @@ defmodule GolfScoring.Scoring.Services.VerifyHoleResult do
     end
   end
 
-  defp lock_actor(%{id: id}, event_id, :override) do
+  defp lock_actor(%StaffUser{id: id}, event_id, :override) do
     with {:ok, id} <- Ecto.UUID.cast(id),
          {:ok, _} <- EventAuthorityLock.lock_scope!(event_id, [id]),
          true <- ActiveEventRole.authorized?(id, event_id, [:event_admin, :competition_manager]) do
