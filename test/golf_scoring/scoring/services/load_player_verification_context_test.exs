@@ -5,6 +5,7 @@ defmodule GolfScoring.Scoring.Services.LoadPlayerVerificationContextTest do
   alias GolfScoring.Accounts
   alias GolfScoring.Competition
   alias GolfScoring.Competition.GroupRoleAssignment
+  alias GolfScoring.Competition.Services.AssignPlayingGroupStart
   alias GolfScoring.Scoring
   alias GolfScoring.Scoring.HoleResult
   alias GolfScoring.Scoring.Scorecard
@@ -158,6 +159,77 @@ defmodule GolfScoring.Scoring.Services.LoadPlayerVerificationContextTest do
     assert Enum.find(context.results, &(&1.hole_result_id == f.scorer_result.id)).query_review?
     refute Enum.any?(context.results, &(&1.hole_result_id == other.scorer_result.id))
     refute inspect(context) =~ "staff-only query detail"
+  end
+
+  test "players cannot read another populated group in the same event and round" do
+    f = fixture!()
+    PaperRecoveryFixtures.set_round_state!(f.round, :draft)
+
+    assert {:ok, group_b} =
+             Competition.create_playing_group(f.event.id, f.round.id, actor: f.admin)
+
+    assert {:ok, _} =
+             AssignPlayingGroupStart.run(
+               f.admin,
+               f.event.id,
+               f.round.id,
+               group_b.id,
+               f.start_hole.id,
+               2
+             )
+
+    entries_b = PaperRecoveryFixtures.add_player_entries_to_group!(f, group_b, 2)
+    verifier_b = Enum.at(entries_b, 1)
+
+    assert {:ok, _} =
+             Competition.assign_designated_verifier(
+               f.admin,
+               f.event.id,
+               f.round.id,
+               group_b.id,
+               verifier_b.id
+             )
+
+    PaperRecoveryFixtures.set_round_state!(f.round, :scoring_open)
+
+    assert {:ok, %{grant: grant_b}} =
+             Accounts.issue_player_access(f.admin, f.event.id, verifier_b.player_id)
+
+    assert {:ok, _} =
+             Scoring.submit_group_hole(f.admin, f.event.id, f.round.id, %{
+               client_submission_id: Ecto.UUID.generate(),
+               playing_group_id: group_b.id,
+               round_hole_id: f.start_hole.id,
+               expected_group_score_revision: 0,
+               captured_at: DateTime.utc_now(),
+               results:
+                 Enum.map(
+                   entries_b,
+                   &%{round_entry_id: &1.id, outcome: :holed_out, gross_strokes: 5}
+                 )
+             })
+
+    group_a_results = Enum.map(f.entries, &result!(&1.id).id) |> MapSet.new()
+    group_b_results = Enum.map(entries_b, &result!(&1.id).id) |> MapSet.new()
+    assert MapSet.size(group_a_results) == 2
+    assert MapSet.size(group_b_results) == 2
+    assert MapSet.disjoint?(group_a_results, group_b_results)
+
+    assert {:error, :not_authorized} =
+             Scoring.load_player_verification_context(
+               f.verifier_grant,
+               f.event.id,
+               f.round.id,
+               group_b.id
+             )
+
+    assert {:ok, context_a} = load(f, f.verifier_grant)
+
+    assert {:ok, context_b} =
+             Scoring.load_player_verification_context(grant_b, f.event.id, f.round.id, group_b.id)
+
+    assert MapSet.new(context_a.results, & &1.hole_result_id) == group_a_results
+    assert MapSet.new(context_b.results, & &1.hole_result_id) == group_b_results
   end
 
   test "a correction exposes pending current evidence and superseded historical evidence" do
