@@ -382,20 +382,54 @@ defmodule GolfScoring.Competition.Services.MysteryRevealCoordinator do
   end
 
   defp side_ineligible_before_target?(row, round_id, round_competition_id, group_id, route) do
-    (valid_exclusion_row?(
-       row,
-       round_id,
-       round_competition_id,
-       group_id,
-       route.start_play_order
-     ) and row.effective_play_index <= route.target_play_index) or
-      (valid_retirement_row?(
+    exclusion_proves_ineligible_before_target?(
+      row,
+      round_id,
+      round_competition_id,
+      group_id,
+      route
+    ) or
+      retirement_proves_ineligible_before_target?(
+        row,
+        round_id,
+        round_competition_id,
+        group_id,
+        route
+      )
+  end
+
+  defp exclusion_proves_ineligible_before_target?(
          row,
          round_id,
          round_competition_id,
          group_id,
-         route.start_play_order
-       ) and row.retired_effective_play_index <= route.target_play_index)
+         route
+       ) do
+    valid_exclusion_row?(
+      row,
+      round_id,
+      round_competition_id,
+      group_id,
+      route.start_play_order
+    ) and row.effective_play_index <= route.target_play_index
+  end
+
+  # Retirement effective-hole attestation is not Mystery target-hole evidence; it may
+  # only support NOT_APPLICABLE when the rule's target is exactly that attested boundary.
+  defp retirement_proves_ineligible_before_target?(
+         row,
+         round_id,
+         round_competition_id,
+         group_id,
+         route
+       ) do
+    valid_retirement_row?(
+      row,
+      round_id,
+      round_competition_id,
+      group_id,
+      route.start_play_order
+    ) and row.retired_effective_play_index == route.target_play_index
   end
 
   defp group_hole_position(group_id, round_id, round_hole_id) do

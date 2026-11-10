@@ -402,6 +402,46 @@ defmodule GolfScoring.Competition.Services.AcceptCompetitionSideRetirementTest d
     assert count_for_rule("mystery_reveals", setup.mystery.rule.id) == 1
   end
 
+  test "retirement at effective boundary does not resolve a later mystery target without submission" do
+    setup = PaperRecoveryFixtures.setup_two_group_mystery_fixture!()
+    holes = round_holes_in_play_order(setup.round.id)
+    later_mystery_hole = Enum.at(holes, 2).id
+
+    Repo.query!(
+      "UPDATE mystery_hole_rules SET round_hole_id = $1::uuid WHERE id = $2::uuid",
+      [Ecto.UUID.dump!(later_mystery_hole), Ecto.UUID.dump!(setup.mystery.rule.id)]
+    )
+
+    side_a = side_id_for_entries(setup.entries)
+    side_b = side_id_for_entries(setup.entries_b)
+    {checkpoint_a, effective_a} = checkpoint_and_effective!(setup, setup.group, setup.entries)
+    {checkpoint_b, effective_b} = checkpoint_and_effective!(setup, setup.group_b, setup.entries_b)
+
+    assert {:ok, %{mystery_reveal_created?: false}} =
+             accept(
+               setup,
+               side_a,
+               checkpoint_a,
+               effective_a,
+               Ecto.UUID.generate(),
+               %{playing_group_id: setup.group.id}
+             )
+
+    assert {:ok, %{mystery_reveal_created?: false}} =
+             accept(
+               setup,
+               side_b,
+               checkpoint_b,
+               effective_b,
+               Ecto.UUID.generate(),
+               %{playing_group_id: setup.group_b.id, reason: "partner group retirement"}
+             )
+
+    assert count_for_rule("mystery_reveals", setup.mystery.rule.id) == 0
+    refute accepted_submission?(setup.round.id, setup.group.id, later_mystery_hole)
+    refute accepted_submission?(setup.round.id, setup.group_b.id, later_mystery_hole)
+  end
+
   test "one still-eligible side keeps mystery unresolved without submission" do
     setup = PaperRecoveryFixtures.setup_two_group_mystery_fixture!()
     holes = round_holes_in_play_order(setup.round.id)

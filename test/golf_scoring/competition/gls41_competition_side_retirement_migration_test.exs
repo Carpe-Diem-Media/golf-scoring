@@ -53,7 +53,9 @@ defmodule GolfScoring.Competition.Gls41CompetitionSideRetirementMigrationTest do
 
     {checkpoint, effective} = checkpoint_and_effective_for_group!(setup, group_a, setup.entries)
 
-    assert_raise Postgrex.Error, fn ->
+    fingerprint = :crypto.strong_rand_bytes(32)
+
+    try do
       Repo.query!(
         """
         INSERT INTO competition_side_retirements (
@@ -65,7 +67,7 @@ defmodule GolfScoring.Competition.Gls41CompetitionSideRetirementMigrationTest do
         )
         SELECT
           r.event_id, r.id, cs.round_competition_id, $2::uuid, $4::uuid, $3::uuid, $5::uuid,
-          'scope probe', gen_random_uuid(), gen_random_bytes(32),
+          'scope probe', gen_random_uuid(), $9::bytea,
           $6::uuid, $7::uuid, 0, $8::uuid, 1, true, now()
         FROM rounds r
         JOIN competition_sides cs ON cs.id = $2::uuid
@@ -79,9 +81,18 @@ defmodule GolfScoring.Competition.Gls41CompetitionSideRetirementMigrationTest do
           Ecto.UUID.dump!(setup.admin.id),
           Ecto.UUID.dump!(checkpoint.submission_id),
           Ecto.UUID.dump!(checkpoint.hole_id),
-          Ecto.UUID.dump!(effective.hole_id)
+          Ecto.UUID.dump!(effective.hole_id),
+          fingerprint
         ]
       )
+
+      flunk("expected competition_side_retirements_competition_side_result_id_fkey violation")
+    rescue
+      error in Postgrex.Error ->
+        assert error.postgres.code == :foreign_key_violation
+
+        assert error.postgres.constraint ==
+                 "competition_side_retirements_competition_side_result_id_fkey"
     end
   end
 
