@@ -27,6 +27,7 @@ defmodule GolfScoring.Scoring.Services.SubmitGroupHole do
   @required_participation ~w(not_started active)
   @scheduled_holes 18
   @progression_batch_key {__MODULE__, :progression_batch}
+  @mystery_gate_key {__MODULE__, :mystery_recheck}
 
   @type command :: map()
 
@@ -364,7 +365,7 @@ defmodule GolfScoring.Scoring.Services.SubmitGroupHole do
              event_id
            ),
          {:ok, reveal_result} <-
-           MysteryRevealCoordinator.recheck(round_id, expected_hole_id) do
+           recheck_mystery(receipt, event_id) do
       broadcast_payload = %{
         round_id: round_id,
         playing_group_id: cmd.playing_group_id,
@@ -382,6 +383,74 @@ defmodule GolfScoring.Scoring.Services.SubmitGroupHole do
        }}
     end
   end
+
+  # Issued only after this operation persisted its receipt, progression and audit.
+  defp recheck_mystery(receipt, event_id) do
+    proof = %{
+      owner: __MODULE__,
+      operation: receipt.source,
+      token: make_ref(),
+      pid: self(),
+      transaction_id: mystery_transaction_id(),
+      event_id: event_id,
+      round_id: receipt.round_id,
+      group_id: receipt.playing_group_id,
+      receipt_id: receipt.id,
+      holes: [receipt.round_hole_id],
+      used?: false
+    }
+
+    if Process.get(@mystery_gate_key), do: Repo.rollback(:nested_mystery_recheck)
+    Process.put(@mystery_gate_key, proof)
+
+    try do
+      MysteryRevealCoordinator.recheck(receipt.round_id, receipt.round_hole_id, proof)
+    after
+      Process.delete(@mystery_gate_key)
+    end
+  end
+
+  @doc false
+  def consume_mystery_recheck(proof, scope) do
+    gate = Process.get(@mystery_gate_key)
+
+    if is_map(gate) and gate == proof and not gate.used? and gate.pid == self() and
+         scope == %{round_id: gate.round_id, competition_id: nil, holes: gate.holes} and
+         Repo.in_transaction?() and gate.transaction_id == mystery_transaction_id() and
+         persisted_mystery_submission?(gate) do
+      Process.put(@mystery_gate_key, %{gate | used?: true})
+      :ok
+    else
+      {:error, :unauthorized_mystery_recheck}
+    end
+  end
+
+  defp persisted_mystery_submission?(gate) do
+    Repo.query!(
+      """
+      SELECT 1 FROM hole_submissions hs
+      JOIN rounds r ON r.id = hs.round_id
+      JOIN playing_groups pg ON pg.id = hs.playing_group_id AND pg.round_id = r.id
+      WHERE hs.id = $1::uuid AND r.id = $2::uuid AND r.event_id = $3::uuid
+        AND hs.playing_group_id = $4::uuid AND hs.round_hole_id = $5::uuid
+        AND hs.source = $6 AND pg.scoring_revision = hs.expected_group_score_revision + 1
+        AND r.state = 'scoring_open'
+        AND EXISTS (SELECT 1 FROM audit_events a WHERE a.target_id = hs.id
+                    AND a.action = 'submit_group_hole')
+      """,
+      [
+        Ecto.UUID.dump!(gate.receipt_id),
+        Ecto.UUID.dump!(gate.round_id),
+        Ecto.UUID.dump!(gate.event_id),
+        Ecto.UUID.dump!(gate.group_id),
+        Ecto.UUID.dump!(hd(gate.holes)),
+        gate.operation
+      ]
+    ).rows == [[1]]
+  end
+
+  defp mystery_transaction_id,
+    do: Repo.query!("SELECT pg_current_xact_id()::text").rows |> hd() |> hd()
 
   defp resolve_idempotency(cmd, actor_ctx, round_id) do
     fingerprint = payload_fingerprint(cmd, actor_ctx)

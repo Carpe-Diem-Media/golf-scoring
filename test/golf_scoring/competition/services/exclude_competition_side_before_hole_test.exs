@@ -259,19 +259,23 @@ defmodule GolfScoring.Competition.Services.ExcludeCompetitionSideBeforeHoleTest 
   end
 
   test "disqualification alone does not resolve a Mystery group" do
-    {setup, mystery} = single_group_mystery!()
+    setup = PaperRecoveryFixtures.setup_two_group_mystery_fixture!()
 
+    # Synthetic unsupported participation state, not a production DQ workflow.
     Repo.query!(
       "UPDATE round_entries SET participation_status = 'disqualified' WHERE playing_group_id = $1::uuid",
       [Ecto.UUID.dump!(setup.group.id)]
     )
 
-    assert {:ok, {:ok, %{created?: false}}} =
-             Repo.transaction(fn ->
-               MysteryRevealCoordinator.recheck(setup.round.id, mystery.rule.round_hole_id)
-             end)
+    assert {:ok, _} =
+             submit_first_hole(setup, setup.group_b, setup.entries_b, setup.start_hole.id)
 
-    assert count_for_rule("mystery_reveals", mystery.rule.id) == 0
+    assert count_for_rule("mystery_reveals", setup.mystery.rule.id) == 0
+
+    assert {:ok, {:error, :unauthorized_mystery_recheck}} =
+             Repo.transaction(fn ->
+               MysteryRevealCoordinator.recheck(setup.round.id, setup.start_hole.id)
+             end)
   end
 
   test "prior accepted play can precede an exclusion, but the exclusion cannot backdate to it" do

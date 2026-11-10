@@ -9,6 +9,7 @@ defmodule GolfScoring.Scoring.Services.PaperRecoveryTest do
   alias GolfScoring.Audit.AuditEvent
   alias GolfScoring.Competition.PlayingGroup
   alias GolfScoring.Competition.RoundEntry
+  alias GolfScoring.Competition.Services.MysteryRevealCoordinator
   alias GolfScoring.Repo
   alias GolfScoring.Scoring.Services.PaperRecoveryFixtures
   alias GolfScoring.Scoring.Services.SubmitGroupHole
@@ -345,6 +346,11 @@ defmodule GolfScoring.Scoring.Services.PaperRecoveryTest do
 
     assert {:ok, receipt} = recover(setup.admin, setup, paper, "final paper scorecard")
     assert receipt.source == "paper_recovery"
+    assert Process.get({SubmitGroupHole, :mystery_recheck}) == nil
+
+    assert {:error, :unauthorized_mystery_recheck} =
+             MysteryRevealCoordinator.recheck(setup.round.id, setup.start_hole.id)
+
     assert_receive {:group_hole_submitted, _}
     assert_receive {:mystery_reveal_changed, reveal_payload}
     assert reveal_payload == %{round_id: setup.round.id}

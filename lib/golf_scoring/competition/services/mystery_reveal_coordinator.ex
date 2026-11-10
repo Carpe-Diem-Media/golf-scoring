@@ -4,35 +4,53 @@ defmodule GolfScoring.Competition.Services.MysteryRevealCoordinator do
   alias Ash.Changeset
   alias GolfScoring.Competition.MysteryReveal
   alias GolfScoring.Competition.Policies.MysteryRevealEligibility
+  alias GolfScoring.Competition.Services.ExcludeCompetitionSideBeforeHole
   alias GolfScoring.LockProtocol
   alias GolfScoring.Repo
+  alias GolfScoring.Scoring.Services.SubmitGroupHole
+
+  @creation_key {__MODULE__, :creation}
 
   @scheduled_holes 18
 
-  @spec recheck(Ecto.UUID.t(), Ecto.UUID.t()) ::
-          {:ok, %{created?: boolean()}} | {:error, term()}
-  def recheck(round_id, round_hole_id) do
-    with :ok <- require_transaction(),
-         {:ok, specs} <- rule_specs_for_holes(round_id, [round_hole_id]),
+  @doc "Proof-free rechecks are not authorized, even inside a transaction."
+  def recheck(_round_id, _round_hole_id), do: {:error, :unauthorized_mystery_recheck}
+
+  @doc false
+  def recheck_many(_round_id, _competition_id, _holes),
+    do: {:error, :unauthorized_mystery_recheck}
+
+  @doc false
+  def recheck(round_id, round_hole_id, proof) do
+    scope = %{round_id: round_id, competition_id: nil, holes: [round_hole_id]}
+
+    with :ok <- consume_origin(proof, scope),
+         {:ok, specs} <- rule_specs_for_holes(round_id, scope.holes),
          do: recheck_specs(specs, round_id)
   end
 
   @doc false
-  @spec recheck_many(Ecto.UUID.t(), Ecto.UUID.t(), [Ecto.UUID.t()]) ::
-          {:ok, %{created?: boolean()}} | {:error, term()}
-  def recheck_many(round_id, round_competition_id, round_hole_ids)
-      when is_list(round_hole_ids) do
-    with :ok <- require_transaction(),
-         {:ok, specs} <-
-           rule_specs_for_competition(round_id, round_competition_id, round_hole_ids),
+  def recheck_many(round_id, competition_id, holes, proof) when is_list(holes) do
+    scope = %{round_id: round_id, competition_id: competition_id, holes: canonical_holes(holes)}
+
+    with :ok <- consume_origin(proof, scope),
+         {:ok, specs} <- rule_specs_for_competition(round_id, competition_id, scope.holes),
          do: recheck_specs(specs, round_id)
   end
 
-  def recheck_many(_round_id, _round_competition_id, _round_hole_ids),
-    do: {:error, :invalid_mystery_recheck_scope}
+  def recheck_many(_, _, _, _), do: {:error, :unauthorized_mystery_recheck}
 
-  defp require_transaction do
-    if Repo.in_transaction?(), do: :ok, else: {:error, :transaction_required}
+  defp consume_origin(%{owner: owner} = proof, scope)
+       when owner in [SubmitGroupHole, ExcludeCompetitionSideBeforeHole] do
+    owner.consume_mystery_recheck(proof, scope)
+  end
+
+  defp consume_origin(_, _), do: {:error, :unauthorized_mystery_recheck}
+
+  defp canonical_holes(holes) do
+    holes |> Enum.uniq() |> Enum.sort_by(&Ecto.UUID.dump!/1)
+  rescue
+    ArgumentError -> :invalid
   end
 
   defp rule_specs_for_holes(round_id, round_hole_ids) do
@@ -466,12 +484,41 @@ defmodule GolfScoring.Competition.Services.MysteryRevealCoordinator do
   defp cast_optional_uuid(nil), do: nil
   defp cast_optional_uuid(value), do: Ecto.UUID.cast!(value)
 
+  # This private call is reachable only after the locked current A2 evaluation.
   defp create_reveal(rule_id) do
-    case MysteryReveal
-         |> Changeset.for_create(:create_internal, %{mystery_hole_rule_id: rule_id})
-         |> Ash.create(authorize?: false) do
-      {:ok, _reveal} -> {:ok, true}
-      {:error, error} -> {:error, error}
+    proof = %{token: make_ref(), pid: self(), transaction_id: transaction_id(), rule_id: rule_id}
+    if Process.get(@creation_key), do: Repo.rollback(:nested_mystery_creation)
+    Process.put(@creation_key, proof)
+
+    try do
+      case MysteryReveal
+           |> Changeset.for_create(:create_internal, %{mystery_hole_rule_id: rule_id})
+           |> Changeset.set_context(%{mystery_reveal_creation: proof.token})
+           |> Ash.create(authorize?: false) do
+        {:ok, _reveal} -> {:ok, true}
+        {:error, error} -> {:error, error}
+      end
+    after
+      Process.delete(@creation_key)
     end
   end
+
+  @doc false
+  def consume_creation(token, rule_id) do
+    case Process.get(@creation_key) do
+      %{token: ^token, pid: pid, transaction_id: transaction, rule_id: ^rule_id}
+      when pid == self() ->
+        if Repo.in_transaction?() and transaction == transaction_id() do
+          Process.delete(@creation_key)
+          :ok
+        else
+          {:error, :unauthorized_mystery_creation}
+        end
+
+      _ ->
+        {:error, :unauthorized_mystery_creation}
+    end
+  end
+
+  defp transaction_id, do: Repo.query!("SELECT pg_current_xact_id()::text").rows |> hd() |> hd()
 end
