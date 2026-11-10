@@ -185,6 +185,18 @@ defmodule GolfScoring.Scoring.Services.DecideScoreQueryTest do
              end)
   end
 
+  test "public wrappers reject non-map commands" do
+    f = opened_fixture!()
+
+    for bad <- [nil, [], "string", 1] do
+      assert {:error, :invalid_input} =
+               Scoring.resolve_score_query_no_change(f.admin, f.event.id, f.round.id, bad)
+
+      assert {:error, :invalid_input} =
+               Scoring.dismiss_score_query(f.admin, f.event.id, f.round.id, bad)
+    end
+  end
+
   test "wrapper entrypoints set decision" do
     f = opened_fixture!()
 
@@ -222,58 +234,13 @@ defmodule GolfScoring.Scoring.Services.DecideScoreQueryTest do
   end
 
   @tag :real_concurrency
-  test "concurrent competing decisions commit at most one transition" do
-    f = opened_fixture!()
-    parent = self()
-
-    tasks =
-      for decision <- [:resolve_no_change, :dismiss] do
-        Task.async(fn ->
-          Sandbox.allow(Repo, parent, self())
-
-          decide(f, %{
-            decision: decision,
-            reason: "race #{decision}"
-          })
-        end)
-      end
-
-    results = Enum.map(tasks, &Task.await(&1, 15_000))
-    successes = Enum.count(results, &match?({:ok, _}, &1))
-    assert successes == 1
-    assert status(f) in ["resolved", "dismissed"]
-
-    assert [[1]] =
-             Repo.query!(
-               "SELECT count(*)::integer FROM audit_events WHERE target_id = $1::uuid AND action IN ('resolve_score_query_no_change', 'dismiss_score_query')",
-               [uuid(f.query_id)]
-             ).rows
+  test "two independent decisions commit one transition, audit and terminal status" do
+    competing!(:decisions)
   end
 
   @tag :real_concurrency
-  test "escalation race remains safe against open query decision" do
-    f = opened_fixture!()
-    parent = self()
-
-    tasks = [
-      Task.async(fn ->
-        Sandbox.allow(Repo, parent, self())
-        decide(f, %{decision: :resolve_no_change, reason: "decide"})
-      end),
-      Task.async(fn ->
-        Sandbox.allow(Repo, parent, self())
-
-        Scoring.escalate_score_query(f.admin, f.event.id, f.round.id, %{
-          score_query_id: f.query_id,
-          expected_revision: 1,
-          reason: "escalate"
-        })
-      end)
-    ]
-
-    results = Enum.map(tasks, &Task.await(&1, 15_000))
-    assert Enum.count(results, &match?({:ok, _}, &1)) == 1
-    assert status(f) in ["resolved", "escalated"]
+  test "concurrent escalation remains safe against an in-flight decision" do
+    competing!(:escalation)
   end
 
   defp fixture!, do: build_fixture!()
@@ -490,6 +457,236 @@ defmodule GolfScoring.Scoring.Services.DecideScoreQueryTest do
         new_gross_strokes: 6,
         reason: "correction"
       })
+
+  defp escalate(f),
+    do:
+      Scoring.escalate_score_query(f.admin, f.event.id, f.round.id, %{
+        score_query_id: f.query_id,
+        expected_revision: 1,
+        reason: "race escalation"
+      })
+
+  defp competing!(operation) do
+    {:ok, fixture} = verified_unboxed_transaction(fn -> fixture!() end)
+    on_exit({:owned_j4b1_decide_fixture, fixture.event.id}, fn -> cleanup!(fixture) end)
+
+    f = verified_unboxed(fn -> open!(fixture) end)
+
+    IO.puts(
+      "GLS-41 J4B1 owned fixture " <>
+        inspect(%{event_id: f.event.id, round_id: f.round.id, query_id: f.query_id})
+    )
+
+    parent = self()
+
+    holder =
+      Task.async(fn ->
+        receive do
+          :start ->
+            verified_unboxed(fn ->
+              decide(f, %{decision: :resolve_no_change, reason: "holder resolve"})
+            end)
+        end
+      end)
+
+    handler = {__MODULE__, make_ref()}
+
+    :ok =
+      :telemetry.attach(handler, [:golf_scoring, :repo, :query], &__MODULE__.observe_decide/4, %{
+        owner: holder.pid,
+        parent: parent,
+        mode: :hold
+      })
+
+    send(holder.pid, :start)
+
+    try do
+      assert_receive {:write_held, holder_pid}, 10_000
+
+      contender =
+        Task.async(fn ->
+          verified_unboxed(fn ->
+            send(parent, {:contender, backend_pid!()})
+
+            case operation do
+              :decisions ->
+                decide(f, %{decision: :dismiss, reason: "contender dismiss"})
+
+              :escalation ->
+                escalate(f)
+            end
+          end)
+        end)
+
+      try do
+        assert_receive {:contender, contender_pid}, 10_000
+        assert holder_pid != contender_pid
+        await_blocked!(contender_pid, holder_pid)
+        send(holder.pid, :release)
+        holder_outcome = Task.await(holder, 15_000)
+        contender_outcome = Task.await(contender, 15_000)
+
+        case operation do
+          :decisions ->
+            assert Enum.count([holder_outcome, contender_outcome], &match?({:ok, _}, &1)) == 1
+            assert status(f) in ["resolved", "dismissed"]
+
+            verified_unboxed(fn ->
+              assert [[1]] =
+                       Repo.query!(
+                         "SELECT count(*)::integer FROM audit_events WHERE target_id = $1::uuid AND action IN ('resolve_score_query_no_change', 'dismiss_score_query')",
+                         [uuid(f.query_id)]
+                       ).rows
+            end)
+
+          :escalation ->
+            successes = Enum.count([holder_outcome, contender_outcome], &match?({:ok, _}, &1))
+            assert successes == 1
+            assert status(f) in ["resolved", "escalated"]
+
+            verified_unboxed(fn ->
+              audit_actions =
+                Repo.query!(
+                  "SELECT action FROM audit_events WHERE target_id = $1::uuid AND action IN ('resolve_score_query_no_change', 'dismiss_score_query', 'escalate_score_query') ORDER BY action",
+                  [uuid(f.query_id)]
+                ).rows
+                |> List.flatten()
+
+              assert length(audit_actions) == 1
+            end)
+        end
+      after
+        send(holder.pid, :release)
+        Task.shutdown(contender, 15_000)
+      end
+    after
+      :telemetry.detach(handler)
+      send(holder.pid, :release)
+      Task.shutdown(holder, 15_000)
+    end
+  end
+
+  @doc false
+  def observe_decide(_event, _measurements, metadata, %{owner: owner, parent: parent, mode: mode}) do
+    if self() == owner and String.contains?(metadata.query, "UPDATE") and
+         String.contains?(metadata.query, "\"score_queries\"") and
+         Process.get({GolfScoring.Scoring.Services.DecideScoreQuery, :decide}) do
+      if mode == :hold do
+        send(parent, {:write_held, backend_pid!()})
+
+        receive do
+          :release -> :ok
+        after
+          15_000 -> raise "timed out holding decide transaction"
+        end
+      end
+    end
+  end
+
+  defp backend_pid!, do: Repo.query!("SELECT pg_backend_pid()").rows |> hd() |> hd()
+
+  defp await_blocked!(waiting, blocker, deadline \\ nil) do
+    deadline = deadline || System.monotonic_time(:millisecond) + 15_000
+
+    [[blocked?]] =
+      Sandbox.unboxed_run(Repo, fn ->
+        Repo.query!("SELECT $1::integer = ANY(pg_blocking_pids($2::integer))", [blocker, waiting]).rows
+      end)
+
+    cond do
+      blocked? ->
+        :ok
+
+      System.monotonic_time(:millisecond) >= deadline ->
+        flunk("expected independent PostgreSQL transactions to block")
+
+      true ->
+        Process.sleep(10)
+        await_blocked!(waiting, blocker, deadline)
+    end
+  end
+
+  defp validate_test_identity!(:test, [["golf_scoring_test", "golf_scoring_test"]], %{
+         "CI" => nil,
+         "GITHUB_ACTIONS" => nil,
+         "GITHUB_REPOSITORY" => nil
+       }),
+       do: :ok
+
+  defp validate_test_identity!(:test, [["golf_scoring_test", "golf_scoring_ci"]], %{
+         "CI" => "true",
+         "GITHUB_ACTIONS" => "true",
+         "GITHUB_REPOSITORY" => "JCSchoeman96/golf-scoring"
+       }),
+       do: :ok
+
+  defp validate_test_identity!(_environment, _rows, _runner),
+    do: raise("refusing unboxed writes outside the allocated test database and role")
+
+  defp verified_unboxed(callback) do
+    Sandbox.unboxed_run(Repo, fn ->
+      rows = Repo.query!("SELECT current_database(), current_user").rows
+      runner = Map.new(["CI", "GITHUB_ACTIONS", "GITHUB_REPOSITORY"], &{&1, System.get_env(&1)})
+      validate_test_identity!(Mix.env(), rows, runner)
+      callback.()
+    end)
+  end
+
+  defp verified_unboxed_transaction(callback),
+    do: verified_unboxed(fn -> Repo.transaction(callback) end)
+
+  defp cleanup!(f) do
+    {:ok, :ok} =
+      verified_unboxed_transaction(fn ->
+        [[0]] =
+          Repo.query!("SELECT count(*)::integer FROM score_revisions WHERE round_id = $1::uuid", [
+            uuid(f.round.id)
+          ]).rows
+
+        delete_fixture_rows!(f)
+        :ok
+      end)
+  end
+
+  defp delete_fixture_rows!(f) do
+    round = uuid(f.round.id)
+
+    for {sql, params} <- [
+          {"DELETE FROM score_queries WHERE round_id = $1::uuid", [round]},
+          {"DELETE FROM score_verifications WHERE round_id = $1::uuid", [round]},
+          {"DELETE FROM player_access_grants WHERE event_id = $1::uuid", [uuid(f.event.id)]},
+          {"DELETE FROM hole_results WHERE round_id = $1::uuid", [round]},
+          {"DELETE FROM hole_submissions WHERE round_id = $1::uuid", [round]},
+          {"DELETE FROM audit_events WHERE context->>'round_id' = $1", [f.round.id]},
+          {"DELETE FROM scorecards WHERE round_id = $1::uuid", [round]},
+          {"DELETE FROM competition_handicaps WHERE round_id = $1::uuid", [round]},
+          {"DELETE FROM handicap_snapshots WHERE round_id = $1::uuid", [round]},
+          {"DELETE FROM competition_side_results WHERE competition_side_id IN (SELECT id FROM competition_sides WHERE round_id = $1::uuid)",
+           [round]},
+          {"DELETE FROM competition_side_memberships WHERE round_id = $1::uuid", [round]},
+          {"DELETE FROM competition_sides WHERE round_id = $1::uuid", [round]},
+          {"DELETE FROM group_role_assignments WHERE round_id = $1::uuid", [round]},
+          {"DELETE FROM round_entries WHERE round_id = $1::uuid", [round]},
+          {"DELETE FROM playing_groups WHERE round_id = $1::uuid", [round]},
+          {"DELETE FROM round_competitions WHERE round_id = $1::uuid", [round]},
+          {"DELETE FROM round_tee_hole_snapshots WHERE round_tee_profile_snapshot_id IN (SELECT id FROM round_tee_profile_snapshots WHERE round_id = $1::uuid)",
+           [round]},
+          {"DELETE FROM round_tee_profile_snapshots WHERE round_id = $1::uuid", [round]},
+          {"DELETE FROM round_holes WHERE round_id = $1::uuid", [round]},
+          {"DELETE FROM rounds WHERE id = $1::uuid", [round]},
+          {"DELETE FROM tee_rating_profiles WHERE id = $1::uuid", [uuid(f.tee_profile.id)]},
+          {"DELETE FROM tee_sets WHERE id = $1::uuid", [uuid(f.tee_set.id)]},
+          {"DELETE FROM course_holes WHERE course_id = $1::uuid", [uuid(f.course.id)]},
+          {"DELETE FROM courses WHERE id = $1::uuid", [uuid(f.course.id)]},
+          {"DELETE FROM event_staff_assignments WHERE event_id = $1::uuid", [uuid(f.event.id)]},
+          {"DELETE FROM events WHERE id = $1::uuid", [uuid(f.event.id)]},
+          {"DELETE FROM staff_users WHERE id = $1::uuid", [uuid(f.admin.id)]}
+        ],
+        do: Repo.query!(sql, params)
+
+    for entry <- f.entries,
+        do: Repo.query!("DELETE FROM players WHERE id = $1::uuid", [uuid(entry.player_id)])
+  end
 
   defp uuid(id), do: Ecto.UUID.dump!(id)
 end

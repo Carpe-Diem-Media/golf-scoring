@@ -87,7 +87,7 @@ defmodule GolfScoring.Scoring do
     DecideScoreQuery.run(actor, event_id, round_id, command)
   end
 
-  def resolve_score_query_no_change(actor, event_id, round_id, command) do
+  def resolve_score_query_no_change(actor, event_id, round_id, command) when is_map(command) do
     DecideScoreQuery.run(
       actor,
       event_id,
@@ -96,9 +96,14 @@ defmodule GolfScoring.Scoring do
     )
   end
 
-  def dismiss_score_query(actor, event_id, round_id, command) do
+  def resolve_score_query_no_change(_actor, _event_id, _round_id, _command),
+    do: {:error, :invalid_input}
+
+  def dismiss_score_query(actor, event_id, round_id, command) when is_map(command) do
     DecideScoreQuery.run(actor, event_id, round_id, Map.put(command, :decision, :dismiss))
   end
+
+  def dismiss_score_query(_actor, _event_id, _round_id, _command), do: {:error, :invalid_input}
 
   @doc """
   Opens a current-revision dispute as trusted same-event staff.
