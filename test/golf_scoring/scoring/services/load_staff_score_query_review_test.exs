@@ -116,6 +116,57 @@ defmodule GolfScoring.Scoring.Services.LoadStaffScoreQueryReviewTest do
     end
   end
 
+  test "displays the subject, hole and current recorded result after correction" do
+    f = fixture!()
+    id = insert_query!(f, "open")
+
+    [[name, hole_number, play_order]] =
+      Repo.query!(
+        """
+        SELECT p.first_name || ' ' || p.surname, rh.display_hole_number, rh.play_order
+        FROM hole_results hr
+        JOIN scorecards sc ON sc.id = hr.scorecard_id
+        JOIN round_entries re ON re.id = sc.round_entry_id
+        JOIN players p ON p.id = re.player_id
+        JOIN round_holes rh ON rh.id = hr.round_hole_id
+        WHERE hr.id = $1::uuid
+        """,
+        [uuid(f.hole)]
+      ).rows
+
+    assert {:ok, %{items: [item]}} = read(f)
+    assert item.id == id
+    assert item.player_name == name
+    assert item.playing_group_id == f.group.id
+    assert item.display_hole_number == hole_number
+    assert item.play_order == play_order
+    assert item.current_outcome == :holed_out
+    assert item.current_gross_strokes == 4
+
+    Repo.query!("UPDATE hole_results SET revision = 2, gross_strokes = 6 WHERE id = $1::uuid", [
+      uuid(f.hole)
+    ])
+
+    assert {:ok, %{items: [corrected]}} = read(f)
+    assert corrected.current_revision == 2
+    assert corrected.current_gross_strokes == 6
+    assert corrected.stale?
+  end
+
+  test "reports picked-up results without gross strokes" do
+    f = fixture!()
+    insert_query!(f, "open")
+
+    Repo.query!(
+      "UPDATE hole_results SET outcome = 'picked_up', gross_strokes = NULL WHERE id = $1::uuid",
+      [uuid(f.hole)]
+    )
+
+    assert {:ok, %{items: [item]}} = read(f)
+    assert item.current_outcome == :picked_up
+    assert item.current_gross_strokes == nil
+  end
+
   test "keyset pagination is stable for equal timestamps and validates cursors" do
     f = fixture!()
     ids = for _ <- 1..55, do: insert_query!(f, "resolved")
