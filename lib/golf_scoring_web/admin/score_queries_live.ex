@@ -34,9 +34,10 @@ defmodule GolfScoringWeb.Admin.ScoreQueriesLive do
   end
 
   def handle_event("select_decision", %{"id" => id, "decision" => decision}, socket)
-      when decision in ["resolve", "dismiss"] do
+      when decision in ["resolve", "dismiss", "correct"] do
     case socket.assigns.loaded[id] do
-      %{status: status, stale?: false} = query when status in [:open, :escalated] ->
+      %{status: status, stale?: false, current_outcome: outcome} = query
+      when status in [:open, :escalated] and (decision != "correct" or outcome == :holed_out) ->
         selection = %{query: query, decision: decision}
 
         {:noreply,
@@ -61,21 +62,22 @@ defmodule GolfScoringWeb.Admin.ScoreQueriesLive do
 
   def handle_event(
         "confirm_decision",
-        %{"decision" => %{"reason" => reason}},
+        %{"decision" => %{"reason" => reason} = params},
         %{assigns: %{selection: %{query: query, decision: decision}}} = socket
       ) do
-    if valid_reason?(reason) do
+    if valid_reason?(reason) and valid_score?(decision, params, query) do
       command = %{
         score_query_id: query.id,
         expected_revision: query.recorded_revision,
         reason: String.trim(reason)
       }
 
+      command = correction_command(command, decision, params)
       result = decide(socket, decision, command)
 
       case result do
-        {:ok, _} ->
-          {:noreply, socket |> assign(:message, "Decision recorded.") |> refresh()}
+        {:ok, result} ->
+          {:noreply, socket |> assign(:message, success_message(decision, result)) |> refresh()}
 
         {:error, :not_found_or_forbidden} ->
           {:noreply, unavailable(socket)}
@@ -92,11 +94,14 @@ defmodule GolfScoringWeb.Admin.ScoreQueriesLive do
     else
       {:noreply,
        socket
-       |> assign(:message, "Enter a reason of at most 4096 bytes.")
+       |> assign(:message, validation_message(reason))
        |> assign(
          :reason_form,
          to_form(
-           %{"reason" => if(is_binary(reason) and String.valid?(reason), do: reason, else: "")},
+           %{
+             "reason" => if(is_binary(reason) and String.valid?(reason), do: reason, else: ""),
+             "new_gross_strokes" => safe_score(params)
+           },
            as: :decision
          )
        )}
@@ -116,6 +121,14 @@ defmodule GolfScoringWeb.Admin.ScoreQueriesLive do
           command
         )
 
+      "correct" ->
+        Scoring.resolve_score_query_with_correction(
+          socket.assigns.staff,
+          socket.assigns.event_id,
+          socket.assigns.round_id,
+          command
+        )
+
       "dismiss" ->
         Scoring.dismiss_score_query(
           socket.assigns.staff,
@@ -127,6 +140,58 @@ defmodule GolfScoringWeb.Admin.ScoreQueriesLive do
   rescue
     _ -> {:error, :unavailable}
   end
+
+  defp validation_message(reason) do
+    if valid_reason?(reason),
+      do: "Enter a different positive whole score within the supported range.",
+      else: "Enter a reason of at most 4096 bytes."
+  end
+
+  defp valid_score?("correct", params, query) do
+    case parse_score(Map.get(params, "new_gross_strokes")) do
+      {:ok, value} -> value != query.current_gross_strokes
+      :error -> false
+    end
+  end
+
+  defp valid_score?(_, _, _), do: true
+
+  defp parse_score(value) when is_binary(value) do
+    digits = String.trim_leading(value, "0")
+
+    if digits != "" and byte_size(digits) <= 10 and String.match?(digits, ~r/\A[0-9]+\z/) do
+      case Integer.parse(digits) do
+        {score, ""} when score <= 2_147_483_647 -> {:ok, score}
+        _ -> :error
+      end
+    else
+      :error
+    end
+  end
+
+  defp parse_score(_), do: :error
+
+  defp safe_score(params) do
+    case Map.get(params, "new_gross_strokes") do
+      value when is_binary(value) -> if String.valid?(value), do: value, else: ""
+      _ -> ""
+    end
+  end
+
+  defp correction_command(command, "correct", params) do
+    {:ok, score} = parse_score(Map.get(params, "new_gross_strokes"))
+    Map.put(command, :new_gross_strokes, score)
+  end
+
+  defp correction_command(command, _, _), do: command
+
+  defp success_message("correct", %{notification: :ok}),
+    do: "Score corrected. The new revision requires verification."
+
+  defp success_message("correct", _),
+    do: "Score corrected. The new revision requires verification. Notification delivery failed."
+
+  defp success_message(_, _), do: "Decision recorded."
 
   defp maybe_clear_selection(socket, true) do
     socket
@@ -235,9 +300,7 @@ defmodule GolfScoringWeb.Admin.ScoreQueriesLive do
             class="space-y-3 border border-base-300 p-4"
           >
             <h2 id="decision-heading" class="font-semibold">
-              Confirm {if @selection.decision == "resolve",
-                do: "resolve without score change",
-                else: "dismissal"}
+              Confirm {decision_label(@selection.decision)}
             </h2>
             <p>
               {@selection.query.player_name}, hole {@selection.query.display_hole_number}: {score(
@@ -250,6 +313,15 @@ defmodule GolfScoringWeb.Admin.ScoreQueriesLive do
               phx-submit="confirm_decision"
               class="space-y-3"
             >
+              <.input
+                :if={@selection.decision == "correct"}
+                field={@reason_form[:new_gross_strokes]}
+                type="text"
+                inputmode="numeric"
+                label="Corrected gross strokes"
+                class="w-full rounded-lg border border-base-content bg-base-100 px-3 py-2 text-base-content focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-base-content"
+                required
+              />
               <.input
                 field={@reason_form[:reason]}
                 type="textarea"
@@ -302,6 +374,15 @@ defmodule GolfScoringWeb.Admin.ScoreQueriesLive do
                   class="min-h-11 rounded-lg border border-base-content px-4 py-2 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-base-content"
                 >Resolve — no score change</button>
                 <button
+                  :if={query.current_outcome == :holed_out}
+                  type="button"
+                  phx-click="select_decision"
+                  phx-value-id={query.id}
+                  phx-value-decision="correct"
+                  aria-label={"Resolve with score correction for #{query.player_name}, hole #{query.display_hole_number}"}
+                  class="min-h-11 rounded-lg border border-base-content px-4 py-2 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-base-content"
+                >Resolve with score correction</button>
+                <button
                   type="button"
                   phx-click="select_decision"
                   phx-value-id={query.id}
@@ -334,6 +415,10 @@ defmodule GolfScoringWeb.Admin.ScoreQueriesLive do
     </Layouts.app>
     """
   end
+
+  defp decision_label("resolve"), do: "resolve without score change"
+  defp decision_label("dismiss"), do: "dismissal"
+  defp decision_label("correct"), do: "score correction"
 
   defp score(%{current_outcome: :picked_up}), do: "Picked up"
   defp score(%{current_gross_strokes: strokes}), do: "#{strokes} strokes"
