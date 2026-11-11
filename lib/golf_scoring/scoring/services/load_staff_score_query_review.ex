@@ -9,7 +9,8 @@ defmodule GolfScoring.Scoring.Services.LoadStaffScoreQueryReview do
          page.current_revision, page.verification_status, page.historical_status,
          page.resolution_reason, page.resolved_at, page.resolved_by_staff_user_id::text,
          page.resolved_by_round_entry_id::text, page.hole_result_id::text,
-         page.scorecard_id::text, page.inserted_at
+         page.scorecard_id::text, page.inserted_at, page.player_name, page.playing_group_id::text,
+         page.display_hole_number, page.play_order, page.current_outcome, page.current_gross_strokes
   FROM rounds r
   JOIN staff_users staff ON staff.id = $1::uuid AND staff.status = 'active'
   LEFT JOIN LATERAL (
@@ -19,15 +20,24 @@ defmodule GolfScoring.Scoring.Services.LoadStaffScoreQueryReview do
             WHERE old.hole_result_id = hr.id AND old.hole_result_revision < hr.revision
             ORDER BY old.hole_result_revision DESC LIMIT 1) AS historical_status,
            q.resolution_reason, q.resolved_at, q.resolved_by_staff_user_id,
-           q.resolved_by_round_entry_id, q.hole_result_id, q.scorecard_id, q.inserted_at
-    FROM score_queries q
+           q.resolved_by_round_entry_id, q.hole_result_id, q.scorecard_id, q.inserted_at,
+           player.first_name || ' ' || player.surname AS player_name, entry.playing_group_id,
+           hole.display_hole_number, hole.play_order, hr.outcome AS current_outcome,
+           hr.gross_strokes AS current_gross_strokes
+    FROM (
+      SELECT * FROM score_queries candidate
+      WHERE candidate.round_id = r.id
+        AND ($4::timestamp IS NULL OR (candidate.inserted_at, candidate.id) < ($4::timestamp, $5::uuid))
+      ORDER BY candidate.inserted_at DESC, candidate.id DESC
+      LIMIT $6
+    ) q
     JOIN hole_results hr ON hr.id = q.hole_result_id AND hr.round_id = r.id
+    JOIN scorecards card ON card.id = hr.scorecard_id AND card.id = q.scorecard_id AND card.round_id = r.id
+    JOIN round_entries entry ON entry.id = card.round_entry_id AND entry.round_id = r.id
+    JOIN players player ON player.id = entry.player_id
+    JOIN round_holes hole ON hole.id = hr.round_hole_id AND hole.round_id = r.id
     LEFT JOIN score_verifications current_v ON current_v.hole_result_id = hr.id
       AND current_v.hole_result_revision = hr.revision
-    WHERE q.round_id = r.id
-      AND ($4::timestamp IS NULL OR (q.inserted_at, q.id) < ($4::timestamp, $5::uuid))
-    ORDER BY q.inserted_at DESC, q.id DESC
-    LIMIT $6
   ) page ON true
   WHERE r.id = $3::uuid AND r.event_id = $2::uuid
     AND EXISTS (SELECT 1 FROM event_staff_assignments a
@@ -116,7 +126,13 @@ defmodule GolfScoring.Scoring.Services.LoadStaffScoreQueryReview do
          entry_id,
          result_id,
          scorecard_id,
-         inserted_at
+         inserted_at,
+         player_name,
+         playing_group_id,
+         display_hole_number,
+         play_order,
+         current_outcome,
+         current_gross_strokes
        ]) do
     %{
       id: id,
@@ -134,7 +150,13 @@ defmodule GolfScoring.Scoring.Services.LoadStaffScoreQueryReview do
       resolved_at: resolved_at,
       resolved_by_staff_user_id: staff_id,
       resolved_by_round_entry_id: entry_id,
-      inserted_at: inserted_at
+      inserted_at: inserted_at,
+      player_name: player_name,
+      playing_group_id: playing_group_id,
+      display_hole_number: display_hole_number,
+      play_order: play_order,
+      current_outcome: String.to_existing_atom(current_outcome),
+      current_gross_strokes: current_gross_strokes
     }
   end
 
