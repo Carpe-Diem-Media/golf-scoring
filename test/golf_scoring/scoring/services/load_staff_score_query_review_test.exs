@@ -117,8 +117,8 @@ defmodule GolfScoring.Scoring.Services.LoadStaffScoreQueryReviewTest do
   end
 
   test "displays the subject, hole and current recorded result after correction" do
-    f = fixture!()
-    id = insert_query!(f, "open")
+    f = fixture!(true)
+    id = insert_query!(f, "resolved")
 
     [[name, hole_number, play_order]] =
       Repo.query!(
@@ -143,9 +143,13 @@ defmodule GolfScoring.Scoring.Services.LoadStaffScoreQueryReviewTest do
     assert item.current_outcome == :holed_out
     assert item.current_gross_strokes == 4
 
-    Repo.query!("UPDATE hole_results SET revision = 2, gross_strokes = 6 WHERE id = $1::uuid", [
-      uuid(f.hole)
-    ])
+    assert {:ok, _} =
+             Scoring.correct_hole_result(f.admin, f.event.id, f.round.id, %{
+               hole_result_id: f.hole,
+               expected_revision: 1,
+               new_gross_strokes: 6,
+               reason: "counting correction"
+             })
 
     assert {:ok, %{items: [corrected]}} = read(f)
     assert corrected.current_revision == 2
@@ -169,7 +173,13 @@ defmodule GolfScoring.Scoring.Services.LoadStaffScoreQueryReviewTest do
 
   test "keyset pagination is stable for equal timestamps and validates cursors" do
     f = fixture!()
-    ids = for _ <- 1..55, do: insert_query!(f, "resolved")
+
+    ids =
+      for n <- 1..55 do
+        subject = if rem(n, 2) == 0, do: f, else: %{f | hole: f.other_hole, card: f.other_card}
+        insert_query!(subject, "resolved")
+      end
+
     assert {:ok, first} = read(f)
     assert length(first.items) == 50
     assert first.next_cursor
@@ -183,6 +193,10 @@ defmodule GolfScoring.Scoring.Services.LoadStaffScoreQueryReviewTest do
     assert second.next_cursor == nil
     all = Enum.map(first.items ++ second.items, & &1.id)
     assert all == Enum.sort(ids, :desc)
+    assert MapSet.size(MapSet.new(all)) == 55
+
+    assert MapSet.new(first.items ++ second.items, & &1.hole_result_id) ==
+             MapSet.new([f.hole, f.other_hole])
 
     assert {:error, :invalid_input} =
              Scoring.load_staff_score_query_review(f.admin, f.event.id, f.round.id,
@@ -224,8 +238,33 @@ defmodule GolfScoring.Scoring.Services.LoadStaffScoreQueryReviewTest do
     id
   end
 
-  defp fixture! do
+  defp fixture!(with_side? \\ false) do
     f = Fixtures.setup_submit_fixture!(2)
+
+    if with_side? do
+      Fixtures.set_round_state!(f.round, :draft)
+
+      assert {:ok, side} =
+               Competition.create_competition_side(
+                 f.admin,
+                 f.event.id,
+                 f.round.id,
+                 f.competition.id,
+                 :partnership
+               )
+
+      assert {:ok, _} =
+               Competition.set_side_membership(
+                 f.admin,
+                 f.event.id,
+                 f.round.id,
+                 f.competition.id,
+                 side.id,
+                 Enum.map(f.entries, & &1.id)
+               )
+
+      Fixtures.set_round_state!(f.round, :scoring_open)
+    end
 
     assert {:ok, _} =
              Scoring.submit_group_hole(f.admin, f.event.id, f.round.id, %{

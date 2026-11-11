@@ -24,7 +24,13 @@ defmodule GolfScoring.Scoring.Services.LoadStaffScoreQueryReview do
            player.first_name || ' ' || player.surname AS player_name, entry.playing_group_id,
            hole.display_hole_number, hole.play_order, hr.outcome AS current_outcome,
            hr.gross_strokes AS current_gross_strokes
-    FROM score_queries q
+    FROM (
+      SELECT * FROM score_queries candidate
+      WHERE candidate.round_id = r.id
+        AND ($4::timestamp IS NULL OR (candidate.inserted_at, candidate.id) < ($4::timestamp, $5::uuid))
+      ORDER BY candidate.inserted_at DESC, candidate.id DESC
+      LIMIT $6
+    ) q
     JOIN hole_results hr ON hr.id = q.hole_result_id AND hr.round_id = r.id
     JOIN scorecards card ON card.id = hr.scorecard_id AND card.id = q.scorecard_id AND card.round_id = r.id
     JOIN round_entries entry ON entry.id = card.round_entry_id AND entry.round_id = r.id
@@ -32,10 +38,6 @@ defmodule GolfScoring.Scoring.Services.LoadStaffScoreQueryReview do
     JOIN round_holes hole ON hole.id = hr.round_hole_id AND hole.round_id = r.id
     LEFT JOIN score_verifications current_v ON current_v.hole_result_id = hr.id
       AND current_v.hole_result_revision = hr.revision
-    WHERE q.round_id = r.id
-      AND ($4::timestamp IS NULL OR (q.inserted_at, q.id) < ($4::timestamp, $5::uuid))
-    ORDER BY q.inserted_at DESC, q.id DESC
-    LIMIT $6
   ) page ON true
   WHERE r.id = $3::uuid AND r.event_id = $2::uuid
     AND EXISTS (SELECT 1 FROM event_staff_assignments a
