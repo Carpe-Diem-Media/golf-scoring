@@ -130,7 +130,7 @@ defmodule GolfScoringWeb.Scoring.VerificationLive do
                 phx-click="verify"
                 phx-value-id={result.hole_result_id}
                 aria-label={"Verify #{result.player_name}, hole #{result.display_hole_number}, revision #{result.revision}"}
-                class="min-h-11 rounded-lg border border-base-content px-4 py-2 text-sm font-semibold hover:bg-base-200 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary"
+                class="min-h-11 rounded-lg border border-base-content px-4 py-2 text-sm font-semibold hover:bg-base-200 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-base-content"
               >
                 Verify score
               </button>
