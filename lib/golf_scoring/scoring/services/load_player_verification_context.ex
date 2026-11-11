@@ -18,7 +18,8 @@ defmodule GolfScoring.Scoring.Services.LoadPlayerVerificationContext do
                  WHERE q.hole_result_id = hr.id AND q.status IN ('open', 'escalated')),
          EXISTS (SELECT 1 FROM group_role_assignments verifier
                  WHERE verifier.playing_group_id = pg.id AND verifier.state = 'active'
-                   AND verifier.role = 'designated_verifier' AND verifier.round_entry_id = subject.id)
+                   AND verifier.role = 'designated_verifier' AND verifier.round_entry_id = subject.id),
+         concat_ws(' ', player.first_name, player.surname), hole.display_hole_number, hole.play_order
   FROM player_access_grants grant_row
   JOIN rounds r ON r.event_id = grant_row.event_id AND r.id = $3::uuid
   JOIN playing_groups pg ON pg.round_id = r.id AND pg.id = $4::uuid
@@ -30,14 +31,16 @@ defmodule GolfScoring.Scoring.Services.LoadPlayerVerificationContext do
                                AND a.state = 'active'
                                AND a.role IN ('designated_verifier', 'primary_scorer')
   LEFT JOIN round_entries subject ON subject.round_id = r.id AND subject.playing_group_id = pg.id
+  LEFT JOIN players player ON player.id = subject.player_id
   LEFT JOIN scorecards card ON card.round_entry_id = subject.id AND card.round_id = r.id
   LEFT JOIN hole_results hr ON hr.scorecard_id = card.id AND hr.round_id = r.id
+  LEFT JOIN round_holes hole ON hole.id = hr.round_hole_id AND hole.round_id = r.id
   LEFT JOIN score_verifications current_verification ON current_verification.hole_result_id = hr.id
        AND current_verification.hole_result_revision = hr.revision
   WHERE grant_row.id = $1::uuid AND grant_row.event_id = $2::uuid
     AND grant_row.state = 'active' AND (grant_row.expires_at IS NULL OR grant_row.expires_at > now())
     AND r.state IN ('scoring_open', 'scoring_closed')
-  ORDER BY a.id, hr.round_hole_id, subject.id
+  ORDER BY a.id, hole.play_order, subject.id
   LIMIT 73
   """
 
@@ -95,7 +98,10 @@ defmodule GolfScoring.Scoring.Services.LoadPlayerVerificationContext do
          status,
          historical,
          queried?,
-         designated?
+         designated?,
+         player_name,
+         display_hole_number,
+         play_order
        ]) do
     status = if status, do: String.to_existing_atom(status), else: :pending
 
@@ -103,6 +109,9 @@ defmodule GolfScoring.Scoring.Services.LoadPlayerVerificationContext do
       hole_result_id: id,
       round_hole_id: hole,
       subject_round_entry_id: subject,
+      player_name: player_name,
+      display_hole_number: display_hole_number,
+      play_order: play_order,
       revision: revision,
       outcome: String.to_existing_atom(outcome),
       gross_strokes: gross,
