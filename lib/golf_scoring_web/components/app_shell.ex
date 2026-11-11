@@ -48,7 +48,7 @@ defmodule GolfScoringWeb.AppShell do
           <button
             type="button"
             id="staff-shell-menu-toggle"
-            class="inline-flex min-h-11 min-w-11 shrink-0 items-center justify-center rounded-lg text-base-content hover:bg-base-200 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary lg:hidden"
+            class="inline-flex min-h-11 min-w-11 shrink-0 items-center justify-center rounded-lg text-base-content hover:bg-base-200 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-base-content lg:hidden"
             aria-controls={@mobile_nav_id}
             aria-expanded="false"
             aria-haspopup="true"
@@ -59,7 +59,7 @@ defmodule GolfScoringWeb.AppShell do
 
           <.link
             navigate={~p"/admin"}
-            class="flex min-h-11 items-center gap-2 rounded-lg px-2 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary"
+            class="flex min-h-11 items-center gap-2 rounded-lg px-2 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-base-content"
           >
             <span class="text-base font-semibold tracking-tight text-base-content">Golf Scoring</span>
             <span
@@ -75,7 +75,7 @@ defmodule GolfScoringWeb.AppShell do
               href={~p"/admin/sign-out"}
               method="delete"
               id="staff-sign-out"
-              class="inline-flex min-h-11 items-center rounded-lg px-3 text-sm font-medium text-base-content hover:bg-base-200 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary"
+              class="inline-flex min-h-11 items-center rounded-lg px-3 text-sm font-medium text-base-content hover:bg-base-200 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-base-content"
             >
               Sign out
             </.link>
@@ -107,7 +107,7 @@ defmodule GolfScoringWeb.AppShell do
             <button
               type="button"
               id="staff-shell-menu-close"
-              class="inline-flex min-h-11 min-w-11 items-center justify-center rounded-lg text-base-content hover:bg-base-200 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary"
+              class="inline-flex min-h-11 min-w-11 items-center justify-center rounded-lg text-base-content hover:bg-base-200 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-base-content"
             >
               <span class="sr-only">Close navigation menu</span>
               <.icon name="hero-x-mark" class="size-5" />
@@ -273,7 +273,7 @@ defmodule GolfScoringWeb.AppShell do
           id={"#{item.id}#{@id_suffix}"}
           aria-current={if item.current, do: "page", else: false}
           class={[
-            "flex min-h-11 items-center rounded-lg px-3 text-sm font-medium transition-colors focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary",
+            "flex min-h-11 items-center rounded-lg px-3 text-sm font-medium transition-colors focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-base-content",
             item.current && "bg-base-200 text-base-content",
             !item.current && "text-base-content/80 hover:bg-base-200/60 hover:text-base-content",
             item.disabled && "pointer-events-none opacity-50"
