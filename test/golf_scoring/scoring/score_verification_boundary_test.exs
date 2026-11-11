@@ -2,6 +2,7 @@ defmodule GolfScoring.Scoring.ScoreVerificationBoundaryTest do
   use GolfScoring.DataCase, async: false
 
   alias Ash.Changeset
+  alias GolfScoring.Accounts
   alias GolfScoring.Competition
   alias GolfScoring.Scoring
   alias GolfScoring.Scoring.HoleResult
@@ -10,6 +11,51 @@ defmodule GolfScoring.Scoring.ScoreVerificationBoundaryTest do
   alias GolfScoring.Scoring.Services.CorrectHoleResult
   alias GolfScoring.Scoring.Services.PaperRecoveryFixtures, as: Fixtures
   alias GolfScoring.Scoring.Services.VerifyHoleResult
+
+  test "verification entrypoints reject an existing transaction before validation" do
+    assert {:ok, results} =
+             Repo.transaction(fn ->
+               [
+                 VerifyHoleResult.run(nil, nil, nil, %{}),
+                 VerifyHoleResult.override(nil, nil, nil, %{})
+               ]
+             end)
+
+    assert results == List.duplicate({:error, :outer_transaction_required}, 2)
+  end
+
+  test "nested verification and override preserve score and certification evidence" do
+    f = fixture!()
+
+    assert {:ok, %{grant: verifier_grant}} =
+             Accounts.issue_player_access(f.admin, f.event.id, Enum.at(f.entries, 1).player_id)
+
+    before_result = Ash.get!(HoleResult, f.result.id, authorize?: false)
+    before_verifications = verification_rows(f)
+
+    command = %{
+      hole_result_id: f.result.id,
+      hole_result_revision: f.result.revision,
+      playing_group_id: f.group.id,
+      role_assignment_id: f.assignment.id,
+      role_assignment_version: f.assignment.assignment_version,
+      reason: "marker unavailable"
+    }
+
+    assert {:ok, results} =
+             Repo.transaction(fn ->
+               [
+                 VerifyHoleResult.run(verifier_grant, f.event.id, f.round.id, command),
+                 VerifyHoleResult.override(f.admin, f.event.id, f.round.id, command)
+               ]
+             end)
+
+    assert results == List.duplicate({:error, :outer_transaction_required}, 2)
+    assert verification_rows(f) == before_verifications
+    assert Ash.get!(HoleResult, f.result.id, authorize?: false) == before_result
+    assert {:ok, certified} = override(f)
+    assert certified.hole_result_revision == f.result.revision
+  end
 
   test "direct pending creation rejects real scope and forged context, including authorization bypass" do
     f = fixture!()

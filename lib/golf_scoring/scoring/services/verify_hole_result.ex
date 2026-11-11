@@ -23,7 +23,15 @@ defmodule GolfScoring.Scoring.Services.VerifyHoleResult do
   def override(actor, event_id, round_id, command),
     do: execute(actor, event_id, round_id, command, :override)
 
-  defp execute(actor, event_id, round_id, command, operation) when is_map(command) do
+  defp execute(actor, event_id, round_id, command, operation) do
+    if Repo.in_transaction?() do
+      {:error, :outer_transaction_required}
+    else
+      execute_standalone(actor, event_id, round_id, command, operation)
+    end
+  end
+
+  defp execute_standalone(actor, event_id, round_id, command, operation) when is_map(command) do
     with {:ok, event_id} <- Ecto.UUID.cast(event_id),
          {:ok, round_id} <- Ecto.UUID.cast(round_id),
          {:ok, group_id} <- Ecto.UUID.cast(command[:playing_group_id]),
@@ -48,7 +56,7 @@ defmodule GolfScoring.Scoring.Services.VerifyHoleResult do
     end
   end
 
-  defp execute(_, _, _, _, _), do: {:error, :invalid_input}
+  defp execute_standalone(_, _, _, _, _), do: {:error, :invalid_input}
 
   defp execute_locked(actor, ids, command, operation) do
     with {:ok, actor_context} <- lock_actor(actor, ids.event_id, operation),
