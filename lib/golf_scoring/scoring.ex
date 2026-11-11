@@ -19,6 +19,7 @@ defmodule GolfScoring.Scoring do
   alias GolfScoring.Scoring.Services.EscalateScoreQuery
   alias GolfScoring.Scoring.Services.LoadGroupScorecard
   alias GolfScoring.Scoring.Services.LoadPlayerVerificationContext
+  alias GolfScoring.Scoring.Services.LoadStaffScoreQueryReview
   alias GolfScoring.Scoring.Services.OpenScoreQuery
   alias GolfScoring.Scoring.Services.OverrideHandicapBasis
   alias GolfScoring.Scoring.Services.ResolveScoreQueryWithCorrection
@@ -162,6 +163,20 @@ defmodule GolfScoring.Scoring do
   """
   def load_player_verification_context(grant, event_id, round_id, group_id) do
     LoadPlayerVerificationContext.run(grant, event_id, round_id, group_id)
+  end
+
+  @doc """
+  Loads a bounded, round-scoped query review page for a trusted staff session.
+
+  Options are `:limit` (1..50, default 50) and `:cursor`, which must be the
+  `next_cursor` returned by a previous page. The result contains `:items` and
+  `:next_cursor`; nil means there are no more results.
+
+  Authority is rechecked on each read. Returned state is a snapshot and does
+  not authorize any subsequent decision or correction.
+  """
+  def load_staff_score_query_review(staff, event_id, round_id, opts) do
+    LoadStaffScoreQueryReview.run(staff, event_id, round_id, opts)
   end
 
   @doc """
