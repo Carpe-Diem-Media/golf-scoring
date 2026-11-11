@@ -11,6 +11,55 @@ defmodule GolfScoring.Scoring.Services.LoadPlayerVerificationContextTest do
   alias GolfScoring.Scoring.Scorecard
   alias GolfScoring.Scoring.Services.PaperRecoveryFixtures
 
+  test "labels each golfer and hole and orders results by play order and subject" do
+    f = fixture!()
+    [first, second] = f.entries
+
+    Repo.query!("UPDATE players SET first_name = 'Ava', surname = 'Green' WHERE id = $1::uuid", [
+      Ecto.UUID.dump!(first.player_id)
+    ])
+
+    Repo.query!("UPDATE players SET first_name = 'Ben', surname = 'Wood' WHERE id = $1::uuid", [
+      Ecto.UUID.dump!(second.player_id)
+    ])
+
+    next_hole = Enum.at(f.route, 1)
+
+    assert {:ok, _} =
+             Scoring.submit_group_hole(f.admin, f.event.id, f.round.id, %{
+               client_submission_id: Ecto.UUID.generate(),
+               playing_group_id: f.group.id,
+               round_hole_id: next_hole.id,
+               expected_group_score_revision: 1,
+               captured_at: DateTime.utc_now(),
+               results:
+                 Enum.map(
+                   f.entries,
+                   &%{round_entry_id: &1.id, outcome: :holed_out, gross_strokes: 4}
+                 )
+             })
+
+    assert {:ok, context} = load(f, f.verifier_grant)
+    assert length(context.results) == 4
+    names = %{first.id => "Ava Green", second.id => "Ben Wood"}
+    holes = %{f.start_hole.id => f.start_hole, next_hole.id => next_hole}
+
+    for result <- context.results do
+      hole = Map.fetch!(holes, result.round_hole_id)
+      assert result.player_name == Map.fetch!(names, result.subject_round_entry_id)
+      assert result.display_hole_number == hole.display_hole_number
+      assert result.play_order == hole.play_order
+
+      refute Enum.any?(
+               Map.keys(result),
+               &(&1 in [:email, :phone, :contact, :mystery_rule, :override_reason])
+             )
+    end
+
+    assert Enum.map(context.results, &{&1.play_order, &1.subject_round_entry_id}) ==
+             Enum.sort(Enum.map(context.results, &{&1.play_order, &1.subject_round_entry_id}))
+  end
+
   test "designated verifier sees current group results and cannot certify their own" do
     f = fixture!()
     assert {:ok, context} = load(f, f.verifier_grant)
@@ -181,6 +230,11 @@ defmodule GolfScoring.Scoring.Services.LoadPlayerVerificationContextTest do
     entries_b = PaperRecoveryFixtures.add_player_entries_to_group!(f, group_b, 2)
     verifier_b = Enum.at(entries_b, 1)
 
+    Repo.query!(
+      "UPDATE players SET first_name = 'Privategroup', surname = 'Other' WHERE id = $1::uuid",
+      [Ecto.UUID.dump!(verifier_b.player_id)]
+    )
+
     assert {:ok, _} =
              Competition.assign_designated_verifier(
                f.admin,
@@ -230,6 +284,8 @@ defmodule GolfScoring.Scoring.Services.LoadPlayerVerificationContextTest do
 
     assert MapSet.new(context_a.results, & &1.hole_result_id) == group_a_results
     assert MapSet.new(context_b.results, & &1.hole_result_id) == group_b_results
+    refute inspect(context_a) =~ "Privategroup Other"
+    assert Enum.any?(context_b.results, &(&1.player_name == "Privategroup Other"))
   end
 
   test "a correction exposes pending current evidence and superseded historical evidence" do
