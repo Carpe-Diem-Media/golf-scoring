@@ -26,6 +26,9 @@ defmodule GolfScoring.Scoring.ScoreQuery do
     end
 
     custom_indexes do
+      index [:round_id, {:desc, :inserted_at}, {:desc, :id}],
+        name: "score_queries_round_queue_index"
+
       index [:hole_result_id],
         unique: true,
         where: "status IN ('open', 'escalated')",
