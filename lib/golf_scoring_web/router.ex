@@ -68,6 +68,10 @@ defmodule GolfScoringWeb.Router do
       live "/events/:event_id/rounds/:round_id/groups/:group_id/scorecard",
            GolfScoringWeb.Scoring.GroupScorecardLive,
            :show
+
+      live "/events/:event_id/rounds/:round_id/groups/:group_id/verify",
+           GolfScoringWeb.Scoring.VerificationLive,
+           :show
     end
   end
 
