@@ -101,6 +101,22 @@ defmodule GolfScoringWeb.Admin.ScoreQueriesLiveTest do
     end
   end
 
+  test "load more clears all rows after staff authority is revoked", %{conn: conn} do
+    f = fixture!()
+    for _ <- 1..55, do: insert_query!(f, hd(f.holes), "resolved")
+    conn = authenticate(conn, f.admin.email)
+    {:ok, view, html} = live(conn, path(f))
+    assert length(query_ids(html)) == 50
+    assert has_element?(view, "#load-more-queries")
+
+    role!(f, "event_admin", "revoked")
+    html = render_click(view, "load_more", %{"cursor" => "forged"})
+    assert has_element?(view, "#queries-unavailable")
+    assert query_ids(html) == []
+    refute html =~ "original private reason"
+    refute has_element?(view, "#load-more-queries")
+  end
+
   test "wrong event and round disclose no reasons", %{conn: conn} do
     f = fixture!()
     other = fixture!()
@@ -135,8 +151,13 @@ defmodule GolfScoringWeb.Admin.ScoreQueriesLiveTest do
     assert query_ids(html) == Enum.take(expected, 50)
   end
 
-  defp query_ids(html),
-    do: Regex.scan(~r/id="queries-([0-9a-f-]+)"/, html) |> Enum.map(fn [_, id] -> id end)
+  defp query_ids(html) do
+    html
+    |> LazyHTML.from_fragment()
+    |> LazyHTML.query("#score-queries > li[id]")
+    |> LazyHTML.attribute("id")
+    |> Enum.map(&String.replace_prefix(&1, "queries-", ""))
+  end
 
   defp fixture! do
     f = Fixtures.setup_submit_fixture!(2)
