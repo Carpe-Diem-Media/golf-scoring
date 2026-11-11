@@ -15,6 +15,10 @@ defmodule GolfScoringWeb.Scoring.VerificationLive do
      |> assign(:event_id, event_id)
      |> assign(:round_id, round_id)
      |> assign(:group_id, group_id)
+     |> assign(
+       :current_path,
+       ~p"/player/events/#{event_id}/rounds/#{round_id}/groups/#{group_id}/verify"
+     )
      |> assign(:feedback, nil)
      |> refresh()}
   end
@@ -77,7 +81,7 @@ defmodule GolfScoringWeb.Scoring.VerificationLive do
   def render(assigns) do
     ~H"""
     <Layouts.app flash={@flash}>
-      <AppShell.player flash={@flash} page_title="Verify scores" current_path="/player">
+      <AppShell.player flash={@flash} page_title="Verify scores" current_path={@current_path}>
         <section :if={is_nil(@context)} id="verification-unavailable" role="status" class="space-y-2">
           <h2 class="text-lg font-semibold">Verification unavailable</h2>
           <p class="text-sm text-base-content/75">
@@ -125,6 +129,7 @@ defmodule GolfScoringWeb.Scoring.VerificationLive do
                 type="button"
                 phx-click="verify"
                 phx-value-id={result.hole_result_id}
+                aria-label={"Verify #{result.player_name}, hole #{result.display_hole_number}, revision #{result.revision}"}
                 class="min-h-11 rounded-lg border border-base-content px-4 py-2 text-sm font-semibold hover:bg-base-200 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary"
               >
                 Verify score

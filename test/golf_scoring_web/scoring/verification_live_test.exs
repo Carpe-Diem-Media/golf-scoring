@@ -16,7 +16,7 @@ defmodule GolfScoringWeb.Scoring.VerificationLiveTest do
     on_exit(fn -> Sandbox.stop_owner(owner) end)
 
     assert Repo.query!("SELECT current_database(), current_user").rows == [
-             ["golf_scoring_test", "golf_scoring_test"]
+             ["golf_scoring_test", System.fetch_env!("TEST_DATABASE_USERNAME")]
            ]
 
     :ok
@@ -27,6 +27,23 @@ defmodule GolfScoringWeb.Scoring.VerificationLiveTest do
     {view, html} = open!(conn, f, f.verifier_grant)
     assert html =~ "Hole 1"
     assert has_element?(view, "#verify-#{f.scorer_result}")
+
+    assert {:ok, context} =
+             Scoring.load_player_verification_context(
+               f.verifier_grant,
+               f.event.id,
+               f.round.id,
+               f.group.id
+             )
+
+    result = Enum.find(context.results, &(&1.hole_result_id == f.scorer_result))
+
+    assert has_element?(
+             view,
+             "#verify-#{f.scorer_result}[aria-label='Verify #{result.player_name}, hole #{result.display_hole_number}, revision #{result.revision}']"
+           )
+
+    refute has_element?(view, "#player-shell-nav [aria-current='page']")
     refute has_element?(view, "#verify-#{f.verifier_result}")
     assert view |> element("#verify-#{f.scorer_result}") |> render_click() =~ "Verified"
   end
