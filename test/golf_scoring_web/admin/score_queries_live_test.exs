@@ -151,6 +151,189 @@ defmodule GolfScoringWeb.Admin.ScoreQueriesLiveTest do
     assert query_ids(html) == Enum.take(expected, 50)
   end
 
+  test "terminal decisions require a reason and preserve scoring facts with audit", %{conn: conn} do
+    for {initial, decision, target, action} <- [
+          {"open", "resolve", "resolved", "resolve_score_query_no_change"},
+          {"open", "dismiss", "dismissed", "dismiss_score_query"},
+          {"escalated", "resolve", "resolved", "resolve_score_query_no_change"},
+          {"escalated", "dismiss", "dismissed", "dismiss_score_query"}
+        ] do
+      f = fixture!()
+      {hole, card} = hd(f.holes)
+      id = insert_query!(f, {hole, card}, initial)
+
+      Repo.query!("UPDATE scorecards SET state = 'review_required' WHERE id = $1::uuid", [
+        uuid(card)
+      ])
+
+      before =
+        Repo.query!(
+          "SELECT revision, outcome, gross_strokes FROM hole_results WHERE id = $1::uuid",
+          [uuid(hole)]
+        ).rows
+
+      conn = authenticate(conn, f.admin.email)
+      {:ok, view, _} = live(conn, path(f))
+      render_click(view, "select_decision", %{"id" => id, "decision" => decision})
+      assert has_element?(view, "#decision-form")
+
+      assert render_submit(view, "confirm_decision", %{"decision" => %{"reason" => "  "}}) =~
+               "Enter a reason"
+
+      assert render_submit(view, "confirm_decision", %{
+               "decision" => %{"reason" => String.duplicate("x", 4097)}
+             }) =~
+               "Enter a reason"
+
+      assert Repo.query!("SELECT status FROM score_queries WHERE id = $1::uuid", [uuid(id)]).rows ==
+               [[initial]]
+
+      html =
+        render_submit(view, "confirm_decision", %{
+          "decision" => %{"reason" => "  reviewed  ", "revision" => "999"}
+        })
+
+      assert html =~ "Decision recorded"
+
+      assert Repo.query!(
+               "SELECT status, resolution_reason FROM score_queries WHERE id = $1::uuid",
+               [uuid(id)]
+             ).rows == [[target, "reviewed"]]
+
+      assert Repo.query!(
+               "SELECT revision, outcome, gross_strokes FROM hole_results WHERE id = $1::uuid",
+               [uuid(hole)]
+             ).rows == before
+
+      assert Repo.query!(
+               "SELECT count(*) FROM audit_events WHERE target_id = $1::uuid AND action = $2",
+               [uuid(id), action]
+             ).rows == [[1]]
+    end
+  end
+
+  test "cancel clears the confirmation and its validation feedback", %{conn: conn} do
+    f = fixture!()
+    id = insert_query!(f, hd(f.holes), "open")
+    conn = authenticate(conn, f.admin.email)
+    {:ok, view, _} = live(conn, path(f))
+    render_click(view, "select_decision", %{"id" => id, "decision" => "dismiss"})
+
+    assert render_submit(view, "confirm_decision", %{"decision" => %{"reason" => " "}}) =~
+             "Enter a reason"
+
+    html = render_click(view, "cancel_decision", %{})
+    refute has_element?(view, "#decision-form")
+    refute html =~ "Enter a reason"
+
+    assert Repo.query!("SELECT status FROM score_queries WHERE id = $1::uuid", [uuid(id)]).rows ==
+             [["open"]]
+  end
+
+  test "forged selections are rejected and stale revisions require review", %{conn: conn} do
+    f = fixture!()
+    {hole, card} = hd(f.holes)
+    id = insert_query!(f, {hole, card}, "open")
+
+    Repo.query!("UPDATE scorecards SET state = 'review_required' WHERE id = $1::uuid", [
+      uuid(card)
+    ])
+
+    conn = authenticate(conn, f.admin.email)
+    {:ok, view, _} = live(conn, path(f))
+
+    render_click(view, "select_decision", %{"id" => Ecto.UUID.generate(), "decision" => "dismiss"})
+
+    refute has_element?(view, "#decision-form")
+    render_click(view, "select_decision", %{"id" => id, "decision" => "other"})
+    refute has_element?(view, "#decision-form")
+
+    render_click(view, "select_decision", %{
+      "id" => id,
+      "decision" => "dismiss",
+      "revision" => "2"
+    })
+
+    Repo.query!("UPDATE hole_results SET revision = 2 WHERE id = $1::uuid", [uuid(hole)])
+
+    html =
+      render_submit(view, "confirm_decision", %{
+        "decision" => %{"reason" => "reviewed", "revision" => "2"}
+      })
+
+    assert html =~ "Review the current information"
+
+    assert Repo.query!("SELECT status FROM score_queries WHERE id = $1::uuid", [uuid(id)]).rows ==
+             [["open"]]
+
+    refute has_element?(view, "#decision-form")
+  end
+
+  test "revoked or suspended staff cannot submit a pending decision", %{conn: conn} do
+    for loss <- [:revoked, :suspended] do
+      f = fixture!()
+      {hole, card} = hd(f.holes)
+      id = insert_query!(f, {hole, card}, "open")
+
+      Repo.query!("UPDATE scorecards SET state = 'review_required' WHERE id = $1::uuid", [
+        uuid(card)
+      ])
+
+      conn = authenticate(conn, f.admin.email)
+      {:ok, view, _} = live(conn, path(f))
+      render_click(view, "select_decision", %{"id" => id, "decision" => "dismiss"})
+
+      if loss == :revoked do
+        role!(f, "event_admin", "revoked")
+      else
+        Repo.query!("UPDATE staff_users SET status = 'suspended' WHERE id = $1::uuid", [
+          uuid(f.admin.id)
+        ])
+      end
+
+      html = render_submit(view, "confirm_decision", %{"decision" => %{"reason" => "reviewed"}})
+      assert html =~ "Score queries are unavailable"
+      refute html =~ "original private reason"
+      refute has_element?(view, "#decision-form")
+
+      assert Repo.query!("SELECT status FROM score_queries WHERE id = $1::uuid", [uuid(id)]).rows ==
+               [["open"]]
+    end
+  end
+
+  test "a decision already made by another reviewer cannot be repeated", %{conn: conn} do
+    f = fixture!()
+    {hole, card} = hd(f.holes)
+    id = insert_query!(f, {hole, card}, "open")
+
+    Repo.query!("UPDATE scorecards SET state = 'review_required' WHERE id = $1::uuid", [
+      uuid(card)
+    ])
+
+    conn = authenticate(conn, f.admin.email)
+    {:ok, view, _} = live(conn, path(f))
+    render_click(view, "select_decision", %{"id" => id, "decision" => "dismiss"})
+
+    assert {:ok, _} =
+             Scoring.resolve_score_query_no_change(f.admin, f.event.id, f.round.id, %{
+               score_query_id: id,
+               expected_revision: 1,
+               reason: "already reviewed"
+             })
+
+    html =
+      render_submit(view, "confirm_decision", %{"decision" => %{"reason" => "second decision"}})
+
+    assert html =~ "Review the current information"
+
+    assert Repo.query!(
+             "SELECT status, resolution_reason FROM score_queries WHERE id = $1::uuid",
+             [uuid(id)]
+           ).rows == [["resolved", "already reviewed"]]
+
+    refute has_element?(view, "#decision-form")
+  end
+
   defp query_ids(html) do
     html
     |> LazyHTML.from_fragment()
