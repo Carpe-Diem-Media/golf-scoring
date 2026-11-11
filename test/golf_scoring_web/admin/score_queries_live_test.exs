@@ -3,6 +3,8 @@ defmodule GolfScoringWeb.Admin.ScoreQueriesLiveTest do
 
   import Phoenix.LiveViewTest
   alias Ecto.Adapters.SQL.Sandbox
+  alias GolfScoring.Accounts
+  alias GolfScoring.Competition
   alias GolfScoring.Repo
   alias GolfScoring.Scoring
   alias GolfScoring.Scoring.Services.PaperRecoveryFixtures, as: Fixtures
@@ -332,6 +334,260 @@ defmodule GolfScoringWeb.Admin.ScoreQueriesLiveTest do
            ).rows == [["resolved", "already reviewed"]]
 
     refute has_element?(view, "#decision-form")
+  end
+
+  test "correction resolves current queries and renews verification with audit", %{conn: conn} do
+    for status <- [:open, :escalated] do
+      f = correction_fixture!(status)
+      conn = authenticate(conn, f.admin.email)
+      {:ok, view, _} = live(conn, path(f))
+      render_click(view, "select_decision", %{"id" => f.query_id, "decision" => "correct"})
+      assert has_element?(view, "#decision-form")
+
+      html =
+        render_submit(view, "confirm_decision", %{
+          "decision" => %{
+            "reason" => "correct count",
+            "new_gross_strokes" => "6",
+            "revision" => "999"
+          }
+        })
+
+      assert html =~ "Score corrected"
+      assert html =~ "requires verification"
+
+      assert Repo.query!("SELECT status FROM score_queries WHERE id=$1::uuid", [uuid(f.query_id)]).rows ==
+               [["resolved"]]
+
+      assert Repo.query!("SELECT revision, gross_strokes FROM hole_results WHERE id=$1::uuid", [
+               uuid(f.hole_id)
+             ]).rows == [[2, 6]]
+
+      assert Repo.query!(
+               "SELECT original_revision, resulting_revision, source_query_id::text FROM score_revisions WHERE hole_result_id=$1::uuid",
+               [uuid(f.hole_id)]
+             ).rows == [[1, 2, f.query_id]]
+
+      assert Repo.query!(
+               "SELECT hole_result_revision, status FROM score_verifications WHERE hole_result_id=$1::uuid ORDER BY hole_result_revision",
+               [uuid(f.hole_id)]
+             ).rows == [[1, "superseded"], [2, "pending"]]
+
+      assert Repo.query!(
+               "SELECT action FROM audit_events WHERE (target_id=$1::uuid OR target_id=$2::uuid) AND action IN ('correct_hole_result','resolve_score_query_with_correction') ORDER BY action",
+               [uuid(f.hole_id), uuid(f.query_id)]
+             ).rows == [["correct_hole_result"], ["resolve_score_query_with_correction"]]
+
+      assert Repo.query!("SELECT state FROM scorecards WHERE id=$1::uuid", [uuid(f.card_id)]).rows ==
+               [["review_required"]]
+
+      assert Repo.query!(
+               "SELECT state FROM competition_side_results WHERE competition_side_id=$1::uuid",
+               [uuid(f.side_id)]
+             ).rows == [["review_required"]]
+    end
+  end
+
+  test "correction rejects invalid values and forged or stale decisions", %{conn: conn} do
+    f = correction_fixture!(:open)
+    conn = authenticate(conn, f.admin.email)
+    {:ok, view, _} = live(conn, path(f))
+
+    render_click(view, "select_decision", %{"id" => Ecto.UUID.generate(), "decision" => "correct"})
+
+    refute has_element?(view, "#decision-form")
+    render_click(view, "select_decision", %{"id" => f.query_id, "decision" => "correct"})
+
+    for value <- ["", "0", "-1", "1.5", "2147483648", "4", "1x"] do
+      html =
+        render_submit(view, "confirm_decision", %{
+          "decision" => %{"reason" => "reviewed", "new_gross_strokes" => value}
+        })
+
+      assert html =~ "Enter a different positive whole score"
+    end
+
+    assert Repo.query!("SELECT revision, gross_strokes FROM hole_results WHERE id=$1::uuid", [
+             uuid(f.hole_id)
+           ]).rows == [[1, 4]]
+
+    assert {:ok, _} =
+             Scoring.resolve_score_query_with_correction(f.admin, f.event.id, f.round.id, %{
+               score_query_id: f.query_id,
+               expected_revision: 1,
+               new_gross_strokes: 5,
+               reason: "another reviewer"
+             })
+
+    html =
+      render_submit(view, "confirm_decision", %{
+        "decision" => %{"reason" => "reviewed", "new_gross_strokes" => "6", "revision" => "2"}
+      })
+
+    assert html =~ "Review the current information"
+
+    assert Repo.query!("SELECT revision, gross_strokes FROM hole_results WHERE id=$1::uuid", [
+             uuid(f.hole_id)
+           ]).rows == [[2, 5]]
+  end
+
+  test "picked-up and stale queries cannot select a correction", %{conn: conn} do
+    f = fixture!()
+    {hole, card} = hd(f.holes)
+
+    Repo.query!(
+      "UPDATE hole_results SET outcome='picked_up', gross_strokes=NULL WHERE id=$1::uuid",
+      [uuid(hole)]
+    )
+
+    id = insert_query!(f, {hole, card}, "open")
+    conn = authenticate(conn, f.admin.email)
+    {:ok, view, _} = live(conn, path(f))
+    refute has_element?(view, "[phx-value-decision='correct']")
+    render_click(view, "select_decision", %{"id" => id, "decision" => "correct"})
+    refute has_element?(view, "#decision-form")
+
+    Repo.query!(
+      "UPDATE hole_results SET outcome='holed_out', gross_strokes=4, revision=2 WHERE id=$1::uuid",
+      [uuid(hole)]
+    )
+
+    render_click(view, "refresh", %{})
+    refute has_element?(view, "[phx-value-decision='correct']")
+    render_click(view, "select_decision", %{"id" => id, "decision" => "correct"})
+    refute has_element?(view, "#decision-form")
+  end
+
+  test "cross-event query selection is rejected", %{conn: conn} do
+    f = correction_fixture!(:open)
+    other = correction_fixture!(:open)
+    conn = authenticate(conn, f.admin.email)
+    {:ok, view, _} = live(conn, path(f))
+    render_click(view, "select_decision", %{"id" => other.query_id, "decision" => "correct"})
+    refute has_element?(view, "#decision-form")
+
+    assert Repo.query!("SELECT revision, gross_strokes FROM hole_results WHERE id=$1::uuid", [
+             uuid(other.hole_id)
+           ]).rows == [[1, 4]]
+  end
+
+  test "lost staff authority cannot commit a selected correction", %{conn: conn} do
+    for loss <- [:revoked, :suspended] do
+      f = correction_fixture!(:open)
+      conn = authenticate(conn, f.admin.email)
+      {:ok, view, _} = live(conn, path(f))
+      render_click(view, "select_decision", %{"id" => f.query_id, "decision" => "correct"})
+
+      if loss == :revoked do
+        role!(f, "event_admin", "revoked")
+      else
+        Repo.query!("UPDATE staff_users SET status='suspended' WHERE id=$1::uuid", [
+          uuid(f.admin.id)
+        ])
+      end
+
+      html =
+        render_submit(view, "confirm_decision", %{
+          "decision" => %{"reason" => "correct count", "new_gross_strokes" => "6"}
+        })
+
+      assert html =~ "Score queries are unavailable"
+      refute has_element?(view, "#decision-form")
+
+      assert Repo.query!("SELECT revision, gross_strokes FROM hole_results WHERE id=$1::uuid", [
+               uuid(f.hole_id)
+             ]).rows == [[1, 4]]
+
+      assert Repo.query!("SELECT status FROM score_queries WHERE id=$1::uuid", [uuid(f.query_id)]).rows ==
+               [["open"]]
+    end
+  end
+
+  defp correction_fixture!(status) do
+    f = Fixtures.setup_submit_fixture!(2)
+    Fixtures.set_round_state!(f.round, :draft)
+
+    {:ok, side} =
+      Competition.create_competition_side(
+        f.admin,
+        f.event.id,
+        f.round.id,
+        f.competition.id,
+        :partnership
+      )
+
+    {:ok, _} =
+      Competition.set_side_membership(
+        f.admin,
+        f.event.id,
+        f.round.id,
+        f.competition.id,
+        side.id,
+        Enum.map(f.entries, & &1.id)
+      )
+
+    {:ok, assignment} =
+      Competition.assign_designated_verifier(
+        f.admin,
+        f.event.id,
+        f.round.id,
+        f.group.id,
+        Enum.at(f.entries, 1).id
+      )
+
+    Fixtures.set_round_state!(f.round, :scoring_open)
+
+    {:ok, _} =
+      Scoring.submit_group_hole(f.admin, f.event.id, f.round.id, %{
+        client_submission_id: Ecto.UUID.generate(),
+        playing_group_id: f.group.id,
+        round_hole_id: f.start_hole.id,
+        expected_group_score_revision: 0,
+        captured_at: DateTime.utc_now(),
+        results:
+          Enum.map(f.entries, &%{round_entry_id: &1.id, outcome: :holed_out, gross_strokes: 4})
+      })
+
+    [[hole, card]] =
+      Repo.query!(
+        "SELECT hr.id::text, hr.scorecard_id::text FROM hole_results hr JOIN scorecards sc ON sc.id=hr.scorecard_id WHERE sc.round_entry_id=$1::uuid AND hr.round_hole_id=$2::uuid",
+        [uuid(hd(f.entries).id), uuid(f.start_hole.id)]
+      ).rows
+
+    {:ok, %{grant: grant}} =
+      Accounts.issue_player_access(f.admin, f.event.id, Enum.at(f.entries, 1).player_id)
+
+    {:ok, _} =
+      Scoring.verify_hole_result(grant, f.event.id, f.round.id, %{
+        playing_group_id: f.group.id,
+        hole_result_id: hole,
+        hole_result_revision: 1,
+        role_assignment_id: assignment.id,
+        role_assignment_version: assignment.assignment_version
+      })
+
+    {:ok, opened} =
+      Scoring.query_hole_result(f.admin, f.event.id, f.round.id, %{
+        hole_result_id: hole,
+        expected_revision: 1,
+        reason: "score query"
+      })
+
+    if status == :escalated do
+      {:ok, _} =
+        Scoring.escalate_score_query(f.admin, f.event.id, f.round.id, %{
+          score_query_id: opened.score_query.id,
+          expected_revision: 1,
+          reason: "escalated"
+        })
+    end
+
+    Map.merge(f, %{
+      hole_id: hole,
+      card_id: card,
+      query_id: opened.score_query.id,
+      side_id: side.id
+    })
   end
 
   defp query_ids(html) do
