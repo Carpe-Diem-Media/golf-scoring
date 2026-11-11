@@ -212,6 +212,24 @@ defmodule GolfScoringWeb.Admin.ScoreQueriesLiveTest do
     end
   end
 
+  test "cancel clears the confirmation and its validation feedback", %{conn: conn} do
+    f = fixture!()
+    id = insert_query!(f, hd(f.holes), "open")
+    conn = authenticate(conn, f.admin.email)
+    {:ok, view, _} = live(conn, path(f))
+    render_click(view, "select_decision", %{"id" => id, "decision" => "dismiss"})
+
+    assert render_submit(view, "confirm_decision", %{"decision" => %{"reason" => " "}}) =~
+             "Enter a reason"
+
+    html = render_click(view, "cancel_decision", %{})
+    refute has_element?(view, "#decision-form")
+    refute html =~ "Enter a reason"
+
+    assert Repo.query!("SELECT status FROM score_queries WHERE id = $1::uuid", [uuid(id)]).rows ==
+             [["open"]]
+  end
+
   test "forged selections are rejected and stale revisions require review", %{conn: conn} do
     f = fixture!()
     {hole, card} = hd(f.holes)

@@ -57,7 +57,7 @@ defmodule GolfScoringWeb.Admin.ScoreQueriesLive do
     do: {:noreply, assign(socket, :selection, nil)}
 
   def handle_event("cancel_decision", _params, socket),
-    do: {:noreply, assign(socket, :selection, nil)}
+    do: {:noreply, socket |> maybe_clear_selection(true) |> assign(:message, nil)}
 
   def handle_event(
         "confirm_decision",
@@ -250,7 +250,13 @@ defmodule GolfScoringWeb.Admin.ScoreQueriesLive do
               phx-submit="confirm_decision"
               class="space-y-3"
             >
-              <.input field={@reason_form[:reason]} type="textarea" label="Decision reason" required />
+              <.input
+                field={@reason_form[:reason]}
+                type="textarea"
+                label="Decision reason"
+                class="w-full rounded-lg border border-base-content bg-base-100 px-3 py-2 text-base-content focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-base-content"
+                required
+              />
               <button
                 type="submit"
                 class="min-h-11 rounded-lg border border-base-content px-4 py-2 font-semibold focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-base-content"
