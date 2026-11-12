@@ -216,11 +216,13 @@ jobs:
       - name: Install browser test dependencies
         run: npm ci
 
-      - name: Install Chromium for the authenticated browser integration
+      - name: Configure Ubuntu mirrors for browser dependencies
         run: |
           # Use Ubuntu's archive mirrors while retaining APT signature verification.
           printf '%s\n' 'https://archive.ubuntu.com/ubuntu/' 'https://security.ubuntu.com/ubuntu/' | sudo tee /etc/apt/apt-mirrors.txt > /dev/null
-          npx playwright install --with-deps chromium
+
+      - name: Install Chromium for the authenticated browser integration
+        run: npx playwright install --with-deps chromium
 
       - name: Install Phoenix asset build tools
         run: mix assets.setup
@@ -325,11 +327,13 @@ jobs:
       - name: Install browser test dependencies
         run: npm ci
 
-      - name: Install Chromium
+      - name: Configure Ubuntu mirrors for browser dependencies
         run: |
           # Use Ubuntu's archive mirrors while retaining APT signature verification.
           printf '%s\n' 'https://archive.ubuntu.com/ubuntu/' 'https://security.ubuntu.com/ubuntu/' | sudo tee /etc/apt/apt-mirrors.txt > /dev/null
-          npx playwright install --with-deps chromium
+
+      - name: Install Chromium
+        run: npx playwright install --with-deps chromium
 
       - name: Run JavaScript and browser tests
         run: npm run test:browser

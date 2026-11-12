@@ -731,7 +731,7 @@ defmodule GolfScoring.Scoring.Services.CorrectHoleResultTest do
   defp validate_test_identity!(:test, [["golf_scoring_test", "golf_scoring_ci"]], %{
          "CI" => "true",
          "GITHUB_ACTIONS" => "true",
-         "GITHUB_REPOSITORY" => "JCSchoeman96/golf-scoring"
+         "GITHUB_REPOSITORY" => "Carpe-Diem-Media/golf-scoring"
        }),
        do: :ok
 

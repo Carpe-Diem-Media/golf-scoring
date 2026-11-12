@@ -19,7 +19,7 @@ defmodule GolfScoring.Competition.Services.RequireReviewForCorrectedScoreTest do
     github = %{
       "CI" => "true",
       "GITHUB_ACTIONS" => "true",
-      "GITHUB_REPOSITORY" => "JCSchoeman96/golf-scoring"
+      "GITHUB_REPOSITORY" => "Carpe-Diem-Media/golf-scoring"
     }
 
     local_rows = [["golf_scoring_test", "golf_scoring_test"]]
@@ -36,6 +36,7 @@ defmodule GolfScoring.Competition.Services.RequireReviewForCorrectedScoreTest do
           {:test, local_rows, github},
           {:test, [], local},
           {:test, ci_rows, Map.put(github, "GITHUB_REPOSITORY", "other/project")},
+          {:test, ci_rows, Map.put(github, "GITHUB_REPOSITORY", "JCSchoeman96/golf-scoring")},
           {:test, ci_rows, Map.put(github, "GITHUB_ACTIONS", "false")},
           {:test, local_rows, Map.put(local, "GITHUB_REPOSITORY", "other/project")},
           {:test, local_rows, Map.put(local, "CI", "true")}
@@ -701,7 +702,7 @@ defmodule GolfScoring.Competition.Services.RequireReviewForCorrectedScoreTest do
   defp validate_test_identity!(:test, [["golf_scoring_test", "golf_scoring_ci"]], %{
          "CI" => "true",
          "GITHUB_ACTIONS" => "true",
-         "GITHUB_REPOSITORY" => "JCSchoeman96/golf-scoring"
+         "GITHUB_REPOSITORY" => "Carpe-Diem-Media/golf-scoring"
        }),
        do: :ok
 
