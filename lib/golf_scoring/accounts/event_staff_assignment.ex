@@ -38,6 +38,9 @@ defmodule GolfScoring.Accounts.EventStaffAssignment do
 
       index [:staff_user_id], name: "event_staff_assignments_staff_user_id_index"
     end
+
+    identity_index_names unique_id_event_staff_role:
+                           "event_staff_assignments_unique_id_event_staff_role_index"
   end
 
   actions do
@@ -118,5 +121,9 @@ defmodule GolfScoring.Accounts.EventStaffAssignment do
       allow_nil? false
       public? false
     end
+  end
+
+  identities do
+    identity :unique_id_event_staff_role, [:id, :event_id, :staff_user_id, :role]
   end
 end

@@ -37,7 +37,9 @@ defmodule GolfScoring.Scoring.HoleSubmission do
     end
 
     identity_index_names unique_client_submission:
-                           "hole_submissions_unique_client_submission_index"
+                           "hole_submissions_unique_client_submission_index",
+                         unique_id_round_group_hole:
+                           "hole_submissions_unique_id_round_group_hole_index"
 
     check_constraints do
       check_constraint :expected_group_score_revision,
@@ -240,5 +242,6 @@ defmodule GolfScoring.Scoring.HoleSubmission do
 
   identities do
     identity :unique_client_submission, [:client_submission_id]
+    identity :unique_id_round_group_hole, [:id, :round_id, :playing_group_id, :round_hole_id]
   end
 end

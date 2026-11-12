@@ -35,6 +35,8 @@ defmodule GolfScoring.Competition.RoundEntry do
       index [:round_tee_profile_snapshot_id]
     end
 
+    identity_index_names unique_entry_scope: "round_entries_unique_id_event_round_group_index"
+
     check_constraints do
       check_constraint :registration_status, "round_entries_registration_status_must_be_valid",
         check:
@@ -229,5 +231,6 @@ defmodule GolfScoring.Competition.RoundEntry do
   identities do
     identity :unique_player_per_round, [:round_id, :player_id]
     identity :unique_id_per_round, [:id, :round_id]
+    identity :unique_entry_scope, [:id, :event_id, :round_id, :playing_group_id]
   end
 end
