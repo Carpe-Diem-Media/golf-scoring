@@ -330,7 +330,7 @@ defmodule GolfScoring.Scoring.Services.ResolveScoreQueryWithCorrectionTest do
     competing!(:decide)
   end
 
-  defp fixture!, do: build_fixture!()
+  defp fixture!, do: build_fixture!() |> submit_fixture!()
 
   defp build_fixture! do
     previous_prefix = Process.get(:gls34_prefix)
@@ -396,36 +396,38 @@ defmodule GolfScoring.Scoring.Services.ResolveScoreQueryWithCorrectionTest do
 
       Fixtures.set_round_state!(f.round, :scoring_open)
 
-      submit = %{
-        client_submission_id: Ecto.UUID.generate(),
-        playing_group_id: f.group.id,
-        round_hole_id: f.start_hole.id,
-        expected_group_score_revision: 0,
-        captured_at: DateTime.utc_now(),
-        results:
-          Enum.map(f.entries, &%{round_entry_id: &1.id, outcome: :holed_out, gross_strokes: 4})
-      }
-
-      assert {:ok, _} = Scoring.submit_group_hole(f.admin, f.event.id, f.round.id, submit)
-
-      [[hole, card]] =
-        Repo.query!(
-          "SELECT hr.id::text, hr.scorecard_id::text FROM hole_results hr JOIN scorecards sc ON sc.id = hr.scorecard_id WHERE sc.round_entry_id = $1::uuid AND hr.round_hole_id = $2::uuid",
-          [uuid(hd(f.entries).id), uuid(f.start_hole.id)]
-        ).rows
-
       Map.merge(f, %{
         affected_result_ids: [first, second],
         unrelated_result_id: third,
-        verifier_assignment: verifier_assignment,
-        hole_id: hole,
-        card_id: card
+        verifier_assignment: verifier_assignment
       })
     after
       if is_nil(previous_prefix),
         do: Process.delete(:gls34_prefix),
         else: Process.put(:gls34_prefix, previous_prefix)
     end
+  end
+
+  defp submit_fixture!(f) do
+    submit = %{
+      client_submission_id: Ecto.UUID.generate(),
+      playing_group_id: f.group.id,
+      round_hole_id: f.start_hole.id,
+      expected_group_score_revision: 0,
+      captured_at: DateTime.utc_now(),
+      results:
+        Enum.map(f.entries, &%{round_entry_id: &1.id, outcome: :holed_out, gross_strokes: 4})
+    }
+
+    assert {:ok, _} = Scoring.submit_group_hole(f.admin, f.event.id, f.round.id, submit)
+
+    [[hole, card]] =
+      Repo.query!(
+        "SELECT hr.id::text, hr.scorecard_id::text FROM hole_results hr JOIN scorecards sc ON sc.id = hr.scorecard_id WHERE sc.round_entry_id = $1::uuid AND hr.round_hole_id = $2::uuid",
+        [uuid(hd(f.entries).id), uuid(f.start_hole.id)]
+      ).rows
+
+    Map.merge(f, %{hole_id: hole, card_id: card})
   end
 
   defp opened_fixture!, do: fixture!() |> open!()
@@ -635,8 +637,14 @@ defmodule GolfScoring.Scoring.Services.ResolveScoreQueryWithCorrectionTest do
   end
 
   defp competing!(operation) do
-    {:ok, fixture} = verified_unboxed_transaction(fn -> fixture!() end)
+    {:ok, fixture} = verified_unboxed_transaction(fn -> build_fixture!() end)
     on_exit({:owned_j4b2_fixture, fixture.event.id}, fn -> cleanup!(fixture) end)
+
+    fixture =
+      verified_unboxed(fn ->
+        refute Repo.in_transaction?()
+        submit_fixture!(fixture)
+      end)
 
     f = verified_unboxed(fn -> open!(fixture) end)
 
