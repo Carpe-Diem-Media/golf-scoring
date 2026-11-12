@@ -218,22 +218,8 @@ jobs:
 
       - name: Install Chromium for the authenticated browser integration
         run: |
-          # Temporary diagnostic: only print known public Ubuntu hostnames.
-          for file in /etc/apt/apt-mirrors.txt /etc/apt/sources.list.d/ubuntu.sources; do
-            if [ -f "$file" ]; then
-              echo "$file exists"
-              awk '/azure[.]archive[.]ubuntu[.]com/ {print "contains azure.archive.ubuntu.com"} /archive[.]ubuntu[.]com/ && !/azure[.]archive[.]ubuntu[.]com/ {print "contains archive.ubuntu.com"} /security[.]ubuntu[.]com/ {print "contains security.ubuntu.com"} /mirror[+]file:\/etc\/apt\/apt-mirrors[.]txt/ {print "uses local mirror list"}' "$file"
-            else
-              echo "$file missing"
-            fi
-          done
-          tmp_mirrors=$(mktemp)
-          trap 'rm -f "$tmp_mirrors"' EXIT
-          cp /etc/apt/apt-mirrors.txt "$tmp_mirrors"
-          if sudo sed -i '/azure\.archive\.ubuntu\.com/d' "$tmp_mirrors"; then sed_status=0; else sed_status=$?; fi
-          if grep -Eq '^https?://(archive|security)\.ubuntu\.com/ubuntu/?$' "$tmp_mirrors"; then grep_status=0; else grep_status=$?; fi
-          echo "temporary-copy sed exit: $sed_status; grep exit: $grep_status"
-          if [ "$sed_status" -ne 0 ] || [ "$grep_status" -ne 0 ]; then exit 1; fi
+          # Use Ubuntu's archive mirrors while retaining APT signature verification.
+          printf '%s\n' 'https://archive.ubuntu.com/ubuntu/' 'https://security.ubuntu.com/ubuntu/' | sudo tee /etc/apt/apt-mirrors.txt > /dev/null
           npx playwright install --with-deps chromium
 
       - name: Install Phoenix asset build tools
@@ -341,22 +327,8 @@ jobs:
 
       - name: Install Chromium
         run: |
-          # Temporary diagnostic: only print known public Ubuntu hostnames.
-          for file in /etc/apt/apt-mirrors.txt /etc/apt/sources.list.d/ubuntu.sources; do
-            if [ -f "$file" ]; then
-              echo "$file exists"
-              awk '/azure[.]archive[.]ubuntu[.]com/ {print "contains azure.archive.ubuntu.com"} /archive[.]ubuntu[.]com/ && !/azure[.]archive[.]ubuntu[.]com/ {print "contains archive.ubuntu.com"} /security[.]ubuntu[.]com/ {print "contains security.ubuntu.com"} /mirror[+]file:\/etc\/apt\/apt-mirrors[.]txt/ {print "uses local mirror list"}' "$file"
-            else
-              echo "$file missing"
-            fi
-          done
-          tmp_mirrors=$(mktemp)
-          trap 'rm -f "$tmp_mirrors"' EXIT
-          cp /etc/apt/apt-mirrors.txt "$tmp_mirrors"
-          if sudo sed -i '/azure\.archive\.ubuntu\.com/d' "$tmp_mirrors"; then sed_status=0; else sed_status=$?; fi
-          if grep -Eq '^https?://(archive|security)\.ubuntu\.com/ubuntu/?$' "$tmp_mirrors"; then grep_status=0; else grep_status=$?; fi
-          echo "temporary-copy sed exit: $sed_status; grep exit: $grep_status"
-          if [ "$sed_status" -ne 0 ] || [ "$grep_status" -ne 0 ]; then exit 1; fi
+          # Use Ubuntu's archive mirrors while retaining APT signature verification.
+          printf '%s\n' 'https://archive.ubuntu.com/ubuntu/' 'https://security.ubuntu.com/ubuntu/' | sudo tee /etc/apt/apt-mirrors.txt > /dev/null
           npx playwright install --with-deps chromium
 
       - name: Run JavaScript and browser tests
