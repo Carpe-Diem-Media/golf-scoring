@@ -350,6 +350,10 @@ defmodule GolfScoring.Scoring.Services.EscalateScoreQueryTest do
   end
 
   defp fixture! do
+    fixture_prerequisites!() |> submit_fixture!()
+  end
+
+  defp fixture_prerequisites! do
     previous_prefix = Process.get(:gls34_prefix)
     Process.put(:gls34_prefix, "gls41-e2-" <> Ecto.UUID.generate())
 
@@ -422,6 +426,16 @@ defmodule GolfScoring.Scoring.Services.EscalateScoreQueryTest do
 
     Fixtures.set_round_state!(f.round, :scoring_open)
 
+    Map.merge(f, %{
+      verifier_assignment: verifier_assignment,
+      affected_result_ids: [first, second],
+      unrelated_result_id: unrelated,
+      secondary_side: secondary_side,
+      secondary_competition: secondary
+    })
+  end
+
+  defp submit_fixture!(f) do
     command = %{
       client_submission_id: Ecto.UUID.generate(),
       playing_group_id: f.group.id,
@@ -440,18 +454,7 @@ defmodule GolfScoring.Scoring.Services.EscalateScoreQueryTest do
         [uuid(hd(f.entries).id), uuid(f.start_hole.id)]
       ).rows
 
-    f =
-      Map.merge(f, %{
-        verifier_assignment: verifier_assignment,
-        affected_result_ids: [first, second],
-        unrelated_result_id: unrelated,
-        secondary_side: secondary_side,
-        secondary_competition: secondary,
-        hole_id: hole,
-        card_id: card
-      })
-
-    f
+    Map.merge(f, %{hole_id: hole, card_id: card})
   end
 
   defp opened_fixture!, do: fixture!() |> open!()
@@ -595,8 +598,16 @@ defmodule GolfScoring.Scoring.Services.EscalateScoreQueryTest do
       })
 
   defp competing!(operation) do
-    {:ok, fixture} = verified_unboxed_transaction(fn -> fixture!() |> with_verifier!() end)
+    {:ok, fixture} =
+      verified_unboxed_transaction(fn -> fixture_prerequisites!() |> with_verifier!() end)
+
     on_exit({:owned_e2_fixture, fixture.event.id}, fn -> cleanup!(fixture) end)
+
+    fixture =
+      verified_unboxed(fn ->
+        refute Repo.in_transaction?()
+        submit_fixture!(fixture)
+      end)
 
     IO.puts(
       "GLS-41 E2 owned fixture " <>

@@ -36,6 +36,110 @@ defmodule GolfScoring.Scoring.Services.SubmitGroupHoleTest do
     :ok
   end
 
+  test "submission entrypoints reject an existing transaction before validation" do
+    assert {:ok, results} =
+             Repo.transaction(fn ->
+               [
+                 SubmitGroupHole.run(nil, nil, nil, %{}),
+                 SubmitGroupHole.run_paper_recovery(nil, nil, nil, %{}, "reason"),
+                 SubmitGroupHole.resolve_accepted_receipt(nil, nil, nil, %{})
+               ]
+             end)
+
+    assert results == List.duplicate({:error, :outer_transaction_required}, 3)
+  end
+
+  test "nested submission and receipt calls leave committed facts and notifications unchanged" do
+    setup = setup_submit_fixture!(2)
+    mystery = configure_single_group_mystery!(setup)
+    command = base_command(setup, setup.start_hole.id, 0, holed_out_results(setup.entries, 4))
+    Phoenix.PubSub.subscribe(GolfScoring.PubSub, "round:#{setup.round.id}")
+
+    assert {:ok, receipt} =
+             SubmitGroupHole.run(setup.admin, setup.event.id, setup.round.id, command)
+
+    assert_receive {:group_hole_submitted, _}
+    assert_receive {:mystery_reveal_changed, _}
+
+    before =
+      {audit_count!(), hole_result_count!(), hole_submission_count!(),
+       mystery_reveal_count_for_rule!(mystery.rule.id)}
+
+    assert {:ok, results} =
+             Repo.transaction(fn ->
+               [
+                 SubmitGroupHole.run(setup.admin, setup.event.id, setup.round.id, command),
+                 SubmitGroupHole.run_paper_recovery(
+                   setup.admin,
+                   setup.event.id,
+                   setup.round.id,
+                   command,
+                   "recovery"
+                 ),
+                 SubmitGroupHole.resolve_accepted_receipt(
+                   setup.admin,
+                   setup.event.id,
+                   setup.round.id,
+                   command
+                 )
+               ]
+             end)
+
+    assert results == List.duplicate({:error, :outer_transaction_required}, 3)
+
+    assert before ==
+             {audit_count!(), hole_result_count!(), hole_submission_count!(),
+              mystery_reveal_count_for_rule!(mystery.rule.id)}
+
+    assert Ash.get!(PlayingGroup, setup.group.id, authorize?: false).scoring_revision == 1
+    refute_receive {:group_hole_submitted, _}, 50
+    refute_receive {:mystery_reveal_changed, _}, 50
+
+    assert {:ok, retry} =
+             SubmitGroupHole.run(setup.admin, setup.event.id, setup.round.id, command)
+
+    assert retry.id == receipt.id
+  end
+
+  test "rejected nested submission does not lock the round in another session" do
+    setup = Sandbox.unboxed_run(Repo, fn -> setup_submit_fixture!(2) end)
+    command = base_command(setup, setup.start_hole.id, 0, holed_out_results(setup.entries, 4))
+    parent = self()
+
+    caller =
+      Task.async(fn ->
+        Sandbox.unboxed_run(Repo, fn ->
+          Repo.transaction(fn ->
+            result = SubmitGroupHole.run(setup.admin, setup.event.id, setup.round.id, command)
+            send(parent, {:nested_submission_result, result})
+            receive do: (:release_nested_submission -> :ok)
+          end)
+        end)
+      end)
+
+    try do
+      assert_receive {:nested_submission_result, {:error, :outer_transaction_required}}, 5_000
+
+      contender =
+        Task.async(fn ->
+          Sandbox.unboxed_run(Repo, fn ->
+            Repo.transaction(fn ->
+              Repo.query!("SET LOCAL lock_timeout = '1s'")
+
+              Repo.query!("SELECT id FROM rounds WHERE id = $1::uuid FOR UPDATE", [
+                Ecto.UUID.dump!(setup.round.id)
+              ]).num_rows
+            end)
+          end)
+        end)
+
+      assert {:ok, 1} = Task.await(contender, 5_000)
+    after
+      send(caller.pid, :release_nested_submission)
+      Task.await(caller, 5_000)
+    end
+  end
+
   for player_count <- [2, 3, 4] do
     @tag player_count: player_count
     test "valid #{player_count}-player group submits first holed_out hole (revision 0 -> 1)", %{

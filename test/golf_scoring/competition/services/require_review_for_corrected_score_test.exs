@@ -49,12 +49,12 @@ defmodule GolfScoring.Competition.Services.RequireReviewForCorrectedScoreTest do
     end
   end
 
-  test "unboxed fixture setup rolls back all writes when setup fails" do
+  test "pre-submission fixture setup rolls back all writes when setup fails" do
     parent = self()
 
     assert {:error, :setup_failed} =
              verified_unboxed_transaction(fn ->
-               fixture = fixture!()
+               fixture = fixture_prerequisites!()
                send(parent, {:rolled_back_fixture, fixture.event.id})
                Repo.rollback(:setup_failed)
              end)
@@ -100,9 +100,15 @@ defmodule GolfScoring.Competition.Services.RequireReviewForCorrectedScoreTest do
   end
 
   defp recorded_cleanup_fixture! do
-    {:ok, fixture} = verified_unboxed_transaction(fn -> fixture!() end)
+    {:ok, fixture} = verified_unboxed_transaction(fn -> fixture_prerequisites!() end)
     # Retain exact ownership immediately, even if a later setup/assertion fails.
     on_exit({:owned_cleanup_fixture, fixture.event.id}, fn -> cleanup!(fixture) end)
+
+    fixture =
+      verified_unboxed(fn ->
+        refute Repo.in_transaction?()
+        submit_fixture!(fixture, true)
+      end)
 
     IO.puts(
       "GLS-41 owned fixture " <>
@@ -542,6 +548,10 @@ defmodule GolfScoring.Competition.Services.RequireReviewForCorrectedScoreTest do
   end
 
   defp fixture!(corrected? \\ true) do
+    fixture_prerequisites!() |> submit_fixture!(corrected?)
+  end
+
+  defp fixture_prerequisites! do
     f = Fixtures.setup_submit_fixture!(4)
     Fixtures.set_round_state!(f.round, :draft)
 
@@ -591,6 +601,15 @@ defmodule GolfScoring.Competition.Services.RequireReviewForCorrectedScoreTest do
     [{_, first}, {secondary_side, second}, {_, unrelated}] = sides
     Fixtures.set_round_state!(f.round, :scoring_open)
 
+    Map.merge(f, %{
+      affected_result_ids: [first, second],
+      unrelated_result_id: unrelated,
+      secondary_side: secondary_side,
+      secondary_competition: secondary
+    })
+  end
+
+  defp submit_fixture!(f, corrected?) do
     command = %{
       client_submission_id: Ecto.UUID.generate(),
       playing_group_id: f.group.id,
@@ -609,16 +628,7 @@ defmodule GolfScoring.Competition.Services.RequireReviewForCorrectedScoreTest do
         [uuid(hd(f.entries).id), uuid(f.start_hole.id)]
       ).rows
 
-    f =
-      Map.merge(f, %{
-        affected_result_ids: [first, second],
-        unrelated_result_id: unrelated,
-        secondary_side: secondary_side,
-        secondary_competition: secondary,
-        hole_id: hole,
-        card_id: card
-      })
-
+    f = Map.merge(f, %{hole_id: hole, card_id: card})
     Map.put(f, :revision_id, if(corrected?, do: correction!(f), else: nil))
   end
 
@@ -708,6 +718,15 @@ defmodule GolfScoring.Competition.Services.RequireReviewForCorrectedScoreTest do
 
   defp validate_test_identity!(_environment, _rows, _runner),
     do: raise("refusing unboxed writes outside the allocated test database and role")
+
+  defp verified_unboxed(callback) do
+    Sandbox.unboxed_run(Repo, fn ->
+      rows = Repo.query!("SELECT current_database(), current_user").rows
+      runner = Map.new(["CI", "GITHUB_ACTIONS", "GITHUB_REPOSITORY"], &{&1, System.get_env(&1)})
+      validate_test_identity!(Mix.env(), rows, runner)
+      callback.()
+    end)
+  end
 
   defp verified_unboxed_transaction(callback) do
     Sandbox.unboxed_run(Repo, fn ->

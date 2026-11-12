@@ -243,87 +243,94 @@ defmodule GolfScoring.Scoring.Services.DecideScoreQueryTest do
     competing!(:escalation)
   end
 
-  defp fixture!, do: build_fixture!()
+  defp fixture!, do: fixture_prerequisites!() |> submit_fixture!()
 
-  defp build_fixture! do
+  defp fixture_prerequisites! do
     previous_prefix = Process.get(:gls34_prefix)
     Process.put(:gls34_prefix, "gls41-j4b1-" <> Ecto.UUID.generate())
 
     try do
-      f = Fixtures.setup_submit_fixture!(4)
-      Fixtures.set_round_state!(f.round, :draft)
-
-      secondary =
-        RoundCompetition
-        |> Changeset.for_create(:configure_internal, %{
-          event_id: f.event.id,
-          round_id: f.round.id,
-          is_primary: false
-        })
-        |> Ash.create!(authorize?: false)
-
-      sides =
-        for {competition, entries} <- [
-              {f.competition, Enum.take(f.entries, 2)},
-              {secondary, Enum.take(f.entries, 2)},
-              {f.competition, Enum.drop(f.entries, 2)}
-            ] do
-          {:ok, side} =
-            Competition.create_competition_side(
-              f.admin,
-              f.event.id,
-              f.round.id,
-              competition.id,
-              :partnership
-            )
-
-          {:ok, _} =
-            Competition.set_side_membership(
-              f.admin,
-              f.event.id,
-              f.round.id,
-              competition.id,
-              side.id,
-              Enum.map(entries, & &1.id)
-            )
-
-          [[result_id]] =
-            Repo.query!(
-              "SELECT id::text FROM competition_side_results WHERE competition_side_id = $1::uuid",
-              [uuid(side.id)]
-            ).rows
-
-          {side, result_id}
-        end
-
-      [{_, first}, {_, second}, _] = sides
-
-      Fixtures.set_round_state!(f.round, :scoring_open)
-
-      submit = %{
-        client_submission_id: Ecto.UUID.generate(),
-        playing_group_id: f.group.id,
-        round_hole_id: f.start_hole.id,
-        expected_group_score_revision: 0,
-        captured_at: DateTime.utc_now(),
-        results:
-          Enum.map(f.entries, &%{round_entry_id: &1.id, outcome: :holed_out, gross_strokes: 4})
-      }
-
-      assert {:ok, _} = Scoring.submit_group_hole(f.admin, f.event.id, f.round.id, submit)
-
-      [[hole, card]] =
-        Repo.query!(
-          "SELECT hr.id::text, hr.scorecard_id::text FROM hole_results hr JOIN scorecards sc ON sc.id = hr.scorecard_id WHERE sc.round_entry_id = $1::uuid AND hr.round_hole_id = $2::uuid",
-          [uuid(hd(f.entries).id), uuid(f.start_hole.id)]
-        ).rows
-
-      Map.merge(f, %{affected_result_ids: [first, second], hole_id: hole, card_id: card})
+      build_fixture!()
     after
       if is_nil(previous_prefix),
         do: Process.delete(:gls34_prefix),
         else: Process.put(:gls34_prefix, previous_prefix)
     end
+  end
+
+  defp build_fixture! do
+    f = Fixtures.setup_submit_fixture!(4)
+    Fixtures.set_round_state!(f.round, :draft)
+
+    secondary =
+      RoundCompetition
+      |> Changeset.for_create(:configure_internal, %{
+        event_id: f.event.id,
+        round_id: f.round.id,
+        is_primary: false
+      })
+      |> Ash.create!(authorize?: false)
+
+    sides =
+      for {competition, entries} <- [
+            {f.competition, Enum.take(f.entries, 2)},
+            {secondary, Enum.take(f.entries, 2)},
+            {f.competition, Enum.drop(f.entries, 2)}
+          ] do
+        {:ok, side} =
+          Competition.create_competition_side(
+            f.admin,
+            f.event.id,
+            f.round.id,
+            competition.id,
+            :partnership
+          )
+
+        {:ok, _} =
+          Competition.set_side_membership(
+            f.admin,
+            f.event.id,
+            f.round.id,
+            competition.id,
+            side.id,
+            Enum.map(entries, & &1.id)
+          )
+
+        [[result_id]] =
+          Repo.query!(
+            "SELECT id::text FROM competition_side_results WHERE competition_side_id = $1::uuid",
+            [uuid(side.id)]
+          ).rows
+
+        {side, result_id}
+      end
+
+    [{_, first}, {_, second}, _] = sides
+
+    Fixtures.set_round_state!(f.round, :scoring_open)
+    Map.merge(f, %{affected_result_ids: [first, second]})
+  end
+
+  defp submit_fixture!(f) do
+    submit = %{
+      client_submission_id: Ecto.UUID.generate(),
+      playing_group_id: f.group.id,
+      round_hole_id: f.start_hole.id,
+      expected_group_score_revision: 0,
+      captured_at: DateTime.utc_now(),
+      results:
+        Enum.map(f.entries, &%{round_entry_id: &1.id, outcome: :holed_out, gross_strokes: 4})
+    }
+
+    assert {:ok, _} = Scoring.submit_group_hole(f.admin, f.event.id, f.round.id, submit)
+
+    [[hole, card]] =
+      Repo.query!(
+        "SELECT hr.id::text, hr.scorecard_id::text FROM hole_results hr JOIN scorecards sc ON sc.id = hr.scorecard_id WHERE sc.round_entry_id = $1::uuid AND hr.round_hole_id = $2::uuid",
+        [uuid(hd(f.entries).id), uuid(f.start_hole.id)]
+      ).rows
+
+    Map.merge(f, %{hole_id: hole, card_id: card})
   end
 
   defp opened_fixture!, do: fixture!() |> open!()
@@ -467,8 +474,14 @@ defmodule GolfScoring.Scoring.Services.DecideScoreQueryTest do
       })
 
   defp competing!(operation) do
-    {:ok, fixture} = verified_unboxed_transaction(fn -> fixture!() end)
+    {:ok, fixture} = verified_unboxed_transaction(fn -> fixture_prerequisites!() end)
     on_exit({:owned_j4b1_decide_fixture, fixture.event.id}, fn -> cleanup!(fixture) end)
+
+    fixture =
+      verified_unboxed(fn ->
+        refute Repo.in_transaction?()
+        submit_fixture!(fixture)
+      end)
 
     f = verified_unboxed(fn -> open!(fixture) end)
 

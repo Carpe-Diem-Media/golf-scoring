@@ -496,6 +496,10 @@ defmodule GolfScoring.Scoring.Services.OpenScoreQueryTest do
   end
 
   defp fixture! do
+    fixture_prerequisites!() |> submit_fixture!()
+  end
+
+  defp fixture_prerequisites! do
     f = Fixtures.setup_submit_fixture!(4)
     Fixtures.set_round_state!(f.round, :draft)
 
@@ -555,6 +559,16 @@ defmodule GolfScoring.Scoring.Services.OpenScoreQueryTest do
 
     Fixtures.set_round_state!(f.round, :scoring_open)
 
+    Map.merge(f, %{
+      verifier_assignment: verifier_assignment,
+      affected_result_ids: [first, second],
+      unrelated_result_id: unrelated,
+      secondary_side: secondary_side,
+      secondary_competition: secondary
+    })
+  end
+
+  defp submit_fixture!(f) do
     command = %{
       client_submission_id: Ecto.UUID.generate(),
       playing_group_id: f.group.id,
@@ -573,18 +587,7 @@ defmodule GolfScoring.Scoring.Services.OpenScoreQueryTest do
         [uuid(hd(f.entries).id), uuid(f.start_hole.id)]
       ).rows
 
-    f =
-      Map.merge(f, %{
-        verifier_assignment: verifier_assignment,
-        affected_result_ids: [first, second],
-        unrelated_result_id: unrelated,
-        secondary_side: secondary_side,
-        secondary_competition: secondary,
-        hole_id: hole,
-        card_id: card
-      })
-
-    f
+    Map.merge(f, %{hole_id: hole, card_id: card})
   end
 
   defp set_state!(f, id, "excluded") do
@@ -648,6 +651,15 @@ defmodule GolfScoring.Scoring.Services.OpenScoreQueryTest do
   defp validate_test_identity!(_environment, _rows, _runner),
     do: raise("refusing unboxed writes outside the allocated test database and role")
 
+  defp verified_unboxed(callback) do
+    Sandbox.unboxed_run(Repo, fn ->
+      rows = Repo.query!("SELECT current_database(), current_user").rows
+      runner = Map.new(["CI", "GITHUB_ACTIONS", "GITHUB_REPOSITORY"], &{&1, System.get_env(&1)})
+      validate_test_identity!(Mix.env(), rows, runner)
+      callback.()
+    end)
+  end
+
   defp verified_unboxed_transaction(callback) do
     Sandbox.unboxed_run(Repo, fn ->
       Repo.transaction(fn ->
@@ -660,8 +672,14 @@ defmodule GolfScoring.Scoring.Services.OpenScoreQueryTest do
   end
 
   defp recorded_cleanup_fixture! do
-    {:ok, fixture} = verified_unboxed_transaction(fn -> fixture!() end)
+    {:ok, fixture} = verified_unboxed_transaction(fn -> fixture_prerequisites!() end)
     on_exit({:owned_cleanup_fixture, fixture.event.id}, fn -> cleanup!(fixture) end)
+
+    fixture =
+      verified_unboxed(fn ->
+        refute Repo.in_transaction?()
+        submit_fixture!(fixture)
+      end)
 
     IO.puts(
       "GLS-41 E1 owned fixture " <>

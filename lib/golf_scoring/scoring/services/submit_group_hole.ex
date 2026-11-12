@@ -179,25 +179,33 @@ defmodule GolfScoring.Scoring.Services.SubmitGroupHole do
 
   @spec run(term(), Ecto.UUID.t(), Ecto.UUID.t(), command()) ::
           {:ok, HoleSubmission.t()} | {:error, term()}
-  def run(actor, event_id, round_id, command) when is_map(command) do
+  def run(actor, event_id, round_id, command) do
+    standalone(fn -> submit(actor, event_id, round_id, command) end)
+  end
+
+  defp submit(actor, event_id, round_id, command) when is_map(command) do
     with {:ok, cmd} <- normalize_command(command) do
       run_transaction(actor, event_id, round_id, cmd)
     end
   end
 
-  def run(_actor, _event_id, _round_id, _command), do: {:error, :invalid_input}
+  defp submit(_actor, _event_id, _round_id, _command), do: {:error, :invalid_input}
 
   @doc false
   @spec resolve_accepted_receipt(term(), Ecto.UUID.t(), Ecto.UUID.t(), command()) ::
           {:ok, HoleSubmission.t()} | {:error, term()}
-  def resolve_accepted_receipt(actor, event_id, round_id, command) when is_map(command) do
+  def resolve_accepted_receipt(actor, event_id, round_id, command) do
+    standalone(fn -> resolve_receipt(actor, event_id, round_id, command) end)
+  end
+
+  defp resolve_receipt(actor, event_id, round_id, command) when is_map(command) do
     case normalize_command(command) do
       {:ok, cmd} -> resolve_normalized_receipt(actor, event_id, round_id, cmd)
       {:error, _reason} = error -> error
     end
   end
 
-  def resolve_accepted_receipt(_actor, _event_id, _round_id, _command),
+  defp resolve_receipt(_actor, _event_id, _round_id, _command),
     do: {:error, :invalid_input}
 
   defp normalize_receipt_resolution({:ok, %HoleSubmission{} = receipt}), do: {:ok, receipt}
@@ -249,7 +257,11 @@ defmodule GolfScoring.Scoring.Services.SubmitGroupHole do
   @doc false
   @spec run_paper_recovery(term(), Ecto.UUID.t(), Ecto.UUID.t(), command(), term()) ::
           {:ok, HoleSubmission.t()} | {:error, term()}
-  def run_paper_recovery(actor, event_id, round_id, command, reason) when is_map(command) do
+  def run_paper_recovery(actor, event_id, round_id, command, reason) do
+    standalone(fn -> paper_recovery(actor, event_id, round_id, command, reason) end)
+  end
+
+  defp paper_recovery(actor, event_id, round_id, command, reason) when is_map(command) do
     with {:ok, normalized_reason} <- normalize_recovery_reason(reason),
          {:ok, cmd} <- normalize_command(command) do
       cmd =
@@ -262,8 +274,12 @@ defmodule GolfScoring.Scoring.Services.SubmitGroupHole do
     end
   end
 
-  def run_paper_recovery(_actor, _event_id, _round_id, _command, _reason),
+  defp paper_recovery(_actor, _event_id, _round_id, _command, _reason),
     do: {:error, :invalid_input}
+
+  defp standalone(fun) do
+    if Repo.in_transaction?(), do: {:error, :outer_transaction_required}, else: fun.()
+  end
 
   defp normalize_recovery_reason(reason) when is_binary(reason) do
     case String.trim(reason) do
