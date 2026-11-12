@@ -64,6 +64,7 @@ defmodule GolfScoring.Competition do
     resource GolfScoring.Competition.CompetitionSideMembership
     resource GolfScoring.Competition.CompetitionSideResult
     resource GolfScoring.Competition.CompetitionSideRetirement
+    resource GolfScoring.Competition.RoundEntryParticipationRuling
     resource GolfScoring.Competition.GroupRoleAssignment
 
     resource GolfScoring.Competition.ScoringTrack do
