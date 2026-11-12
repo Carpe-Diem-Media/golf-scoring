@@ -217,7 +217,11 @@ jobs:
         run: npm ci
 
       - name: Install Chromium for the authenticated browser integration
-        run: npx playwright install --with-deps chromium
+        run: |
+          # Avoid the runner's Azure mirror when resolving Ubuntu packages.
+          sudo sed -i '/azure\.archive\.ubuntu\.com/d' /etc/apt/apt-mirrors.txt
+          grep -Eq '^https?://(archive|security)\.ubuntu\.com/ubuntu/?$' /etc/apt/apt-mirrors.txt
+          npx playwright install --with-deps chromium
 
       - name: Install Phoenix asset build tools
         run: mix assets.setup
@@ -323,7 +327,11 @@ jobs:
         run: npm ci
 
       - name: Install Chromium
-        run: npx playwright install --with-deps chromium
+        run: |
+          # Avoid the runner's Azure mirror when resolving Ubuntu packages.
+          sudo sed -i '/azure\.archive\.ubuntu\.com/d' /etc/apt/apt-mirrors.txt
+          grep -Eq '^https?://(archive|security)\.ubuntu\.com/ubuntu/?$' /etc/apt/apt-mirrors.txt
+          npx playwright install --with-deps chromium
 
       - name: Run JavaScript and browser tests
         run: npm run test:browser
