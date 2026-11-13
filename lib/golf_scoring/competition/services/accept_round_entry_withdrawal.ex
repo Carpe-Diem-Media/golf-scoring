@@ -121,9 +121,6 @@ defmodule GolfScoring.Competition.Services.AcceptRoundEntryWithdrawal do
     end
   end
 
-  defp normalize_input(_event_id, _round_id, _group_id, _entry_id, _attrs, _received_at),
-    do: {:error, :invalid_input}
-
   defp normalize_reason(reason) when is_binary(reason) do
     case String.trim(reason) do
       "" -> {:error, :reason_required}
@@ -786,7 +783,6 @@ defmodule GolfScoring.Competition.Services.AcceptRoundEntryWithdrawal do
        }}
     else
       {:error, _reason} = error -> error
-      nil -> {:error, :invalid_checkpoint_route}
     end
   end
 
@@ -1305,8 +1301,15 @@ defmodule GolfScoring.Competition.Services.AcceptRoundEntryWithdrawal do
   end
 
   defp gate_matches_operation?(gate, operation) do
+    ruling_state_matches? =
+      if operation == :create_accepted_withdrawal_internal do
+        not gate.ruling_inserted? and is_nil(gate.ruling_id)
+      else
+        gate.ruling_inserted? and is_binary(gate.ruling_id)
+      end
+
     gate.owner == __MODULE__ and gate.pid == self() and
-      gate.ruling_inserted? == (operation != :create_accepted_withdrawal_internal) and
+      ruling_state_matches? and
       is_reference(gate.token)
   end
 
@@ -1352,14 +1355,14 @@ defmodule GolfScoring.Competition.Services.AcceptRoundEntryWithdrawal do
       Ash.Changeset.get_data(changeset, :participation_status) == :active
   end
 
-  defp write_scope_matches?(changeset, :mark_revoked_for_withdrawal_internal, scope, _gate) do
-    changeset.resource == GroupRoleAssignment and changeset.data.id == scope.assignment_id and
-      changeset.data.round_id == scope.round_id and
-      changeset.data.playing_group_id == scope.playing_group_id and
-      changeset.data.round_entry_id == scope.round_entry_id and
-      changeset.data.role == String.to_existing_atom(scope.role) and
-      changeset.data.assignment_version == scope.assignment_version and
-      Ash.Changeset.get_data(changeset, :state) == :active
+  defp write_scope_matches?(changeset, :mark_revoked_for_withdrawal_internal, scope, gate) do
+    locked_assignment =
+      Enum.find(gate.verification.revoked_assignments, &(&1.id == scope.assignment_id))
+
+    case locked_assignment do
+      nil -> false
+      assignment -> locked_revocation_matches?(changeset, scope, gate, assignment)
+    end
   end
 
   defp write_scope_matches?(changeset, :flag_group_attention_for_withdrawal_internal, scope, gate) do
@@ -1370,14 +1373,75 @@ defmodule GolfScoring.Competition.Services.AcceptRoundEntryWithdrawal do
       not gate.verification.independent_verification_available?
   end
 
-  defp write_scope_matches?(changeset, :require_review_for_withdrawal_internal, scope, _gate) do
-    changeset.resource == CompetitionSideResult and
-      changeset.data.id == scope.competition_side_result_id and
-      changeset.data.competition_side_id == scope.competition_side_id and
-      scope.blocker_codes != [] and Ash.Changeset.get_data(changeset, :state) == :provisional
+  defp write_scope_matches?(changeset, :require_review_for_withdrawal_internal, scope, gate) do
+    locked_side =
+      Enum.find(gate.sides.sides, &(&1.result_id == scope.competition_side_result_id))
+
+    case locked_side do
+      nil -> false
+      side -> locked_side_review_matches?(changeset, scope, gate, side)
+    end
   end
 
   defp write_scope_matches?(_changeset, _operation, _scope, _gate), do: false
+
+  defp locked_revocation_matches?(changeset, scope, gate, assignment) do
+    accepted_ruling_matches?(gate) and scope == revocation_scope(assignment) and
+      assignment_matches_withdrawal_target?(assignment, gate) and
+      changeset_matches_locked_assignment?(changeset, assignment, gate)
+  end
+
+  defp revocation_scope(assignment) do
+    %{
+      assignment_id: assignment.id,
+      round_id: assignment.round_id,
+      playing_group_id: assignment.playing_group_id,
+      round_entry_id: assignment.round_entry_id,
+      role: assignment.role,
+      assignment_version: assignment.assignment_version
+    }
+  end
+
+  defp assignment_matches_withdrawal_target?(assignment, gate) do
+    assignment.round_id == gate.input.round_id and
+      assignment.playing_group_id == gate.input.playing_group_id and
+      assignment.round_entry_id == gate.input.round_entry_id
+  end
+
+  defp changeset_matches_locked_assignment?(changeset, assignment, gate) do
+    changeset.resource == GroupRoleAssignment and changeset.data.id == assignment.id and
+      changeset.data.round_id == assignment.round_id and
+      changeset.data.playing_group_id == assignment.playing_group_id and
+      changeset.data.round_entry_id == gate.input.round_entry_id and
+      changeset.data.role == String.to_existing_atom(assignment.role) and
+      changeset.data.assignment_version == assignment.assignment_version and
+      Ash.Changeset.get_data(changeset, :state) == :active
+  end
+
+  defp locked_side_review_matches?(changeset, scope, gate, side) do
+    blocker_codes = side_blockers(side, gate.verification)
+
+    accepted_ruling_matches?(gate) and scope == side_review_scope(side, blocker_codes) and
+      blocker_codes != [] and side.state in ["provisional", :provisional] and
+      side.round_id == gate.input.round_id and changeset_matches_locked_side?(changeset, side)
+  end
+
+  defp side_review_scope(side, blocker_codes) do
+    %{
+      competition_side_result_id: side.result_id,
+      competition_side_id: side.side_id,
+      blocker_codes: blocker_codes
+    }
+  end
+
+  defp changeset_matches_locked_side?(changeset, side) do
+    changeset.resource == CompetitionSideResult and changeset.data.id == side.result_id and
+      changeset.data.competition_side_id == side.side_id and
+      Ash.Changeset.get_data(changeset, :state) == :provisional
+  end
+
+  defp accepted_ruling_matches?(gate),
+    do: gate.ruling_inserted? and is_binary(gate.ruling_id)
 
   defp attributes_match?(changeset, expected) do
     Enum.all?(expected, fn {field, value} ->

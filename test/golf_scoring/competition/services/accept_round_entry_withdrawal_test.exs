@@ -4,10 +4,14 @@ defmodule GolfScoring.Competition.Services.AcceptRoundEntryWithdrawalTest do
   alias Ecto.Adapters.SQL.Sandbox
   alias GolfScoring.Accounts.StaffUser
   alias GolfScoring.Competition
+  alias GolfScoring.Competition.CompetitionSideResult
+  alias GolfScoring.Competition.GroupRoleAssignment
   alias GolfScoring.Competition.RoundEntry
   alias GolfScoring.Competition.Services.AcceptRoundEntryWithdrawal
+  alias GolfScoring.Competition.Services.AssignPlayingGroupStart
   alias GolfScoring.Competition.Services.HandoverGroupRole
   alias GolfScoring.Repo
+  alias GolfScoring.Scoring.Services.OpenScoreQuery
   alias GolfScoring.Scoring.Services.PaperRecoveryFixtures
   alias GolfScoring.Scoring.Services.SubmitGroupHole
 
@@ -128,6 +132,29 @@ defmodule GolfScoring.Competition.Services.AcceptRoundEntryWithdrawalTest do
     assert ruling_id == accepted.ruling_id
 
     refute_receive {:playing_group_attention_required, _}, 50
+  end
+
+  test "accepts a shotgun route that wraps from hole 18 to hole 1" do
+    fixture = scored_fixture!(2, 1, start_hole_index: 17)
+    target = Enum.at(fixture.entries, 2)
+
+    assert hd(fixture.route).play_order == 18
+    assert Enum.at(fixture.route, 1).play_order == 1
+
+    assert {:ok, accepted} =
+             AcceptRoundEntryWithdrawal.run(
+               fixture.admin,
+               fixture.event.id,
+               fixture.round.id,
+               fixture.group.id,
+               target.id,
+               withdrawal_attrs(fixture)
+             )
+
+    assert accepted.checkpoint_round_hole_id == hd(fixture.route).id
+    assert accepted.effective_round_hole_id == Enum.at(fixture.route, 1).id
+    assert accepted.checkpoint_play_index == 0
+    assert accepted.effective_play_index == 1
   end
 
   test "accepts a same-event Competition Manager assignment" do
@@ -808,6 +835,28 @@ defmodule GolfScoring.Competition.Services.AcceptRoundEntryWithdrawalTest do
     assert count_rulings(target.id) == 0
   end
 
+  test "role revocation and SideResult review reject writes without coordinator evidence" do
+    fixture = scored_fixture!(1)
+    target = Enum.at(fixture.entries, 1)
+    assignment_id = assignment_for_entry!(fixture.group.id, target.id, :designated_verifier)
+    assignment = Ash.get!(GroupRoleAssignment, assignment_id, authorize?: false)
+    result_id = side_result_id_for(fixture.side.id)
+    result = Ash.get!(CompetitionSideResult, result_id, authorize?: false)
+
+    assert {:error, %Ash.Error.Invalid{}} =
+             assignment
+             |> Ash.Changeset.for_update(:mark_revoked_for_withdrawal_internal, %{})
+             |> Ash.update(authorize?: false)
+
+    assert {:error, %Ash.Error.Invalid{}} =
+             result
+             |> Ash.Changeset.for_update(:require_review_for_withdrawal_internal, %{})
+             |> Ash.update(authorize?: false)
+
+    assert role_assignment_state(assignment_id) == "active"
+    assert side_result_state(fixture.side.id) == "provisional"
+  end
+
   @tag :real_concurrency
   test "withdrawal and hole submission serialize in both Round-lock winner orders", %{
     sandbox_owner: owner
@@ -968,10 +1017,161 @@ defmodule GolfScoring.Competition.Services.AcceptRoundEntryWithdrawalTest do
     assert group_state(withdrawal_first_fixture.group.id) == "attention_required"
   end
 
+  @tag :real_concurrency
+  test "withdrawal and designated-verifier handover serialize in both Round-lock winner orders",
+       %{
+         sandbox_owner: owner
+       } do
+    handover_first_fixture = committed_fixture!(2, 2)
+    register_committed_cleanup!(owner, handover_first_fixture)
+    verifier = Enum.at(handover_first_fixture.entries, 2)
+    successor = Enum.at(handover_first_fixture.entries, 1)
+
+    {handover, withdrawal} =
+      race_with_audit_barrier!(
+        "handover_group_role",
+        fn ->
+          HandoverGroupRole.run(
+            handover_first_fixture.admin,
+            handover_first_fixture.event.id,
+            handover_first_fixture.round.id,
+            handover_first_fixture.group.id,
+            successor.id,
+            :designated_verifier
+          )
+        end,
+        fn ->
+          AcceptRoundEntryWithdrawal.run(
+            handover_first_fixture.admin,
+            handover_first_fixture.event.id,
+            handover_first_fixture.round.id,
+            handover_first_fixture.group.id,
+            verifier.id,
+            withdrawal_attrs_for_play(handover_first_fixture, 1)
+          )
+        end
+      )
+
+    assert match?({:ok, _}, handover)
+    assert {:ok, _accepted_after_handover} = withdrawal
+    assert participation_status(verifier.id) == "withdrawn"
+
+    assert role_state_for_entry(
+             handover_first_fixture.group.id,
+             verifier.id,
+             :designated_verifier
+           ) ==
+             "handed_over"
+
+    assert active_role_holder(handover_first_fixture.group.id, :designated_verifier) ==
+             successor.id
+
+    assert group_state(handover_first_fixture.group.id) == "playing"
+
+    withdrawal_first_fixture = committed_fixture!(2, 2)
+    register_committed_cleanup!(owner, withdrawal_first_fixture)
+    verifier = Enum.at(withdrawal_first_fixture.entries, 2)
+    successor = Enum.at(withdrawal_first_fixture.entries, 1)
+
+    {withdrawal_result, handover_result} =
+      race_with_audit_barrier!(
+        "accept_round_entry_withdrawal",
+        fn ->
+          AcceptRoundEntryWithdrawal.run(
+            withdrawal_first_fixture.admin,
+            withdrawal_first_fixture.event.id,
+            withdrawal_first_fixture.round.id,
+            withdrawal_first_fixture.group.id,
+            verifier.id,
+            withdrawal_attrs_for_play(withdrawal_first_fixture, 1)
+          )
+        end,
+        fn ->
+          HandoverGroupRole.run(
+            withdrawal_first_fixture.admin,
+            withdrawal_first_fixture.event.id,
+            withdrawal_first_fixture.round.id,
+            withdrawal_first_fixture.group.id,
+            successor.id,
+            :designated_verifier
+          )
+        end
+      )
+
+    assert {:ok, _accepted_before_handover} = withdrawal_result
+    assert {:error, _reason} = handover_result
+    assert participation_status(verifier.id) == "withdrawn"
+
+    assert role_state_for_entry(
+             withdrawal_first_fixture.group.id,
+             verifier.id,
+             :designated_verifier
+           ) ==
+             "revoked"
+
+    assert active_role_holder(withdrawal_first_fixture.group.id, :designated_verifier) == nil
+    assert group_state(withdrawal_first_fixture.group.id) == "attention_required"
+  end
+
+  @tag :real_concurrency
+  test "withdrawal and score-query SideResult review serialize in both Round-lock winner orders",
+       %{
+         sandbox_owner: owner
+       } do
+    query_first_fixture = committed_fixture!(2, 1)
+    register_committed_cleanup!(owner, query_first_fixture)
+    target = Enum.at(query_first_fixture.entries, 2)
+
+    {query, withdrawal} =
+      race_with_audit_barrier!(
+        "query_hole_result",
+        fn -> open_score_query(query_first_fixture, target) end,
+        fn ->
+          AcceptRoundEntryWithdrawal.run(
+            query_first_fixture.admin,
+            query_first_fixture.event.id,
+            query_first_fixture.round.id,
+            query_first_fixture.group.id,
+            target.id,
+            withdrawal_attrs_for_play(query_first_fixture, 1)
+          )
+        end
+      )
+
+    assert match?({:ok, _}, query)
+    assert {:ok, _accepted_after_query} = withdrawal
+    assert side_result_state(query_first_fixture.side.id) == "review_required"
+
+    withdrawal_first_fixture = committed_fixture!(2, 1)
+    register_committed_cleanup!(owner, withdrawal_first_fixture)
+    target = Enum.at(withdrawal_first_fixture.entries, 2)
+
+    {withdrawal_result, query_result} =
+      race_with_audit_barrier!(
+        "accept_round_entry_withdrawal",
+        fn ->
+          AcceptRoundEntryWithdrawal.run(
+            withdrawal_first_fixture.admin,
+            withdrawal_first_fixture.event.id,
+            withdrawal_first_fixture.round.id,
+            withdrawal_first_fixture.group.id,
+            target.id,
+            withdrawal_attrs_for_play(withdrawal_first_fixture, 1)
+          )
+        end,
+        fn -> open_score_query(withdrawal_first_fixture, target) end
+      )
+
+    assert {:ok, _accepted_before_query} = withdrawal_result
+    assert match?({:ok, _}, query_result)
+    assert side_result_state(withdrawal_first_fixture.side.id) == "review_required"
+  end
+
   defp scored_fixture!(target_index, verifier_index \\ 1, options \\ []) do
     fixture = PaperRecoveryFixtures.setup_submit_fixture!(3)
 
     PaperRecoveryFixtures.set_round_state!(fixture.round, :draft)
+    fixture = assign_requested_start_hole!(fixture, options)
 
     assert {:ok, _assignment} =
              PaperRecoveryFixtures.assign_designated_verifier_for_fixture(
@@ -1086,8 +1286,49 @@ defmodule GolfScoring.Competition.Services.AcceptRoundEntryWithdrawalTest do
     }
   end
 
-  defp committed_fixture!(target_index, verifier_index) do
-    Sandbox.unboxed_run(Repo, fn -> scored_fixture!(target_index, verifier_index) end)
+  defp open_score_query(fixture, entry) do
+    [[hole_result_id, _hole_id, _gross_strokes, revision]] = results_for_entry(entry.id)
+
+    OpenScoreQuery.run(
+      fixture.admin,
+      fixture.event.id,
+      fixture.round.id,
+      %{
+        hole_result_id: Ecto.UUID.cast!(hole_result_id),
+        expected_revision: revision,
+        reason: "query before or after participant withdrawal"
+      }
+    )
+  end
+
+  defp committed_fixture!(target_index, verifier_index, options \\ []) do
+    Sandbox.unboxed_run(Repo, fn -> scored_fixture!(target_index, verifier_index, options) end)
+  end
+
+  defp assign_requested_start_hole!(fixture, options) do
+    case Keyword.get(options, :start_hole_index) do
+      index when is_integer(index) and index in 0..17 ->
+        starting_hole = Enum.at(fixture.route, index)
+
+        assert {:ok, _group} =
+                 AssignPlayingGroupStart.run(
+                   fixture.admin,
+                   fixture.event.id,
+                   fixture.round.id,
+                   fixture.group.id,
+                   starting_hole.id,
+                   1
+                 )
+
+        Map.put(
+          fixture,
+          :route,
+          Enum.drop(fixture.route, index) ++ Enum.take(fixture.route, index)
+        )
+
+      _ ->
+        fixture
+    end
   end
 
   defp register_committed_cleanup!(owner, fixture) do
@@ -1273,6 +1514,18 @@ defmodule GolfScoring.Competition.Services.AcceptRoundEntryWithdrawalTest do
       BEFORE UPDATE OR DELETE ON round_entry_participation_rulings
       FOR EACH ROW EXECUTE FUNCTION public.reject_round_entry_participation_ruling_mutation()
       """)
+
+      Repo.query!(
+        "ALTER TABLE public.round_entry_participation_rulings ENABLE ALWAYS TRIGGER round_entry_participation_rulings_reject_mutation"
+      )
+
+      assert [["A"]] ==
+               Repo.query!("""
+               SELECT tgenabled::text
+               FROM pg_trigger
+               WHERE tgrelid = 'public.round_entry_participation_rulings'::regclass
+                 AND tgname = 'round_entry_participation_rulings_reject_mutation'
+               """).rows
     end)
   end
 
@@ -1284,6 +1537,7 @@ defmodule GolfScoring.Competition.Services.AcceptRoundEntryWithdrawalTest do
     cleanup_statements = [
       {"DELETE FROM audit_events WHERE context->>'round_id' = $1", [fixture.round.id]},
       {"DELETE FROM round_entry_participation_rulings WHERE round_id = $1::uuid", [round]},
+      {"DELETE FROM score_queries WHERE round_id = $1::uuid", [round]},
       {"DELETE FROM hole_results WHERE round_id = $1::uuid", [round]},
       {"DELETE FROM hole_submissions WHERE round_id = $1::uuid", [round]},
       {"DELETE FROM scorecards WHERE round_id = $1::uuid", [round]},
