@@ -1,3 +1,41 @@
+defmodule GolfScoring.Competition.RoundEntryRegistrationPolicy do
+  @moduledoc false
+
+  use Ash.Policy.SimpleCheck
+
+  alias Ash.Error.Changes.InvalidChanges
+  alias GolfScoring.Accounts.Checks.ActiveEventRole
+  alias GolfScoring.Repo
+
+  @impl true
+  def describe(opts) do
+    ActiveEventRole.describe(opts) <> " and no caller-owned transaction is open"
+  end
+
+  @impl true
+  def requires_original_data?(authorizer, opts) do
+    ActiveEventRole.requires_original_data?(authorizer, opts)
+  end
+
+  @impl true
+  def match?(actor, context, opts) do
+    if Repo.in_transaction?() do
+      {:error, transaction_already_open_error()}
+    else
+      ActiveEventRole.match?(actor, context, opts)
+    end
+  end
+
+  @doc false
+  def transaction_already_open_error do
+    InvalidChanges.exception(
+      fields: [],
+      message: "registration lifecycle actions require a standalone transaction",
+      vars: [reason: :transaction_already_open]
+    )
+  end
+end
+
 defmodule GolfScoring.Competition.RoundEntry do
   @moduledoc "One Player participating in one Round."
 
@@ -153,7 +191,7 @@ defmodule GolfScoring.Competition.RoundEntry do
       policy action(action) do
         access_type :strict
 
-        authorize_if {GolfScoring.Accounts.Checks.ActiveEventRole,
+        authorize_if {GolfScoring.Competition.RoundEntryRegistrationPolicy,
                       roles: [:event_admin, :competition_manager, :registration_staff]}
       end
     end

@@ -150,6 +150,46 @@ defmodule GolfScoring.Competition.RoundEntryTest do
     end
   end
 
+  test "registration lifecycle Ash policies require active same-event staff roles" do
+    %{event: event, round: round, admin: admin, player: player} = setup_round!()
+    manager = create_staff_user!()
+    registration_staff = create_staff_user!()
+    revoked_staff = create_staff_user!()
+    inactive_staff = create_staff_user!()
+
+    assign_role!(admin, event, manager, :competition_manager)
+    assign_role!(admin, event, registration_staff, :registration_staff)
+    assign_role!(admin, event, revoked_staff, :registration_staff)
+    assign_role!(admin, event, inactive_staff, :registration_staff)
+
+    other_event = create_event!()
+    other_event_admin = create_event_admin!(other_event)
+
+    assert {:ok, entry} =
+             Competition.add_round_entry(event.id, round.id, player.id, actor: admin)
+
+    assert {:ok, _revoked} =
+             Accounts.revoke_event_staff_role(
+               active_assignment_record(event, revoked_staff, :registration_staff),
+               actor: admin
+             )
+
+    Repo.query!("UPDATE staff_users SET status = 'suspended' WHERE id = $1::uuid", [
+      Ecto.UUID.dump!(inactive_staff.id)
+    ])
+
+    for action <- [:check_in_round_entry, :mark_no_show, :withdraw_before_start] do
+      for authorized_actor <- [admin, manager, registration_staff] do
+        assert Ash.can?({entry, action}, authorized_actor)
+      end
+
+      refute Ash.can?({entry, action}, other_event_admin)
+      refute Ash.can?({entry, action}, revoked_staff)
+      refute Ash.can?({entry, action}, inactive_staff)
+      refute Ash.can?({entry, action}, nil)
+    end
+  end
+
   test "PostgreSQL integrity constraints and RESTRICT history" do
     %{event: event, round: round, admin: admin, player: player} = setup_round!()
     other_event = create_event!()
@@ -455,6 +495,123 @@ defmodule GolfScoring.Competition.RoundEntryTest do
     assert withdrawn.registration_status == :withdrawn_before_start
     assert withdrawn.participation_status == :not_started
     refute withdrawn.participation_status == :withdrawn
+  end
+
+  test "registration lifecycle actions reject caller transactions before issuing SQL" do
+    %{event: event, round: round, admin: admin, player: player} = setup_round!()
+    staff = create_staff_user!()
+    assign_role!(admin, event, staff, :registration_staff)
+
+    assert {:ok, entry} =
+             Competition.add_round_entry(event.id, round.id, player.id, actor: admin)
+
+    actions = [
+      {:check_in_round_entry, fn -> Competition.check_in_round_entry(entry, actor: staff) end,
+       false},
+      {:mark_no_show, fn -> Competition.mark_no_show(entry, actor: staff) end, true},
+      {:withdraw_before_start, fn -> Competition.withdraw_before_start(entry, actor: staff) end,
+       false}
+    ]
+
+    expected_state = registration_lifecycle_state(entry.id)
+
+    for {operation, call, hold_entry?} <- actions do
+      assert {:ok, {:error, %Ash.Error.Invalid{} = error}} =
+               Repo.transaction(fn ->
+                 assert Repo.in_transaction?()
+
+                 if hold_entry? do
+                   Repo.query!(
+                     "SELECT id FROM round_entries WHERE id = $1::uuid FOR UPDATE",
+                     [Ecto.UUID.dump!(entry.id)]
+                   )
+                 end
+
+                 handler = {__MODULE__, make_ref()}
+                 event = [:golf_scoring, :repo, :query]
+
+                 :ok =
+                   :telemetry.attach(
+                     handler,
+                     event,
+                     &__MODULE__.observe_lifecycle_query/4,
+                     self()
+                   )
+
+                 try do
+                   result = call.()
+                   refute_receive {:round_entry_lifecycle_query, _metadata}, 0
+                   result
+                 after
+                   :telemetry.detach(handler)
+                 end
+               end),
+             "#{operation} did not reject the caller-owned transaction before querying"
+
+      assert Enum.any?(error.errors, fn
+               %Ash.Error.Changes.InvalidChanges{vars: vars} ->
+                 Keyword.get(vars, :reason) == :transaction_already_open
+
+               _error ->
+                 false
+             end)
+
+      assert registration_lifecycle_state(entry.id) == expected_state
+    end
+  end
+
+  test "prebuilt registration changesets reject caller transactions before policy SQL" do
+    %{event: event, round: round, admin: admin, player: player} = setup_round!()
+    staff = create_staff_user!()
+    assign_role!(admin, event, staff, :registration_staff)
+
+    assert {:ok, entry} =
+             Competition.add_round_entry(event.id, round.id, player.id, actor: admin)
+
+    actions = [:check_in_round_entry, :mark_no_show, :withdraw_before_start]
+
+    changesets =
+      Enum.map(actions, fn action ->
+        {action, Ash.Changeset.for_update(entry, action, %{}, actor: staff)}
+      end)
+
+    expected_state = registration_lifecycle_state(entry.id)
+
+    for {action, changeset} <- changesets do
+      handler = {__MODULE__, make_ref()}
+
+      assert {:ok, {:error, %Ash.Error.Invalid{} = error}} =
+               Repo.transaction(fn ->
+                 assert Repo.in_transaction?()
+
+                 :ok =
+                   :telemetry.attach(
+                     handler,
+                     [:golf_scoring, :repo, :query],
+                     &__MODULE__.observe_lifecycle_query/4,
+                     self()
+                   )
+
+                 try do
+                   result = Ash.update(changeset, actor: staff)
+                   refute_receive {:round_entry_lifecycle_query, _metadata}, 0
+                   result
+                 after
+                   :telemetry.detach(handler)
+                 end
+               end),
+             "#{action} checked its policy before rejecting the caller-owned transaction"
+
+      assert Enum.any?(error.errors, fn
+               %Ash.Error.Changes.InvalidChanges{vars: vars} ->
+                 Keyword.get(vars, :reason) == :transaction_already_open
+
+               _error ->
+                 false
+             end)
+
+      assert registration_lifecycle_state(entry.id) == expected_state
+    end
   end
 
   test "cannot mark no_show when participation is already active at the database layer" do
@@ -1013,6 +1170,21 @@ defmodule GolfScoring.Competition.RoundEntryTest do
     status
   end
 
+  defp registration_lifecycle_state(round_entry_id) do
+    [[registration_status, participation_status, checked_in_at, checked_in_by_staff_user_id]] =
+      Repo.query!(
+        """
+        SELECT registration_status, participation_status, checked_in_at,
+               checked_in_by_staff_user_id::text
+        FROM round_entries
+        WHERE id = $1::uuid
+        """,
+        [Ecto.UUID.dump!(round_entry_id)]
+      ).rows
+
+    {registration_status, participation_status, checked_in_at, checked_in_by_staff_user_id}
+  end
+
   defp force_participation!(round_entry_id, status) do
     Repo.query!(
       "UPDATE round_entries SET participation_status = $1 WHERE id = $2::uuid",
@@ -1123,5 +1295,9 @@ defmodule GolfScoring.Competition.RoundEntryTest do
       )
 
     course
+  end
+
+  def observe_lifecycle_query(_event, _measurements, metadata, owner) do
+    send(owner, {:round_entry_lifecycle_query, metadata})
   end
 end

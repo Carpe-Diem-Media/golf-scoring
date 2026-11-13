@@ -7,6 +7,7 @@ defmodule GolfScoring.Competition.RoundEntryLifecycleGuard do
   alias GolfScoring.Accounts.EventAuthorityLock
   alias GolfScoring.Competition.GroupRoleAssignmentGuard
   alias GolfScoring.Competition.RoundEntry
+  alias GolfScoring.Competition.RoundEntryRegistrationPolicy
   alias GolfScoring.Repo
 
   @registration_roles [:event_admin, :competition_manager, :registration_staff]
@@ -18,9 +19,25 @@ defmodule GolfScoring.Competition.RoundEntryLifecycleGuard do
     actor_id = if is_map(context.actor), do: Map.get(context.actor, :id), else: nil
 
     changeset
+    # The policy check rejects before role SQL; retain this boundary for
+    # authorization-disabled calls and defense in depth.
+    |> Ash.Changeset.before_transaction(fn changeset ->
+      reject_caller_transaction(changeset)
+    end)
     |> Ash.Changeset.before_action(fn changeset ->
       apply_operation(changeset, operation, actor_id)
     end)
+  end
+
+  defp reject_caller_transaction(changeset) do
+    if Repo.in_transaction?() do
+      Ash.Changeset.add_error(
+        changeset,
+        RoundEntryRegistrationPolicy.transaction_already_open_error()
+      )
+    else
+      changeset
+    end
   end
 
   defp apply_operation(changeset, operation, actor_id) do
