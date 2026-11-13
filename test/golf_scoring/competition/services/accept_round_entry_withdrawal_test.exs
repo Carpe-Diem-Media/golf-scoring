@@ -130,6 +130,29 @@ defmodule GolfScoring.Competition.Services.AcceptRoundEntryWithdrawalTest do
     refute_receive {:playing_group_attention_required, _}, 50
   end
 
+  test "accepts a same-event Competition Manager assignment" do
+    fixture = scored_fixture!(2)
+    target = Enum.at(fixture.entries, 2)
+
+    Repo.query!(
+      "UPDATE event_staff_assignments SET role = 'competition_manager' WHERE event_id = $1::uuid AND staff_user_id = $2::uuid AND role = 'event_admin' AND status = 'active'",
+      [Ecto.UUID.dump!(fixture.event.id), Ecto.UUID.dump!(fixture.admin.id)]
+    )
+
+    assert {:ok, accepted} =
+             AcceptRoundEntryWithdrawal.run(
+               fixture.admin,
+               fixture.event.id,
+               fixture.round.id,
+               fixture.group.id,
+               target.id,
+               withdrawal_attrs(fixture)
+             )
+
+    assert withdrawal_audit_context(accepted.ruling_id)["authorized_by_role"] ==
+             "competition_manager"
+  end
+
   test "revokes the withdrawn scorer and blocks group scoring when independent verification is lost" do
     fixture = scored_fixture!(0)
     target = hd(fixture.entries)
@@ -263,6 +286,26 @@ defmodule GolfScoring.Competition.Services.AcceptRoundEntryWithdrawalTest do
       Ecto.UUID.dump!(fixture.admin.id)
     ])
 
+    Repo.query!(
+      "UPDATE event_staff_assignments SET status = 'revoked' WHERE event_id = $1::uuid AND staff_user_id = $2::uuid AND role = 'event_admin'",
+      [Ecto.UUID.dump!(fixture.event.id), Ecto.UUID.dump!(fixture.admin.id)]
+    )
+
+    assert {:error, :forbidden} =
+             AcceptRoundEntryWithdrawal.run(
+               fixture.admin,
+               fixture.event.id,
+               fixture.round.id,
+               fixture.group.id,
+               target.id,
+               withdrawal_attrs(fixture)
+             )
+
+    Repo.query!(
+      "UPDATE event_staff_assignments SET status = 'active' WHERE event_id = $1::uuid AND staff_user_id = $2::uuid AND role = 'event_admin'",
+      [Ecto.UUID.dump!(fixture.event.id), Ecto.UUID.dump!(fixture.admin.id)]
+    )
+
     invalid_claim = %{
       checkpoint_round_hole_id: Ecto.UUID.generate(),
       effective_play_index: 1
@@ -332,6 +375,7 @@ defmodule GolfScoring.Competition.Services.AcceptRoundEntryWithdrawalTest do
     assert side_result_state(fixture.side.id) == "provisional"
     refute_receive {:round_entry_withdrawn, _}, 50
     refute_receive {:playing_group_attention_required, _}, 50
+    refute_receive {:competition_side_readiness_changed, _}, 50
   end
 
   test "rejects inconsistent participation states, incomplete checkpoints, and invalid routes" do
