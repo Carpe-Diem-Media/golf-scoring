@@ -16,6 +16,17 @@ defmodule GolfScoring.Competition.Services.RevokeGroupRole do
           {:ok, GroupRoleAssignment.t()} | {:error, term()}
   def run(actor, event_id, round_id, playing_group_id, role, reason)
       when role in [:primary_scorer, :designated_verifier] and is_map(actor) do
+    if Repo.in_transaction?() do
+      {:error, :transaction_already_open}
+    else
+      run_standalone(actor, event_id, round_id, playing_group_id, role, reason)
+    end
+  end
+
+  def run(_actor, _event_id, _round_id, _playing_group_id, _role, _reason),
+    do: {:error, :invalid_input}
+
+  defp run_standalone(actor, event_id, round_id, playing_group_id, role, reason) do
     actor_id = Map.get(actor, :id)
 
     Repo.transaction(fn ->
@@ -42,9 +53,6 @@ defmodule GolfScoring.Competition.Services.RevokeGroupRole do
     end)
     |> normalize_result()
   end
-
-  def run(_actor, _event_id, _round_id, _playing_group_id, _role, _reason),
-    do: {:error, :invalid_input}
 
   defp authorize(actor_id, event_id) do
     if ActiveEventRole.authorized?(actor_id, event_id, @revoke_roles) do

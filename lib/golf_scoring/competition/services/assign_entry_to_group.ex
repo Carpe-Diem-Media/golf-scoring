@@ -22,6 +22,17 @@ defmodule GolfScoring.Competition.Services.AssignEntryToGroup do
           {:ok, RoundEntry.t()} | {:error, term()}
   def run(actor, event_id, round_id, round_entry_id, playing_group_id)
       when is_map(actor) do
+    if Repo.in_transaction?() do
+      {:error, :transaction_already_open}
+    else
+      run_standalone(actor, event_id, round_id, round_entry_id, playing_group_id)
+    end
+  end
+
+  def run(_actor, _event_id, _round_id, _round_entry_id, _playing_group_id),
+    do: {:error, :invalid_input}
+
+  defp run_standalone(actor, event_id, round_id, round_entry_id, playing_group_id) do
     actor_id = Map.get(actor, :id)
 
     Repo.transaction(fn ->
@@ -47,9 +58,6 @@ defmodule GolfScoring.Competition.Services.AssignEntryToGroup do
     end)
     |> normalize_result()
   end
-
-  def run(_actor, _event_id, _round_id, _round_entry_id, _playing_group_id),
-    do: {:error, :invalid_input}
 
   defp authorize(actor_id, event_id) do
     if ActiveEventRole.authorized?(actor_id, event_id, @manager_roles) do

@@ -616,7 +616,7 @@ defmodule GolfScoring.Scoring.Services.CorrectHoleResultTest do
           )
 
         {:ok, _} =
-          Competition.set_side_membership(
+          Fixtures.set_side_membership_for_fixture(
             f.admin,
             f.event.id,
             f.round.id,
@@ -637,7 +637,7 @@ defmodule GolfScoring.Scoring.Services.CorrectHoleResultTest do
     [{_, first}, {secondary_side, second}, {_, unrelated}] = sides
 
     {:ok, verifier_assignment} =
-      Competition.assign_designated_verifier(
+      Fixtures.assign_designated_verifier_for_fixture(
         f.admin,
         f.event.id,
         f.round.id,

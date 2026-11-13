@@ -287,7 +287,7 @@ defmodule GolfScoring.Scoring.Services.DecideScoreQueryTest do
           )
 
         {:ok, _} =
-          Competition.set_side_membership(
+          Fixtures.set_side_membership_for_fixture(
             f.admin,
             f.event.id,
             f.round.id,

@@ -771,7 +771,8 @@ defmodule GolfScoring.Scoring.HandicapRecordsTest do
     stale = course_attrs!(D.new("10.0"), setup.tee_a)
 
     {first, second} =
-      gls75_race!(
+      gls75_standalone_race!(
+        setup.round.id,
         fn ->
           Competition.assign_round_tee(
             setup.admin,
@@ -784,7 +785,7 @@ defmodule GolfScoring.Scoring.HandicapRecordsTest do
         fn -> Scoring.build_handicap_snapshot(setup.entry.id, stale) end
       )
 
-    assert {:ok, {:ok, _}} = first
+    assert {:ok, _} = first
     assert {:error, :stale_handicap_output} = second
 
     Sandbox.unboxed_run(Repo, fn ->
@@ -1485,6 +1486,63 @@ defmodule GolfScoring.Scoring.HandicapRecordsTest do
     {Task.await(first, 15_000), Task.await(second, 15_000)}
   end
 
+  defp gls75_standalone_race!(round_id, first_fun, second_fun) do
+    parent = self()
+
+    blocker =
+      Task.async(fn -> block_gls75_round_until_released!(parent, round_id) end)
+
+    assert_receive {:gls75_round_held, blocker_pid}, 10_000
+
+    first =
+      Task.async(fn ->
+        Sandbox.unboxed_run(Repo, fn ->
+          [[pid]] = Repo.query!("SELECT pg_backend_pid()").rows
+          send(parent, {:gls75_standalone_first_started, pid})
+          first_fun.()
+        end)
+      end)
+
+    assert_receive {:gls75_standalone_first_started, first_pid}, 10_000
+    refute blocker_pid == first_pid
+    await_gls75_lock!(first_pid, System.monotonic_time(:millisecond) + 10_000)
+
+    second =
+      Task.async(fn ->
+        Sandbox.unboxed_run(Repo, fn ->
+          [[pid]] = Repo.query!("SELECT pg_backend_pid()").rows
+          send(parent, {:gls75_standalone_second_started, pid})
+          second_fun.()
+        end)
+      end)
+
+    assert_receive {:gls75_standalone_second_started, second_pid}, 10_000
+    refute first_pid == second_pid
+    await_gls75_lock!(second_pid, System.monotonic_time(:millisecond) + 10_000)
+    await_gls75_blocked_by!(second_pid, first_pid, System.monotonic_time(:millisecond) + 10_000)
+
+    send(blocker.pid, :release)
+    assert {:ok, :released} = Task.await(blocker, 15_000)
+
+    {Task.await(first, 15_000), Task.await(second, 15_000)}
+  end
+
+  defp block_gls75_round_until_released!(parent, round_id) do
+    Sandbox.unboxed_run(Repo, fn ->
+      Repo.transaction(fn ->
+        lock_round_row!(round_id)
+        [[pid]] = Repo.query!("SELECT pg_backend_pid()").rows
+        send(parent, {:gls75_round_held, pid})
+
+        receive do
+          :release -> :released
+        after
+          15_000 -> Repo.rollback(:timeout)
+        end
+      end)
+    end)
+  end
+
   defp run_gls75_first!(parent, first_fun) do
     Repo.transaction(fn -> hold_gls75_transaction!(parent, first_fun) end)
   end
@@ -1514,6 +1572,28 @@ defmodule GolfScoring.Scoring.HandicapRecordsTest do
         do: flunk("second backend did not wait on a lock")
 
       await_gls75_lock!(pid, deadline)
+    end
+  end
+
+  defp await_gls75_blocked_by!(waiting_pid, blocker_pid, deadline) do
+    [[blocked]] =
+      Sandbox.unboxed_run(Repo, fn ->
+        Repo.query!("SELECT $1::integer = ANY(pg_blocking_pids($2::integer))", [
+          blocker_pid,
+          waiting_pid
+        ]).rows
+      end)
+
+    cond do
+      blocked ->
+        :ok
+
+      System.monotonic_time(:millisecond) >= deadline ->
+        flunk("stale course build did not queue behind tee correction")
+
+      true ->
+        Process.sleep(10)
+        await_gls75_blocked_by!(waiting_pid, blocker_pid, deadline)
     end
   end
 

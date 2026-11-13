@@ -15,6 +15,7 @@ defmodule GolfScoring.Competition.GroupRoleAssignmentTest do
   alias GolfScoring.Competition.Round
   alias GolfScoring.Competition.Services.AssignEntryToGroup
   alias GolfScoring.Competition.Services.AssignGroupRole
+  alias GolfScoring.Competition.Services.AssignPlayingGroupStart
   alias GolfScoring.Competition.Services.HandoverGroupRole
   alias GolfScoring.Competition.Services.SetSideMembership
   alias GolfScoring.Repo
@@ -926,6 +927,75 @@ defmodule GolfScoring.Competition.GroupRoleAssignmentTest do
       assert successor.assignment_version == fixture.assignment_version + 1
       assert successor.round_entry_id == fixture.entry_two_id
     after
+      cleanup_committed_role_race_fixture!(fixture)
+    end
+  end
+
+  @tag :real_concurrency
+  test "a nested command rejects before waiting for its Round lock" do
+    fixture =
+      Sandbox.unboxed_run(Repo, fn ->
+        setup_committed_handover_fixture!(Process.get(:gls20_email_prefix))
+      end)
+
+    parent = self()
+
+    blocker =
+      Task.async(fn ->
+        Sandbox.unboxed_run(Repo, fn ->
+          Repo.transaction(fn ->
+            Repo.query!("SELECT id FROM rounds WHERE id = $1::uuid FOR UPDATE", [
+              Ecto.UUID.dump!(fixture.round_id)
+            ])
+
+            send(parent, :gls42a_round_locked)
+
+            receive do
+              :gls42a_release_round_lock -> :released
+            after
+              15_000 -> Repo.rollback(:round_lock_timeout)
+            end
+          end)
+        end)
+      end)
+
+    assert_receive :gls42a_round_locked, 5_000
+
+    nested_command =
+      Task.async(fn ->
+        Sandbox.unboxed_run(Repo, fn ->
+          Repo.transaction(fn ->
+            send(parent, :gls42a_nested_command_started)
+
+            AssignPlayingGroupStart.run(
+              fixture.admin,
+              fixture.event_id,
+              fixture.round_id,
+              fixture.group_id,
+              Ecto.UUID.generate(),
+              1
+            )
+          end)
+        end)
+      end)
+
+    try do
+      assert_receive :gls42a_nested_command_started, 5_000
+
+      command_result = Task.yield(nested_command, 500)
+
+      send(blocker.pid, :gls42a_release_round_lock)
+      assert {:ok, :released} = Task.await(blocker, 15_000)
+
+      if is_nil(command_result) do
+        assert {:ok, _result} = Task.yield(nested_command, 15_000)
+      end
+
+      assert {:ok, {:ok, {:error, :transaction_already_open}}} = command_result
+    after
+      send(blocker.pid, :gls42a_release_round_lock)
+      Task.shutdown(blocker, 15_000)
+      Task.shutdown(nested_command, 15_000)
       cleanup_committed_role_race_fixture!(fixture)
     end
   end
