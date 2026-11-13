@@ -11,6 +11,7 @@ defmodule GolfScoring.Competition.Services.AcceptRoundEntryWithdrawalTest do
   alias GolfScoring.Competition.Services.AssignPlayingGroupStart
   alias GolfScoring.Competition.Services.HandoverGroupRole
   alias GolfScoring.Repo
+  alias GolfScoring.Scoring
   alias GolfScoring.Scoring.Services.OpenScoreQuery
   alias GolfScoring.Scoring.Services.PaperRecoveryFixtures
   alias GolfScoring.Scoring.Services.SubmitGroupHole
@@ -1118,33 +1119,93 @@ defmodule GolfScoring.Competition.Services.AcceptRoundEntryWithdrawalTest do
        %{
          sandbox_owner: owner
        } do
-    query_first_fixture = committed_fixture!(2, 1)
+    query_first_fixture = committed_fixture!(1, 1)
     register_committed_cleanup!(owner, query_first_fixture)
-    target = Enum.at(query_first_fixture.entries, 2)
+    withdrawn_entry = Enum.at(query_first_fixture.entries, 1)
+    queried_entry = hd(query_first_fixture.entries)
+    side_result_id = side_result_id_for(query_first_fixture.side.id)
+
+    assert side_result_state(query_first_fixture.side.id) == "provisional"
+
+    assert role_state_for_entry(
+             query_first_fixture.group.id,
+             withdrawn_entry.id,
+             :designated_verifier
+           ) ==
+             "active"
+
+    assert role_state_for_entry(query_first_fixture.group.id, queried_entry.id, :primary_scorer) ==
+             "active"
+
+    Phoenix.PubSub.subscribe(GolfScoring.PubSub, "round:#{query_first_fixture.round.id}")
 
     {query, withdrawal} =
       race_with_audit_barrier!(
         "query_hole_result",
-        fn -> open_score_query(query_first_fixture, target) end,
+        fn -> open_score_query(query_first_fixture, queried_entry) end,
         fn ->
           AcceptRoundEntryWithdrawal.run(
             query_first_fixture.admin,
             query_first_fixture.event.id,
             query_first_fixture.round.id,
             query_first_fixture.group.id,
-            target.id,
+            withdrawn_entry.id,
             withdrawal_attrs_for_play(query_first_fixture, 1)
           )
         end
       )
 
-    assert match?({:ok, _}, query)
-    assert {:ok, _accepted_after_query} = withdrawal
-    assert side_result_state(query_first_fixture.side.id) == "review_required"
+    assert {:ok, opened_query} = query
+    assert {:ok, accepted_after_query} = withdrawal
+    assert accepted_after_query.changed_side_result_ids == []
+    assert participation_status(withdrawn_entry.id) == "withdrawn"
 
-    withdrawal_first_fixture = committed_fixture!(2, 1)
+    assert role_state_for_entry(
+             query_first_fixture.group.id,
+             withdrawn_entry.id,
+             :designated_verifier
+           ) ==
+             "revoked"
+
+    assert active_role_holder(query_first_fixture.group.id, :designated_verifier) == nil
+    assert active_role_holder(query_first_fixture.group.id, :primary_scorer) == queried_entry.id
+    assert group_state(query_first_fixture.group.id) == "attention_required"
+    assert side_result_state(query_first_fixture.side.id) == "review_required"
+    assert count_rulings(withdrawn_entry.id) == 1
+    assert count_withdrawal_audits_unboxed(accepted_after_query.ruling_id) == 1
+    assert count_score_queries(query_first_fixture.round.id) == 1
+    assert count_audits("query_hole_result", opened_query.score_query.id) == 1
+
+    query_first_audit = withdrawal_audit_context_unboxed(accepted_after_query.ruling_id)
+    assert query_first_audit["side_result_review_required_ids"] == []
+
+    assert [
+             %{
+               "competition_side_result_id" => ^side_result_id,
+               "source_state" => "review_required",
+               "blockers" => ["independent_verification_unavailable"]
+             }
+           ] = query_first_audit["side_result_blockers"]
+
+    assert_receive {:score_query_opened, %{score_query_id: query_id}}, 5_000
+    assert query_id == opened_query.score_query.id
+    assert_receive {:round_entry_withdrawn, %{ruling_id: ruling_id}}, 5_000
+    assert ruling_id == accepted_after_query.ruling_id
+    assert_receive {:playing_group_attention_required, %{ruling_id: attention_ruling_id}}, 5_000
+    assert attention_ruling_id == accepted_after_query.ruling_id
+    refute_receive {:competition_side_readiness_changed, _}, 50
+    refute_receive {:score_query_opened, _}, 50
+    refute_receive {:round_entry_withdrawn, _}, 50
+    refute_receive {:playing_group_attention_required, _}, 50
+
+    withdrawal_first_fixture = committed_fixture!(1, 1)
     register_committed_cleanup!(owner, withdrawal_first_fixture)
-    target = Enum.at(withdrawal_first_fixture.entries, 2)
+    withdrawn_entry = Enum.at(withdrawal_first_fixture.entries, 1)
+    queried_entry = hd(withdrawal_first_fixture.entries)
+    side_result_id = side_result_id_for(withdrawal_first_fixture.side.id)
+
+    assert side_result_state(withdrawal_first_fixture.side.id) == "provisional"
+    Phoenix.PubSub.subscribe(GolfScoring.PubSub, "round:#{withdrawal_first_fixture.round.id}")
 
     {withdrawal_result, query_result} =
       race_with_audit_barrier!(
@@ -1155,16 +1216,220 @@ defmodule GolfScoring.Competition.Services.AcceptRoundEntryWithdrawalTest do
             withdrawal_first_fixture.event.id,
             withdrawal_first_fixture.round.id,
             withdrawal_first_fixture.group.id,
-            target.id,
+            withdrawn_entry.id,
             withdrawal_attrs_for_play(withdrawal_first_fixture, 1)
           )
         end,
-        fn -> open_score_query(withdrawal_first_fixture, target) end
+        fn -> open_score_query(withdrawal_first_fixture, queried_entry) end
       )
 
-    assert {:ok, _accepted_before_query} = withdrawal_result
-    assert match?({:ok, _}, query_result)
+    assert {:ok, accepted_before_query} = withdrawal_result
+    assert accepted_before_query.changed_side_result_ids == [side_result_id]
+    assert {:error, :unsupported_side_result_state} = query_result
+    assert participation_status(withdrawn_entry.id) == "withdrawn"
+
+    assert role_state_for_entry(
+             withdrawal_first_fixture.group.id,
+             withdrawn_entry.id,
+             :designated_verifier
+           ) ==
+             "revoked"
+
+    assert active_role_holder(withdrawal_first_fixture.group.id, :designated_verifier) == nil
+
+    assert active_role_holder(withdrawal_first_fixture.group.id, :primary_scorer) ==
+             queried_entry.id
+
+    assert group_state(withdrawal_first_fixture.group.id) == "attention_required"
     assert side_result_state(withdrawal_first_fixture.side.id) == "review_required"
+    assert count_rulings(withdrawn_entry.id) == 1
+    assert count_withdrawal_audits_unboxed(accepted_before_query.ruling_id) == 1
+    assert count_score_queries(withdrawal_first_fixture.round.id) == 0
+    assert count_audits_for_round("query_hole_result", withdrawal_first_fixture.round.id) == 0
+
+    withdrawal_first_audit = withdrawal_audit_context_unboxed(accepted_before_query.ruling_id)
+    assert withdrawal_first_audit["side_result_review_required_ids"] == [side_result_id]
+
+    assert [
+             %{
+               "competition_side_result_id" => ^side_result_id,
+               "source_state" => "provisional",
+               "blockers" => ["independent_verification_unavailable"]
+             }
+           ] = withdrawal_first_audit["side_result_blockers"]
+
+    assert_receive {:round_entry_withdrawn, %{ruling_id: ruling_id}}, 5_000
+    assert ruling_id == accepted_before_query.ruling_id
+    assert_receive {:playing_group_attention_required, %{ruling_id: attention_ruling_id}}, 5_000
+    assert attention_ruling_id == accepted_before_query.ruling_id
+
+    assert_receive {:competition_side_readiness_changed,
+                    %{competition_side_result_ids: [^side_result_id]}},
+                   5_000
+
+    refute_receive {:score_query_opened, _}, 50
+    refute_receive {:round_entry_withdrawn, _}, 50
+    refute_receive {:playing_group_attention_required, _}, 50
+    refute_receive {:competition_side_readiness_changed, _}, 50
+  end
+
+  @tag :real_concurrency
+  test "withdrawal and corrected-score SideResult review serialize in both Round-lock winner orders",
+       %{
+         sandbox_owner: owner
+       } do
+    correction_first_fixture = committed_fixture!(1, 1)
+    register_committed_cleanup!(owner, correction_first_fixture)
+    withdrawn_entry = Enum.at(correction_first_fixture.entries, 1)
+    corrected_entry = hd(correction_first_fixture.entries)
+
+    correction_hole_id =
+      results_for_entry(corrected_entry.id) |> hd() |> hd() |> Ecto.UUID.cast!()
+
+    side_result_id = side_result_id_for(correction_first_fixture.side.id)
+
+    assert side_result_state(correction_first_fixture.side.id) == "provisional"
+    Phoenix.PubSub.subscribe(GolfScoring.PubSub, "round:#{correction_first_fixture.round.id}")
+
+    {correction_result, withdrawal_result} =
+      race_with_audit_barrier!(
+        "correct_hole_result",
+        fn -> correct_hole_result(correction_first_fixture, correction_hole_id) end,
+        fn ->
+          AcceptRoundEntryWithdrawal.run(
+            correction_first_fixture.admin,
+            correction_first_fixture.event.id,
+            correction_first_fixture.round.id,
+            correction_first_fixture.group.id,
+            withdrawn_entry.id,
+            withdrawal_attrs_for_play(correction_first_fixture, 1)
+          )
+        end
+      )
+
+    assert {:ok, correction} = correction_result
+    assert correction.hole_result.revision == 2
+    assert Enum.map(correction.side_results, & &1.state) == [:review_required]
+    assert {:ok, accepted_after_correction} = withdrawal_result
+    assert accepted_after_correction.changed_side_result_ids == []
+    assert participation_status(withdrawn_entry.id) == "withdrawn"
+
+    assert role_state_for_entry(
+             correction_first_fixture.group.id,
+             withdrawn_entry.id,
+             :designated_verifier
+           ) ==
+             "revoked"
+
+    assert active_role_holder(correction_first_fixture.group.id, :primary_scorer) ==
+             corrected_entry.id
+
+    assert group_state(correction_first_fixture.group.id) == "attention_required"
+    assert side_result_state(correction_first_fixture.side.id) == "review_required"
+    assert count_rulings(withdrawn_entry.id) == 1
+    assert count_withdrawal_audits_unboxed(accepted_after_correction.ruling_id) == 1
+    assert count_audits("correct_hole_result", correction_hole_id) == 1
+
+    correction_first_audit = withdrawal_audit_context_unboxed(accepted_after_correction.ruling_id)
+    assert correction_first_audit["side_result_review_required_ids"] == []
+
+    assert [
+             %{
+               "competition_side_result_id" => ^side_result_id,
+               "source_state" => "review_required",
+               "blockers" => ["independent_verification_unavailable"]
+             }
+           ] = correction_first_audit["side_result_blockers"]
+
+    assert_receive {:hole_result_corrected, %{resulting_revision: 2}}, 5_000
+    assert_receive {:round_entry_withdrawn, %{ruling_id: ruling_id}}, 5_000
+    assert ruling_id == accepted_after_correction.ruling_id
+    assert_receive {:playing_group_attention_required, _}, 5_000
+    refute_receive {:competition_side_readiness_changed, _}, 50
+    refute_receive {:hole_result_corrected, _}, 50
+    refute_receive {:round_entry_withdrawn, _}, 50
+
+    withdrawal_first_fixture = committed_fixture!(1, 1)
+    register_committed_cleanup!(owner, withdrawal_first_fixture)
+    withdrawn_entry = Enum.at(withdrawal_first_fixture.entries, 1)
+    corrected_entry = hd(withdrawal_first_fixture.entries)
+
+    correction_hole_id =
+      results_for_entry(corrected_entry.id) |> hd() |> hd() |> Ecto.UUID.cast!()
+
+    side_result_id = side_result_id_for(withdrawal_first_fixture.side.id)
+
+    assert side_result_state(withdrawal_first_fixture.side.id) == "provisional"
+    Phoenix.PubSub.subscribe(GolfScoring.PubSub, "round:#{withdrawal_first_fixture.round.id}")
+
+    {withdrawal_result, correction_result} =
+      race_with_audit_barrier!(
+        "accept_round_entry_withdrawal",
+        fn ->
+          AcceptRoundEntryWithdrawal.run(
+            withdrawal_first_fixture.admin,
+            withdrawal_first_fixture.event.id,
+            withdrawal_first_fixture.round.id,
+            withdrawal_first_fixture.group.id,
+            withdrawn_entry.id,
+            withdrawal_attrs_for_play(withdrawal_first_fixture, 1)
+          )
+        end,
+        fn -> correct_hole_result(withdrawal_first_fixture, correction_hole_id) end
+      )
+
+    assert {:ok, accepted_before_correction} = withdrawal_result
+    assert accepted_before_correction.changed_side_result_ids == [side_result_id]
+    assert {:error, _reason} = correction_result
+    assert participation_status(withdrawn_entry.id) == "withdrawn"
+
+    assert role_state_for_entry(
+             withdrawal_first_fixture.group.id,
+             withdrawn_entry.id,
+             :designated_verifier
+           ) ==
+             "revoked"
+
+    assert active_role_holder(withdrawal_first_fixture.group.id, :primary_scorer) ==
+             corrected_entry.id
+
+    assert group_state(withdrawal_first_fixture.group.id) == "attention_required"
+    assert side_result_state(withdrawal_first_fixture.side.id) == "review_required"
+
+    [[_hole_result_id, _round_hole_id, gross_strokes, revision]] =
+      results_for_entry(corrected_entry.id)
+
+    assert gross_strokes == 5
+    assert revision == 1
+    assert count_rulings(withdrawn_entry.id) == 1
+    assert count_withdrawal_audits_unboxed(accepted_before_correction.ruling_id) == 1
+    assert count_audits("correct_hole_result", correction_hole_id) == 0
+
+    withdrawal_first_audit =
+      withdrawal_audit_context_unboxed(accepted_before_correction.ruling_id)
+
+    assert withdrawal_first_audit["side_result_review_required_ids"] == [side_result_id]
+
+    assert [
+             %{
+               "competition_side_result_id" => ^side_result_id,
+               "source_state" => "provisional",
+               "blockers" => ["independent_verification_unavailable"]
+             }
+           ] = withdrawal_first_audit["side_result_blockers"]
+
+    assert_receive {:round_entry_withdrawn, %{ruling_id: ruling_id}}, 5_000
+    assert ruling_id == accepted_before_correction.ruling_id
+    assert_receive {:playing_group_attention_required, _}, 5_000
+
+    assert_receive {:competition_side_readiness_changed,
+                    %{competition_side_result_ids: [^side_result_id]}},
+                   5_000
+
+    refute_receive {:hole_result_corrected, _}, 50
+    refute_receive {:round_entry_withdrawn, _}, 50
+    refute_receive {:playing_group_attention_required, _}, 50
+    refute_receive {:competition_side_readiness_changed, _}, 50
   end
 
   defp scored_fixture!(target_index, verifier_index \\ 1, options \\ []) do
@@ -1297,6 +1562,25 @@ defmodule GolfScoring.Competition.Services.AcceptRoundEntryWithdrawalTest do
         hole_result_id: Ecto.UUID.cast!(hole_result_id),
         expected_revision: revision,
         reason: "query before or after participant withdrawal"
+      }
+    )
+  end
+
+  defp correct_hole_result(fixture, hole_result_id) do
+    [[revision]] =
+      Repo.query!("SELECT revision FROM hole_results WHERE id = $1::uuid", [
+        Ecto.UUID.dump!(hole_result_id)
+      ]).rows
+
+    Scoring.correct_hole_result(
+      fixture.admin,
+      fixture.event.id,
+      fixture.round.id,
+      %{
+        hole_result_id: hole_result_id,
+        expected_revision: revision,
+        new_gross_strokes: 6,
+        reason: "correct scorer result during withdrawal race"
       }
     )
   end
@@ -1507,7 +1791,17 @@ defmodule GolfScoring.Competition.Services.AcceptRoundEntryWithdrawalTest do
         "DROP TRIGGER round_entry_participation_rulings_reject_mutation ON round_entry_participation_rulings"
       )
 
-      cleanup_committed_fixture_rows!(fixture, round, event, staff)
+      Repo.query!(
+        "ALTER TABLE public.score_revisions DISABLE TRIGGER score_revisions_immutable_rows"
+      )
+
+      try do
+        cleanup_committed_fixture_rows!(fixture, round, event, staff)
+      after
+        Repo.query!(
+          "ALTER TABLE public.score_revisions ENABLE ALWAYS TRIGGER score_revisions_immutable_rows"
+        )
+      end
 
       Repo.query!("""
       CREATE TRIGGER round_entry_participation_rulings_reject_mutation
@@ -1526,6 +1820,15 @@ defmodule GolfScoring.Competition.Services.AcceptRoundEntryWithdrawalTest do
                WHERE tgrelid = 'public.round_entry_participation_rulings'::regclass
                  AND tgname = 'round_entry_participation_rulings_reject_mutation'
                """).rows
+
+      assert [["A"], ["A"]] ==
+               Repo.query!("""
+               SELECT tgenabled::text
+               FROM pg_trigger
+               WHERE tgrelid = 'public.score_revisions'::regclass
+                 AND tgname IN ('score_revisions_immutable_rows', 'score_revisions_immutable_truncate')
+               ORDER BY tgname
+               """).rows
     end)
   end
 
@@ -1537,6 +1840,8 @@ defmodule GolfScoring.Competition.Services.AcceptRoundEntryWithdrawalTest do
     cleanup_statements = [
       {"DELETE FROM audit_events WHERE context->>'round_id' = $1", [fixture.round.id]},
       {"DELETE FROM round_entry_participation_rulings WHERE round_id = $1::uuid", [round]},
+      {"DELETE FROM score_verifications WHERE round_id = $1::uuid", [round]},
+      {"DELETE FROM score_revisions WHERE round_id = $1::uuid", [round]},
       {"DELETE FROM score_queries WHERE round_id = $1::uuid", [round]},
       {"DELETE FROM hole_results WHERE round_id = $1::uuid", [round]},
       {"DELETE FROM hole_submissions WHERE round_id = $1::uuid", [round]},
@@ -1600,6 +1905,47 @@ defmodule GolfScoring.Competition.Services.AcceptRoundEntryWithdrawalTest do
     ).rows
     |> hd()
     |> hd()
+  end
+
+  defp count_withdrawal_audits_unboxed(ruling_id) do
+    Sandbox.unboxed_run(Repo, fn ->
+      Repo.query!(
+        "SELECT count(*)::int FROM audit_events WHERE action = 'accept_round_entry_withdrawal' AND target_id = $1::uuid",
+        [Ecto.UUID.dump!(ruling_id)]
+      ).rows
+      |> hd()
+      |> hd()
+    end)
+  end
+
+  defp count_score_queries(round_id) do
+    Repo.query!("SELECT count(*)::int FROM score_queries WHERE round_id = $1::uuid", [
+      Ecto.UUID.dump!(round_id)
+    ]).rows
+    |> hd()
+    |> hd()
+  end
+
+  defp count_audits(action, target_id) do
+    Sandbox.unboxed_run(Repo, fn ->
+      Repo.query!(
+        "SELECT count(*)::int FROM audit_events WHERE action = $1 AND target_id = $2::uuid",
+        [action, Ecto.UUID.dump!(target_id)]
+      ).rows
+      |> hd()
+      |> hd()
+    end)
+  end
+
+  defp count_audits_for_round(action, round_id) do
+    Sandbox.unboxed_run(Repo, fn ->
+      Repo.query!(
+        "SELECT count(*)::int FROM audit_events WHERE action = $1 AND context->>'round_id' = $2",
+        [action, round_id]
+      ).rows
+      |> hd()
+      |> hd()
+    end)
   end
 
   defp side_membership_count(entry_id) do
@@ -1759,6 +2105,17 @@ defmodule GolfScoring.Competition.Services.AcceptRoundEntryWithdrawalTest do
     ).rows
     |> hd()
     |> hd()
+  end
+
+  defp withdrawal_audit_context_unboxed(ruling_id) do
+    Sandbox.unboxed_run(Repo, fn ->
+      Repo.query!(
+        "SELECT context FROM audit_events WHERE action = 'accept_round_entry_withdrawal' AND target_id = $1::uuid",
+        [Ecto.UUID.dump!(ruling_id)]
+      ).rows
+      |> hd()
+      |> hd()
+    end)
   end
 
   defp audit_staff_assignment_id(ruling_id) do
