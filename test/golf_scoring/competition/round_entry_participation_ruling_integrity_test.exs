@@ -7,10 +7,52 @@ defmodule GolfScoring.Competition.RoundEntryParticipationRulingIntegrityTest do
   alias GolfScoring.Scoring.Services.PaperRecoveryFixtures
   alias GolfScoring.Scoring.Services.SubmitGroupHole
 
-  test "the resource exposes no create, update, or destroy transition" do
+  test "the resource exposes only the coordinator-guarded internal create action" do
     actions = Info.actions(RoundEntryParticipationRuling)
 
-    assert Enum.map(actions, & &1.type) == [:read]
+    create_action =
+      Info.action(RoundEntryParticipationRuling, :create_accepted_withdrawal_internal)
+
+    assert Enum.map(actions, & &1.type) == [:read, :create]
+    assert Info.public_actions(RoundEntryParticipationRuling) == []
+    assert create_action.type == :create
+    refute create_action.public?
+    refute Enum.any?(actions, &(&1.type in [:update, :destroy]))
+  end
+
+  test "direct Ash creation without withdrawal coordinator evidence inserts no ruling" do
+    setup = PaperRecoveryFixtures.setup_two_group_mystery_fixture!()
+    checkpoint = checkpoint_for!(setup, setup.group, setup.entries)
+    entry = hd(setup.entries)
+
+    attrs =
+      setup
+      |> ruling_attrs(entry, setup.group, checkpoint)
+      |> Map.take([
+        :event_id,
+        :round_id,
+        :round_entry_id,
+        :playing_group_id,
+        :authorized_by_event_staff_assignment_id,
+        :authorized_by_staff_user_id,
+        :checkpoint_hole_submission_id,
+        :checkpoint_round_hole_id,
+        :effective_round_hole_id
+      ])
+
+    assert {:error, %Ash.Error.Invalid{} = error} =
+             RoundEntryParticipationRuling
+             |> Ash.Changeset.for_create(:create_accepted_withdrawal_internal, attrs)
+             |> Ash.create(authorize?: false)
+
+    assert inspect(error) =~
+             "withdrawal writes require the active acceptance coordinator transaction"
+
+    assert [[0]] ==
+             Repo.query!(
+               "SELECT count(*)::int FROM round_entry_participation_rulings WHERE round_entry_id = $1::uuid",
+               [Ecto.UUID.dump!(entry.id)]
+             ).rows
   end
 
   test "migration installs scoped indexes, composite references, and always-on append-only triggers" do

@@ -104,6 +104,27 @@ defmodule GolfScoring.Competition.RoundEntryParticipationRuling do
       public? false
       primary? true
     end
+
+    create :create_accepted_withdrawal_internal do
+      public? false
+
+      accept [
+        :event_id,
+        :round_id,
+        :round_entry_id,
+        :playing_group_id,
+        :authorized_by_event_staff_assignment_id,
+        :authorized_by_staff_user_id,
+        :checkpoint_hole_submission_id,
+        :checkpoint_round_hole_id,
+        :effective_round_hole_id
+      ]
+
+      transaction? false
+
+      change {GolfScoring.Competition.Services.AcceptRoundEntryWithdrawal.WriteGuard,
+              operation: :create_accepted_withdrawal_internal}
+    end
   end
 
   attributes do
