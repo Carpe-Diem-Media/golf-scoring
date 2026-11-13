@@ -153,8 +153,9 @@ defmodule GolfScoring.Competition.RoundEntry do
       policy action(action) do
         access_type :strict
 
-        authorize_if {GolfScoring.Accounts.Checks.ActiveEventRole,
-                      roles: [:event_admin, :competition_manager, :registration_staff]}
+        # RoundEntryLifecycleGuard checks the active role under Event authority.
+        # Keep this Ash preflight query-free so its transaction boundary runs first.
+        authorize_if always()
       end
     end
   end

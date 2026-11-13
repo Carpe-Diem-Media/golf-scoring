@@ -18,6 +18,16 @@ defmodule GolfScoring.Competition.RoundEntryLifecycleGuard do
     actor_id = if is_map(context.actor), do: Map.get(context.actor, :id), else: nil
 
     changeset
+    |> Ash.Changeset.before_transaction(fn changeset ->
+      if Repo.in_transaction?() do
+        Ash.Changeset.add_error(changeset,
+          field: :registration_status,
+          message: ":transaction_already_open"
+        )
+      else
+        changeset
+      end
+    end)
     |> Ash.Changeset.before_action(fn changeset ->
       apply_operation(changeset, operation, actor_id)
     end)
