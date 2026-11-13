@@ -150,6 +150,46 @@ defmodule GolfScoring.Competition.RoundEntryTest do
     end
   end
 
+  test "registration lifecycle Ash policies require active same-event staff roles" do
+    %{event: event, round: round, admin: admin, player: player} = setup_round!()
+    manager = create_staff_user!()
+    registration_staff = create_staff_user!()
+    revoked_staff = create_staff_user!()
+    inactive_staff = create_staff_user!()
+
+    assign_role!(admin, event, manager, :competition_manager)
+    assign_role!(admin, event, registration_staff, :registration_staff)
+    assign_role!(admin, event, revoked_staff, :registration_staff)
+    assign_role!(admin, event, inactive_staff, :registration_staff)
+
+    other_event = create_event!()
+    other_event_admin = create_event_admin!(other_event)
+
+    assert {:ok, entry} =
+             Competition.add_round_entry(event.id, round.id, player.id, actor: admin)
+
+    assert {:ok, _revoked} =
+             Accounts.revoke_event_staff_role(
+               active_assignment_record(event, revoked_staff, :registration_staff),
+               actor: admin
+             )
+
+    Repo.query!("UPDATE staff_users SET status = 'suspended' WHERE id = $1::uuid", [
+      Ecto.UUID.dump!(inactive_staff.id)
+    ])
+
+    for action <- [:check_in_round_entry, :mark_no_show, :withdraw_before_start] do
+      for authorized_actor <- [admin, manager, registration_staff] do
+        assert Ash.can?({entry, action}, authorized_actor)
+      end
+
+      refute Ash.can?({entry, action}, other_event_admin)
+      refute Ash.can?({entry, action}, revoked_staff)
+      refute Ash.can?({entry, action}, inactive_staff)
+      refute Ash.can?({entry, action}, nil)
+    end
+  end
+
   test "PostgreSQL integrity constraints and RESTRICT history" do
     %{event: event, round: round, admin: admin, player: player} = setup_round!()
     other_event = create_event!()
@@ -508,7 +548,68 @@ defmodule GolfScoring.Competition.RoundEntryTest do
                end),
              "#{operation} did not reject the caller-owned transaction before querying"
 
-      assert inspect(error) =~ ":transaction_already_open"
+      assert Enum.any?(error.errors, fn
+               %Ash.Error.Changes.InvalidChanges{vars: vars} ->
+                 Keyword.get(vars, :reason) == :transaction_already_open
+
+               _error ->
+                 false
+             end)
+
+      assert registration_lifecycle_state(entry.id) == expected_state
+    end
+  end
+
+  test "prebuilt registration changesets reject caller transactions before policy SQL" do
+    %{event: event, round: round, admin: admin, player: player} = setup_round!()
+    staff = create_staff_user!()
+    assign_role!(admin, event, staff, :registration_staff)
+
+    assert {:ok, entry} =
+             Competition.add_round_entry(event.id, round.id, player.id, actor: admin)
+
+    actions = [:check_in_round_entry, :mark_no_show, :withdraw_before_start]
+
+    changesets =
+      Enum.map(actions, fn action ->
+        {action, Ash.Changeset.for_update(entry, action, %{}, actor: staff)}
+      end)
+
+    expected_state = registration_lifecycle_state(entry.id)
+
+    for {action, changeset} <- changesets do
+      handler = {__MODULE__, make_ref()}
+
+      assert {:ok, {:error, %Ash.Error.Invalid{} = error}} =
+               Repo.transaction(fn ->
+                 assert Repo.in_transaction?()
+
+                 :ok =
+                   :telemetry.attach(
+                     handler,
+                     [:golf_scoring, :repo, :query],
+                     &__MODULE__.observe_lifecycle_query/4,
+                     self()
+                   )
+
+                 try do
+                   result = Ash.update(changeset, actor: staff)
+                   refute_receive {:round_entry_lifecycle_query, _metadata}, 0
+                   result
+                 after
+                   :telemetry.detach(handler)
+                 end
+               end),
+             "#{action} checked its policy before rejecting the caller-owned transaction"
+
+      assert Enum.any?(error.errors, fn
+               %Ash.Error.Changes.InvalidChanges{vars: vars} ->
+                 Keyword.get(vars, :reason) == :transaction_already_open
+
+               _error ->
+                 false
+             end)
+
       assert registration_lifecycle_state(entry.id) == expected_state
     end
   end
