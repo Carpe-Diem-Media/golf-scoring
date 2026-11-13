@@ -167,6 +167,17 @@ defmodule GolfScoring.Competition.CompetitionSideResult do
       change {GolfScoring.Competition.CompetitionSideResultLifecycleGuard,
               operation: :accept_retirement_internal}
     end
+
+    update :require_review_for_withdrawal_internal do
+      public? false
+      accept []
+      transaction? false
+      require_atomic? false
+      atomic_upgrade? false
+
+      change {GolfScoring.Competition.CompetitionSideResultLifecycleGuard,
+              operation: :require_review_for_withdrawal_internal}
+    end
   end
 
   attributes do

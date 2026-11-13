@@ -4,6 +4,7 @@ defmodule GolfScoring.Competition do
   use Ash.Domain
 
   alias GolfScoring.Competition.Services.AcceptCompetitionSideRetirement
+  alias GolfScoring.Competition.Services.AcceptRoundEntryWithdrawal
   alias GolfScoring.Competition.Services.AssignGroupRole
   alias GolfScoring.Competition.Services.AssignRoundTee
   alias GolfScoring.Competition.Services.ConfigureMysteryHoleRule
@@ -223,6 +224,24 @@ defmodule GolfScoring.Competition do
       round_competition_id,
       competition_side_id,
       playing_group_id,
+      attrs
+    )
+  end
+
+  def accept_round_entry_withdrawal(
+        actor,
+        event_id,
+        round_id,
+        playing_group_id,
+        round_entry_id,
+        attrs
+      ) do
+    AcceptRoundEntryWithdrawal.run(
+      actor,
+      event_id,
+      round_id,
+      playing_group_id,
+      round_entry_id,
       attrs
     )
   end

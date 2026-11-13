@@ -4,6 +4,7 @@ defmodule GolfScoring.Competition.RoundEntryScoringLifecycleGuard do
   use Ash.Resource.Change
 
   alias GolfScoring.Competition.RoundEntry
+  alias GolfScoring.Competition.Services.AcceptRoundEntryWithdrawal
   alias GolfScoring.Repo
   alias GolfScoring.Scoring.Services.SubmitGroupHole
 
@@ -11,16 +12,43 @@ defmodule GolfScoring.Competition.RoundEntryScoringLifecycleGuard do
   def change(changeset, opts, _context) do
     operation = Keyword.fetch!(opts, :operation)
 
+    case operation do
+      :mark_participation_withdrawn_internal -> guard_withdrawal(changeset)
+      _ -> guard_scoring_progression(changeset, operation)
+    end
+  end
+
+  defp guard_scoring_progression(changeset, operation) do
+    Ash.Changeset.before_action(changeset, &apply_scoring_progression(&1, operation))
+  end
+
+  defp apply_scoring_progression(changeset, operation) do
+    current = Ash.Changeset.get_data(changeset, :participation_status)
+    entry = changeset.data
+
+    case require_progression(changeset.context, operation, entry) do
+      :ok ->
+        apply_participation_transition(changeset, operation, current)
+
+      {:error, message} ->
+        Ash.Changeset.add_error(changeset, field: :participation_status, message: message)
+    end
+  end
+
+  defp guard_withdrawal(changeset) do
     Ash.Changeset.before_action(changeset, fn changeset ->
-      current = Ash.Changeset.get_data(changeset, :participation_status)
-      entry = changeset.data
+      case AcceptRoundEntryWithdrawal.consume_internal_write(
+             changeset,
+             :mark_participation_withdrawn_internal
+           ) do
+        {:ok, %{participation_status: :withdrawn}} ->
+          Ash.Changeset.force_change_attribute(changeset, :participation_status, :withdrawn)
 
-      case require_progression(changeset.context, operation, entry) do
-        :ok ->
-          apply_participation_transition(changeset, operation, current)
-
-        {:error, message} ->
-          Ash.Changeset.add_error(changeset, field: :participation_status, message: message)
+        {:error, _reason} ->
+          Ash.Changeset.add_error(changeset,
+            field: :participation_status,
+            message: "withdrawal requires its locked acceptance coordinator transaction"
+          )
       end
     end)
   end

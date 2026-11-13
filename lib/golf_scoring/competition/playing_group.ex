@@ -98,6 +98,17 @@ defmodule GolfScoring.Competition.PlayingGroup do
               operation: :flag_group_attention}
     end
 
+    update :flag_group_attention_for_withdrawal_internal do
+      public? false
+      accept []
+      transaction? false
+      require_atomic? false
+      atomic_upgrade? false
+
+      change {GolfScoring.Competition.PlayingGroupLifecycleGuard,
+              operation: :flag_group_attention_for_withdrawal_internal}
+    end
+
     update :clear_group_attention do
       public? false
       accept []

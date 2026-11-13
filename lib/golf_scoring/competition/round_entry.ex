@@ -177,6 +177,17 @@ defmodule GolfScoring.Competition.RoundEntry do
       change {GolfScoring.Competition.RoundEntryScoringLifecycleGuard,
               operation: :mark_participation_completed}
     end
+
+    update :mark_participation_withdrawn_internal do
+      public? false
+      accept []
+      transaction? false
+      require_atomic? false
+      atomic_upgrade? false
+
+      change {GolfScoring.Competition.RoundEntryScoringLifecycleGuard,
+              operation: :mark_participation_withdrawn_internal}
+    end
   end
 
   policies do

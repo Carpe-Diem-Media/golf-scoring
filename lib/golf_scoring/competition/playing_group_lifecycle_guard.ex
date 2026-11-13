@@ -3,6 +3,7 @@ defmodule GolfScoring.Competition.PlayingGroupLifecycleGuard do
 
   use Ash.Resource.Change
 
+  alias GolfScoring.Competition.Services.AcceptRoundEntryWithdrawal
   alias GolfScoring.Scoring.Services.SubmitGroupHole
 
   @future_dependency_message "cannot transition PlayingGroup lifecycle until required HoleSubmission and completion evidence is implemented"
@@ -51,10 +52,35 @@ defmodule GolfScoring.Competition.PlayingGroupLifecycleGuard do
           message: transition_message(:flag_group_attention)
         )
 
+      {:flag_group_attention_for_withdrawal_internal, :playing} ->
+        apply_withdrawal_attention(changeset)
+
+      {:flag_group_attention_for_withdrawal_internal, _} ->
+        Ash.Changeset.add_error(changeset,
+          field: :state,
+          message: "withdrawal can flag attention only while the group is playing"
+        )
+
       {:clear_group_attention, _} ->
         Ash.Changeset.add_error(changeset,
           field: :state,
           message: transition_message(:clear_group_attention)
+        )
+    end
+  end
+
+  defp apply_withdrawal_attention(changeset) do
+    case AcceptRoundEntryWithdrawal.consume_internal_write(
+           changeset,
+           :flag_group_attention_for_withdrawal_internal
+         ) do
+      {:ok, %{state: :attention_required}} ->
+        Ash.Changeset.force_change_attribute(changeset, :state, :attention_required)
+
+      {:error, _reason} ->
+        Ash.Changeset.add_error(changeset,
+          field: :state,
+          message: "withdrawal attention requires its locked acceptance coordinator transaction"
         )
     end
   end

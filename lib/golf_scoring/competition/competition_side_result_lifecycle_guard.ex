@@ -2,6 +2,7 @@ defmodule GolfScoring.Competition.CompetitionSideResultLifecycleGuard do
   @moduledoc "Guards coordinator-owned query/correction review and pre-play exclusion; other readiness transitions remain unavailable."
 
   alias GolfScoring.Competition.Services.AcceptCompetitionSideRetirement
+  alias GolfScoring.Competition.Services.AcceptRoundEntryWithdrawal
   alias GolfScoring.Competition.Services.ExcludeCompetitionSideBeforeHole
   alias GolfScoring.Competition.Services.RequireReviewForCorrectedScore
   alias GolfScoring.Scoring.Services.OpenScoreQuery
@@ -21,6 +22,9 @@ defmodule GolfScoring.Competition.CompetitionSideResultLifecycleGuard do
       :accept_retirement_internal ->
         guard_retirement_review(changeset)
 
+      :require_review_for_withdrawal_internal ->
+        guard_withdrawal_review(changeset)
+
       :require_review_for_open_query_internal ->
         Ash.Changeset.before_action(changeset, &OpenScoreQuery.prepare_review(&1, :side))
 
@@ -35,6 +39,24 @@ defmodule GolfScoring.Competition.CompetitionSideResultLifecycleGuard do
           )
         end)
     end
+  end
+
+  defp guard_withdrawal_review(changeset) do
+    Ash.Changeset.before_action(changeset, fn changeset ->
+      case AcceptRoundEntryWithdrawal.consume_internal_write(
+             changeset,
+             :require_review_for_withdrawal_internal
+           ) do
+        {:ok, %{state: :review_required}} ->
+          Ash.Changeset.force_change_attribute(changeset, :state, :review_required)
+
+        {:error, _reason} ->
+          Ash.Changeset.add_error(changeset,
+            field: :state,
+            message: "withdrawal review requires its locked acceptance coordinator transaction"
+          )
+      end
+    end)
   end
 
   defp guard_correction_review(changeset) do

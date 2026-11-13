@@ -102,6 +102,17 @@ defmodule GolfScoring.Competition.GroupRoleAssignment do
 
       change set_attribute(:state, :revoked)
     end
+
+    update :mark_revoked_for_withdrawal_internal do
+      public? false
+      accept []
+      transaction? false
+      require_atomic? false
+      atomic_upgrade? false
+
+      change {GolfScoring.Competition.Services.AcceptRoundEntryWithdrawal.WriteGuard,
+              operation: :mark_revoked_for_withdrawal_internal}
+    end
   end
 
   attributes do
