@@ -16,6 +16,17 @@ defmodule GolfScoring.Competition.Services.AssignRoundEntryCategories do
           {:ok, %{memberships: [RoundEntryCategoryMembership.t()]}} | {:error, term()}
   def run(actor, event_id, round_id, round_entry_id, category_ids)
       when is_map(actor) and is_list(category_ids) do
+    if Repo.in_transaction?() do
+      {:error, :transaction_already_open}
+    else
+      run_standalone(actor, event_id, round_id, round_entry_id, category_ids)
+    end
+  end
+
+  def run(_actor, _event_id, _round_id, _round_entry_id, _category_ids),
+    do: {:error, :invalid_input}
+
+  defp run_standalone(actor, event_id, round_id, round_entry_id, category_ids) do
     actor_id = Map.get(actor, :id)
     category_ids = normalize_category_ids(category_ids)
 
@@ -38,9 +49,6 @@ defmodule GolfScoring.Competition.Services.AssignRoundEntryCategories do
     end)
     |> normalize_result()
   end
-
-  def run(_actor, _event_id, _round_id, _round_entry_id, _category_ids),
-    do: {:error, :invalid_input}
 
   defp authorize(actor_id, event_id) do
     if ActiveEventRole.authorized?(actor_id, event_id, @manager_roles) do
