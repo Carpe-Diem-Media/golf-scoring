@@ -7,9 +7,13 @@ defmodule GolfScoring.Scoring.Services.PaperRecoveryFixtures do
   alias Decimal, as: D
   alias GolfScoring.Accounts
   alias GolfScoring.Competition
+  alias GolfScoring.Competition.CompetitionSideMembership
   alias GolfScoring.Competition.Event
+  alias GolfScoring.Competition.GroupRoleAssignment
   alias GolfScoring.Competition.Player
+  alias GolfScoring.Competition.PlayingGroup
   alias GolfScoring.Competition.Round
+  alias GolfScoring.Competition.RoundEntry
   alias GolfScoring.Competition.Services.AssignEntryToGroup
   alias GolfScoring.Competition.Services.AssignPlayingGroupStart
   alias GolfScoring.Competition.Services.ConfigureRoundCompetition
@@ -29,7 +33,7 @@ defmodule GolfScoring.Scoring.Services.PaperRecoveryFixtures do
     start_hole = Enum.find(setup.route, &(&1.play_order == start_play_order))
 
     assert {:ok, _} =
-             AssignPlayingGroupStart.run(
+             assign_start_for_fixture(
                setup.admin,
                setup.event.id,
                setup.round.id,
@@ -64,7 +68,7 @@ defmodule GolfScoring.Scoring.Services.PaperRecoveryFixtures do
     start_hole = hd(route)
 
     assert {:ok, _} =
-             AssignPlayingGroupStart.run(
+             assign_start_for_fixture(
                admin,
                event.id,
                round.id,
@@ -81,10 +85,10 @@ defmodule GolfScoring.Scoring.Services.PaperRecoveryFixtures do
           Competition.add_round_entry(event.id, round.id, player.id, actor: admin)
 
         assert {:ok, _} =
-                 AssignEntryToGroup.run(admin, event.id, round.id, entry.id, group.id)
+                 assign_entry_to_group_for_fixture(admin, event.id, round.id, entry.id, group.id)
 
         assert {:ok, _} =
-                 Competition.assign_round_tee(admin, event.id, round.id, entry.id, tee.id)
+                 assign_round_tee_for_fixture(admin, event.id, round.id, entry.id, tee.id)
 
         assert {:ok, _} =
                  Scoring.confirm_handicap_input(admin, event.id, round.id, entry.id, %{
@@ -118,7 +122,7 @@ defmodule GolfScoring.Scoring.Services.PaperRecoveryFixtures do
     [scorer | _] = entries
 
     assert {:ok, _} =
-             Competition.assign_primary_scorer(
+             assign_primary_scorer_for_fixture(
                admin,
                event.id,
                round.id,
@@ -163,7 +167,7 @@ defmodule GolfScoring.Scoring.Services.PaperRecoveryFixtures do
         )
 
       assert {:ok, _} =
-               Competition.set_side_membership(
+               set_side_membership_for_fixture(
                  setup.admin,
                  setup.event.id,
                  setup.round.id,
@@ -214,7 +218,7 @@ defmodule GolfScoring.Scoring.Services.PaperRecoveryFixtures do
                  )
 
         assert {:ok, _} =
-                 AssignEntryToGroup.run(
+                 assign_entry_to_group_for_fixture(
                    setup.admin,
                    setup.event.id,
                    setup.round.id,
@@ -223,7 +227,7 @@ defmodule GolfScoring.Scoring.Services.PaperRecoveryFixtures do
                  )
 
         assert {:ok, _} =
-                 Competition.assign_round_tee(
+                 assign_round_tee_for_fixture(
                    setup.admin,
                    setup.event.id,
                    setup.round.id,
@@ -269,7 +273,7 @@ defmodule GolfScoring.Scoring.Services.PaperRecoveryFixtures do
     [scorer | _] = entries
 
     assert {:ok, _} =
-             Competition.assign_primary_scorer(
+             assign_primary_scorer_for_fixture(
                setup.admin,
                setup.event.id,
                setup.round.id,
@@ -288,7 +292,7 @@ defmodule GolfScoring.Scoring.Services.PaperRecoveryFixtures do
              Competition.create_playing_group(setup.event.id, setup.round.id, actor: setup.admin)
 
     assert {:ok, _} =
-             AssignPlayingGroupStart.run(
+             assign_start_for_fixture(
                setup.admin,
                setup.event.id,
                setup.round.id,
@@ -316,6 +320,115 @@ defmodule GolfScoring.Scoring.Services.PaperRecoveryFixtures do
     ])
 
     Repo.get!(Round, round.id)
+  end
+
+  # Fixture transactions use internal actions instead of composing standalone services.
+  defp assign_start_for_fixture(actor, event_id, round_id, group_id, hole_id, position) do
+    if Repo.in_transaction?() do
+      fixture_update(PlayingGroup, group_id, :assign_start_internal, %{
+        starting_round_hole_id: hole_id,
+        starting_position: position
+      })
+    else
+      AssignPlayingGroupStart.run(actor, event_id, round_id, group_id, hole_id, position)
+    end
+  end
+
+  defp assign_entry_to_group_for_fixture(actor, event_id, round_id, entry_id, group_id) do
+    if Repo.in_transaction?() do
+      fixture_update(RoundEntry, entry_id, :assign_playing_group_internal, %{
+        playing_group_id: group_id
+      })
+    else
+      AssignEntryToGroup.run(actor, event_id, round_id, entry_id, group_id)
+    end
+  end
+
+  defp assign_round_tee_for_fixture(actor, event_id, round_id, entry_id, tee_snapshot_id) do
+    if Repo.in_transaction?() do
+      fixture_update(RoundEntry, entry_id, :assign_round_tee_internal, %{
+        round_tee_profile_snapshot_id: tee_snapshot_id
+      })
+    else
+      Competition.assign_round_tee(actor, event_id, round_id, entry_id, tee_snapshot_id)
+    end
+  end
+
+  defp assign_primary_scorer_for_fixture(actor, event_id, round_id, group_id, entry_id) do
+    if Repo.in_transaction?() do
+      fixture_create(GroupRoleAssignment, :create_internal, %{
+        round_id: round_id,
+        playing_group_id: group_id,
+        round_entry_id: entry_id,
+        role: :primary_scorer,
+        assignment_version: 1
+      })
+    else
+      Competition.assign_primary_scorer(actor, event_id, round_id, group_id, entry_id)
+    end
+  end
+
+  def assign_designated_verifier_for_fixture(actor, event_id, round_id, group_id, entry_id) do
+    if Repo.in_transaction?() do
+      fixture_create(GroupRoleAssignment, :create_internal, %{
+        round_id: round_id,
+        playing_group_id: group_id,
+        round_entry_id: entry_id,
+        role: :designated_verifier,
+        assignment_version: 1
+      })
+    else
+      Competition.assign_designated_verifier(actor, event_id, round_id, group_id, entry_id)
+    end
+  end
+
+  def set_side_membership_for_fixture(
+        actor,
+        event_id,
+        round_id,
+        round_competition_id,
+        side_id,
+        entry_ids
+      ) do
+    if Repo.in_transaction?() do
+      memberships =
+        Enum.map(entry_ids, fn entry_id ->
+          {:ok, membership} =
+            fixture_create(CompetitionSideMembership, :create_internal, %{
+              round_id: round_id,
+              round_competition_id: round_competition_id,
+              competition_side_id: side_id,
+              round_entry_id: entry_id
+            })
+
+          membership
+        end)
+
+      {:ok, memberships}
+    else
+      Competition.set_side_membership(
+        actor,
+        event_id,
+        round_id,
+        round_competition_id,
+        side_id,
+        entry_ids
+      )
+    end
+  end
+
+  defp fixture_create(resource, action, attributes) do
+    resource
+    |> Changeset.for_create(action, attributes)
+    |> Ash.create(authorize?: false)
+  end
+
+  defp fixture_update(resource, record_id, action, attributes) do
+    with {:ok, record} <- Ash.get(resource, record_id, authorize?: false) do
+      record
+      |> Changeset.for_update(action, attributes)
+      |> Ash.update(authorize?: false)
+    end
   end
 
   def create_event! do

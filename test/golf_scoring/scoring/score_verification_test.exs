@@ -5,7 +5,6 @@ defmodule GolfScoring.Scoring.ScoreVerificationTest do
   alias Ash.Changeset
   alias Ecto.Adapters.SQL.Sandbox
   alias GolfScoring.Accounts
-  alias GolfScoring.Accounts.EventAuthorityLock
   alias GolfScoring.Accounts.StaffUser
   alias GolfScoring.Audit.AuditEvent
   alias GolfScoring.Competition
@@ -335,32 +334,44 @@ defmodule GolfScoring.Scoring.ScoreVerificationTest do
         Task.async(fn ->
           Sandbox.unboxed_run(Repo, fn ->
             Repo.transaction(fn ->
-              assert {:ok, _} = EventAuthorityLock.lock_scope!(f.event.id, [f.admin.id])
-
-              assert {:ok, _} =
-                       LockProtocol.acquire!(round: [f.round.id], playing_group: [f.group.id])
+              assert [[_assignment_id]] =
+                       Repo.query!(
+                         "SELECT id::text FROM group_role_assignments WHERE id = $1::uuid FOR UPDATE",
+                         [Ecto.UUID.dump!(f.verifier_assignment.id)]
+                       ).rows
 
               [[pid]] = Repo.query!("SELECT pg_backend_pid()").rows
               send(parent, {:held, pid})
 
               receive do
-                :handover ->
-                  assert {:ok, _} =
-                           Competition.handover_designated_verifier(
-                             f.admin,
-                             f.event.id,
-                             f.round.id,
-                             f.group.id,
-                             Enum.at(f.entries, 2).id
-                           )
+                :release -> :released
               after
-                10_000 -> raise "handover test timed out"
+                10_000 -> raise "verification test timed out"
               end
             end)
           end)
         end)
 
       assert_receive {:held, holder_pid}, 10_000
+
+      handover =
+        Task.async(fn ->
+          Sandbox.unboxed_run(Repo, fn ->
+            [[pid]] = Repo.query!("SELECT pg_backend_pid()").rows
+            send(parent, {:handing_over, pid})
+
+            Competition.handover_designated_verifier(
+              f.admin,
+              f.event.id,
+              f.round.id,
+              f.group.id,
+              Enum.at(f.entries, 2).id
+            )
+          end)
+        end)
+
+      assert_receive {:handing_over, handover_pid}, 10_000
+      await_blocked!(handover_pid, holder_pid, System.monotonic_time(:millisecond) + 10_000)
 
       verifier =
         Task.async(fn ->
@@ -372,9 +383,10 @@ defmodule GolfScoring.Scoring.ScoreVerificationTest do
         end)
 
       assert_receive {:verifying, verifier_pid}, 10_000
-      await_blocked!(verifier_pid, holder_pid, System.monotonic_time(:millisecond) + 10_000)
-      send(holder.pid, :handover)
+      await_blocked!(verifier_pid, handover_pid, System.monotonic_time(:millisecond) + 10_000)
+      send(holder.pid, :release)
       assert {:ok, _} = Task.await(holder, 15_000)
+      assert {:ok, _} = Task.await(handover, 15_000)
       assert {:error, :ineligible_verifier} = Task.await(verifier, 15_000)
     after
       cleanup!(f)
@@ -487,7 +499,7 @@ defmodule GolfScoring.Scoring.ScoreVerificationTest do
         :ok
 
       System.monotonic_time(:millisecond) >= deadline ->
-        flunk("verification did not wait on the handover lock")
+        flunk("backend did not wait on the expected lock")
 
       true ->
         Process.sleep(10)
