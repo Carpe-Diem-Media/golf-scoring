@@ -4,6 +4,7 @@ defmodule GolfScoring.Competition.PlayingGroupLifecycleGuard do
   use Ash.Resource.Change
 
   alias GolfScoring.Competition.Services.AcceptRoundEntryWithdrawal
+  alias GolfScoring.Competition.Services.FillGroupRoleVacancy
   alias GolfScoring.Scoring.Services.SubmitGroupHole
 
   @future_dependency_message "cannot transition PlayingGroup lifecycle until required HoleSubmission and completion evidence is implemented"
@@ -27,6 +28,24 @@ defmodule GolfScoring.Competition.PlayingGroupLifecycleGuard do
   end
 
   defp apply_group_transition(changeset, operation, current) do
+    if operation == :clear_group_attention_for_vacancy_internal do
+      apply_vacancy_attention_transition(changeset, current)
+    else
+      apply_regular_group_transition(changeset, operation, current)
+    end
+  end
+
+  defp apply_vacancy_attention_transition(changeset, :attention_required),
+    do: apply_vacancy_attention_clear(changeset)
+
+  defp apply_vacancy_attention_transition(changeset, _current) do
+    Ash.Changeset.add_error(changeset,
+      field: :state,
+      message: "vacancy recovery can clear attention only from attention_required"
+    )
+  end
+
+  defp apply_regular_group_transition(changeset, operation, current) do
     case {operation, current} do
       {:mark_group_playing, :not_started} ->
         Ash.Changeset.force_change_attribute(changeset, :state, :playing)
@@ -81,6 +100,22 @@ defmodule GolfScoring.Competition.PlayingGroupLifecycleGuard do
         Ash.Changeset.add_error(changeset,
           field: :state,
           message: "withdrawal attention requires its locked acceptance coordinator transaction"
+        )
+    end
+  end
+
+  defp apply_vacancy_attention_clear(changeset) do
+    case FillGroupRoleVacancy.consume_internal_write(
+           changeset,
+           :clear_group_attention_for_vacancy_internal
+         ) do
+      {:ok, %{state: :playing}} ->
+        Ash.Changeset.force_change_attribute(changeset, :state, :playing)
+
+      {:error, _reason} ->
+        Ash.Changeset.add_error(changeset,
+          field: :state,
+          message: "vacancy attention recovery requires its locked coordinator transaction"
         )
     end
   end
