@@ -83,6 +83,24 @@ defmodule GolfScoring.Competition.GroupRoleAssignment do
       validate one_of(:role, [:primary_scorer, :designated_verifier])
     end
 
+    create :create_for_vacancy_internal do
+      public? false
+
+      accept [
+        :round_id,
+        :playing_group_id,
+        :round_entry_id,
+        :role,
+        :state,
+        :assignment_version
+      ]
+
+      transaction? false
+
+      change {GolfScoring.Competition.Services.FillGroupRoleVacancy.WriteGuard,
+              operation: :create_for_vacancy_internal}
+    end
+
     update :mark_handed_over_internal do
       public? false
       accept []
