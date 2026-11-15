@@ -120,6 +120,17 @@ defmodule GolfScoring.Competition.PlayingGroup do
               operation: :clear_group_attention}
     end
 
+    update :clear_group_attention_for_vacancy_internal do
+      public? false
+      accept []
+      transaction? false
+      require_atomic? false
+      atomic_upgrade? false
+
+      change {GolfScoring.Competition.PlayingGroupLifecycleGuard,
+              operation: :clear_group_attention_for_vacancy_internal}
+    end
+
     update :increment_scoring_revision_internal do
       public? false
       accept []

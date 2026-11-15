@@ -11,6 +11,7 @@ defmodule GolfScoring.Competition do
   alias GolfScoring.Competition.Services.ConfigureRoundCompetition
   alias GolfScoring.Competition.Services.ConfigureScoringTrack
   alias GolfScoring.Competition.Services.CreateCompetitionSide
+  alias GolfScoring.Competition.Services.FillGroupRoleVacancy
   alias GolfScoring.Competition.Services.HandoverGroupRole
   alias GolfScoring.Competition.Services.OpenRound
   alias GolfScoring.Competition.Services.RevokeGroupRole
@@ -243,6 +244,24 @@ defmodule GolfScoring.Competition do
       playing_group_id,
       round_entry_id,
       attrs
+    )
+  end
+
+  def fill_group_role_vacancy(
+        actor,
+        event_id,
+        round_id,
+        playing_group_id,
+        replacement_round_entry_id,
+        role
+      ) do
+    FillGroupRoleVacancy.run(
+      actor,
+      event_id,
+      round_id,
+      playing_group_id,
+      replacement_round_entry_id,
+      role
     )
   end
 end
