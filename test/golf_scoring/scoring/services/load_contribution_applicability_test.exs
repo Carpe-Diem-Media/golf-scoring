@@ -329,7 +329,9 @@ defmodule GolfScoring.Scoring.Services.LoadContributionApplicabilityTest do
     end
   end
 
-  def observe_query(_event, _measurements, _metadata, parent), do: send(parent, :projection_query)
+  def observe_query(_event, _measurements, _metadata, parent) do
+    if self() == parent, do: send(parent, :projection_query)
+  end
 
   defp accept!(fixture, entry, effective, index) do
     attrs = %{
