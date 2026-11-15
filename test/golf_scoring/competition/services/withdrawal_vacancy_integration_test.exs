@@ -158,6 +158,11 @@ defmodule GolfScoring.Competition.Services.WithdrawalVacancyIntegrationTest do
       assert_receive {:group_role_vacancy_filled, %{withdrawal_ruling_id: ^ruling_id}}
       assert_receive {:playing_group_attention_cleared, %{withdrawal_ruling_id: ^ruling_id}}
 
+      second_hole_id = Enum.at(fixture.route, 1).id
+      assert group_scoring_revision(group_id) == 1
+      assert submissions_for_hole(group_id, second_hole_id) == []
+      assert result_entries_for_hole(group_id, second_hole_id) == []
+
       assert {:error, :stale_role_assignment} =
                SubmitGroupHole.run(
                  grant,
@@ -167,18 +172,49 @@ defmodule GolfScoring.Competition.Services.WithdrawalVacancyIntegrationTest do
                )
 
       assert score_rows(group_id) == fixture.prior_results
+      assert group_scoring_revision(group_id) == 1
+      assert submissions_for_hole(group_id, second_hole_id) == []
+      assert result_entries_for_hole(group_id, second_hole_id) == []
       refute_receive {:group_hole_submitted, _}, 50
+
+      command = next_submission_command(fixture, replacement.id, 2)
 
       assert {:ok, receipt} =
                SubmitGroupHole.run(
                  grant,
                  fixture.event.id,
                  round_id,
-                 next_submission_command(fixture, replacement.id, 2)
+                 command
                )
 
       assert receipt.role_assignment_version == 2
-      assert Enum.all?(fixture.prior_results, &(&1 in score_rows(group_id)))
+      assert group_scoring_revision(group_id) == 2
+
+      assert submissions_for_hole(group_id, second_hole_id) == [
+               [receipt.id, command.client_submission_id, filled.assignment.id, 2]
+             ]
+
+      expected_entries =
+        fixture.entries
+        |> Enum.reject(&(&1.id == fixture.withdrawn_entry.id))
+        |> Enum.map(& &1.id)
+        |> Enum.sort()
+
+      assert result_entries_for_hole(group_id, second_hole_id) == expected_entries
+
+      assert Enum.filter(score_rows(group_id), fn [row] ->
+               row["round_hole_id"] == hd(fixture.route).id
+             end) == fixture.prior_results
+
+      assert_receive {:group_hole_submitted,
+                      %{
+                        round_id: ^round_id,
+                        playing_group_id: ^group_id,
+                        round_hole_id: ^second_hole_id,
+                        scoring_revision: 2
+                      }}
+
+      refute_receive {:group_hole_submitted, _}, 50
       assert side_result_state(fixture.side.id) == "review_required"
     end)
   end
@@ -496,6 +532,30 @@ defmodule GolfScoring.Competition.Services.WithdrawalVacancyIntegrationTest do
       ]).rows
 
     state
+  end
+
+  defp group_scoring_revision(group_id) do
+    [[revision]] =
+      Repo.query!("SELECT scoring_revision FROM playing_groups WHERE id = $1::uuid", [
+        Ecto.UUID.dump!(group_id)
+      ]).rows
+
+    revision
+  end
+
+  defp submissions_for_hole(group_id, hole_id) do
+    Repo.query!(
+      "SELECT id::text, client_submission_id::text, group_role_assignment_id::text, role_assignment_version FROM hole_submissions WHERE playing_group_id = $1::uuid AND round_hole_id = $2::uuid ORDER BY id",
+      [Ecto.UUID.dump!(group_id), Ecto.UUID.dump!(hole_id)]
+    ).rows
+  end
+
+  defp result_entries_for_hole(group_id, hole_id) do
+    Repo.query!(
+      "SELECT sc.round_entry_id::text FROM hole_results hr JOIN scorecards sc ON sc.id = hr.scorecard_id JOIN round_entries re ON re.id = sc.round_entry_id WHERE re.playing_group_id = $1::uuid AND hr.round_hole_id = $2::uuid ORDER BY sc.round_entry_id",
+      [Ecto.UUID.dump!(group_id), Ecto.UUID.dump!(hole_id)]
+    ).rows
+    |> List.flatten()
   end
 
   defp score_rows(group_id) do
