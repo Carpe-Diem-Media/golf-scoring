@@ -13,13 +13,28 @@ defmodule GolfScoring.Scoring.Services.LoadContributionApplicability do
     with {:ok, event} <- Ecto.UUID.dump(event_id),
          {:ok, round} <- Ecto.UUID.dump(round_id),
          {:ok, side} <- Ecto.UUID.dump(side_id) do
-      load(event, round, side)
+      load(event, round, side, :results)
     else
       :error -> {:error, :invalid_scope}
     end
   end
 
-  defp load(event_id, round_id, side_id) do
+  @doc """
+  Returns withdrawal applicability for each scheduled hole in the scoped side.
+
+  Missing results have nil `hole_result_id` and `revision`; they do not imply a score.
+  """
+  def run_scheduled(event_id, round_id, side_id) do
+    with {:ok, event} <- Ecto.UUID.dump(event_id),
+         {:ok, round} <- Ecto.UUID.dump(round_id),
+         {:ok, side} <- Ecto.UUID.dump(side_id) do
+      load(event, round, side, :scheduled)
+    else
+      :error -> {:error, :invalid_scope}
+    end
+  end
+
+  defp load(event_id, round_id, side_id, mode) do
     result =
       Repo.query!(
         """
@@ -79,14 +94,63 @@ defmodule GolfScoring.Scoring.Services.LoadContributionApplicability do
 
       [[route | _] | _] = rows ->
         if valid_route?(route) do
-          {:ok,
-           rows
-           |> Enum.reject(&(Enum.at(&1, 8) == nil))
-           |> Enum.map(&fact(&1, event_id, round_id))}
+          project(rows, event_id, round_id, mode)
         else
           {:error, :ambiguous_route}
         end
     end
+  end
+
+  defp project(rows, event, round, :results) do
+    {:ok, rows |> Enum.reject(&(Enum.at(&1, 8) == nil)) |> Enum.map(&fact(&1, event, round))}
+  end
+
+  defp project(rows, event, round, :scheduled) do
+    members = rows |> Enum.reject(&(Enum.at(&1, 1) == nil)) |> Enum.group_by(&Enum.at(&1, 1))
+
+    invalid_results? =
+      Enum.any?(members, fn {_entry, member_rows} ->
+        ids = member_rows |> hd() |> hd() |> Enum.map(& &1["id"])
+        holes = member_rows |> Enum.filter(&(Enum.at(&1, 8) != nil)) |> Enum.map(&Enum.at(&1, 10))
+        Enum.any?(holes, &(&1 not in ids)) or length(holes) != length(Enum.uniq(holes))
+      end)
+
+    if invalid_results? do
+      {:error, :ambiguous_route}
+    else
+      scheduled_facts(members, event, round)
+    end
+  end
+
+  defp scheduled_facts(members, event, round) do
+    facts =
+      members
+      |> Enum.sort_by(&elem(&1, 0))
+      |> Enum.flat_map(fn {_entry, member_rows} ->
+        [first | _] = member_rows
+        route = hd(first)
+        ids = Enum.map(route, & &1["id"])
+        start = Enum.find_index(ids, &(&1 == Enum.at(first, 7)))
+        ordered = if start, do: Enum.drop(ids, start) ++ Enum.take(ids, start), else: ids
+        results = Map.new(member_rows, &{Enum.at(&1, 10), &1})
+
+        Enum.map(ordered, fn hole_id ->
+          row =
+            Map.get(
+              results,
+              hole_id,
+              first
+              |> List.replace_at(8, nil)
+              |> List.replace_at(9, nil)
+              |> List.replace_at(10, hole_id)
+              |> List.replace_at(11, nil)
+            )
+
+          fact(row, event, round)
+        end)
+      end)
+
+    {:ok, facts}
   end
 
   defp valid_route?(route) do
@@ -129,8 +193,8 @@ defmodule GolfScoring.Scoring.Services.LoadContributionApplicability do
         entry_event == event_id,
         entry_round == round_id,
         group_round == round_id,
-        result_round == round_id,
-        card_round == round_id,
+        is_nil(result_id) or result_round == round_id,
+        (is_nil(result_id) and is_nil(card_round)) or card_round == round_id,
         member_round == round_id,
         member_competition == side_competition,
         not is_nil(index)
