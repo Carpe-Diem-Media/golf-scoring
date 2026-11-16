@@ -64,6 +64,112 @@ defmodule GolfScoring.Scoring.Services.LoadContributionApplicabilityTest do
     %{fixture: fixture, side: side}
   end
 
+  test "scheduled reads include missing active results", %{fixture: fixture, side: side} do
+    assert {:ok, facts} =
+             LoadContributionApplicability.run_scheduled(
+               fixture.event.id,
+               fixture.round.id,
+               side.id
+             )
+
+    assert length(facts) == 36
+    assert Enum.count(facts, &is_nil(&1.hole_result_id)) == 34
+    assert Enum.all?(facts, &(&1.withdrawal_applicability == :applicable))
+  end
+
+  test "scheduled withdrawal preserves results and leaves the partner applicable", %{
+    fixture: fixture,
+    side: side
+  } do
+    entry = List.last(fixture.entries)
+
+    assert {:ok, prior} =
+             LoadContributionApplicability.run(fixture.event.id, fixture.round.id, side.id)
+
+    original = Enum.find(prior, &(&1.round_entry_id == entry.id))
+    assert {:ok, accepted} = accept!(fixture, entry, Enum.at(fixture.route, 1), 1)
+    insert_result!(entry.id, Enum.at(fixture.route, 1).id)
+    before = authoritative_snapshot(entry.id, accepted.ruling_id)
+
+    assert {:ok, facts} =
+             LoadContributionApplicability.run_scheduled(
+               fixture.event.id,
+               fixture.round.id,
+               side.id
+             )
+
+    withdrawn = Enum.filter(facts, &(&1.round_entry_id == entry.id))
+
+    assert [
+             %{
+               play_index: 0,
+               withdrawal_applicability: :applicable,
+               hole_result_id: id,
+               revision: revision
+             }
+             | rest
+           ] = withdrawn
+
+    assert {id, revision} == {original.hole_result_id, original.revision}
+    assert Enum.all?(rest, &(&1.withdrawal_applicability == :not_applicable))
+    assert hd(rest).hole_result_id != nil
+    partner = Enum.reject(facts, &(&1.round_entry_id == entry.id))
+    assert Enum.all?(partner, &(&1.withdrawal_applicability == :applicable))
+    assert Enum.count(partner, &is_nil(&1.hole_result_id)) == 17
+
+    assert {:ok, ^facts} =
+             LoadContributionApplicability.run_scheduled(
+               fixture.event.id,
+               fixture.round.id,
+               side.id
+             )
+
+    assert authoritative_snapshot(entry.id, accepted.ruling_id) == before
+  end
+
+  @tag start_order: 18
+  test "scheduled route wraps around a shotgun start", %{fixture: fixture, side: side} do
+    assert {:ok, facts} =
+             LoadContributionApplicability.run_scheduled(
+               fixture.event.id,
+               fixture.round.id,
+               side.id
+             )
+
+    entry = hd(fixture.entries)
+    route = Enum.filter(facts, &(&1.round_entry_id == entry.id))
+    assert Enum.map(route, & &1.play_index) == Enum.to_list(0..17)
+
+    assert Enum.map(route, & &1.round_hole_id) == [
+             List.last(fixture.route).id | Enum.map(Enum.drop(fixture.route, -1), & &1.id)
+           ]
+  end
+
+  test "scheduled holes fail closed on missing or inconsistent withdrawal evidence", %{
+    fixture: fixture,
+    side: side
+  } do
+    entry = List.last(fixture.entries)
+
+    Repo.query!(
+      "UPDATE round_entries SET participation_status = 'withdrawn' WHERE id = $1::uuid",
+      [Ecto.UUID.dump!(entry.id)]
+    )
+
+    assert {:ok, facts} =
+             LoadContributionApplicability.run_scheduled(
+               fixture.event.id,
+               fixture.round.id,
+               side.id
+             )
+
+    assert Enum.all?(
+             Enum.filter(facts, &(&1.round_entry_id == entry.id)),
+             &(&1.withdrawal_applicability == :unresolved and
+                 &1.unresolved_reason == :missing_withdrawal_ruling)
+           )
+  end
+
   test "active members' current results are applicable to withdrawal", %{
     fixture: fixture,
     side: side
@@ -140,6 +246,16 @@ defmodule GolfScoring.Scoring.Services.LoadContributionApplicabilityTest do
   test "rejects a mismatched event scope", %{fixture: fixture, side: side} do
     assert {:error, :invalid_scope} =
              LoadContributionApplicability.run(Ecto.UUID.generate(), fixture.round.id, side.id)
+
+    assert {:error, :invalid_scope} =
+             LoadContributionApplicability.run_scheduled(
+               Ecto.UUID.generate(),
+               fixture.round.id,
+               side.id
+             )
+
+    assert {:error, :invalid_scope} =
+             LoadContributionApplicability.run_scheduled("invalid", fixture.round.id, side.id)
   end
 
   @tag start_order: 18
@@ -244,6 +360,18 @@ defmodule GolfScoring.Scoring.Services.LoadContributionApplicabilityTest do
 
     assert %{revision: 2, withdrawal_applicability: :applicable} =
              Enum.find(facts, &(&1.round_entry_id == entry.id))
+
+    assert {:ok, scheduled} =
+             LoadContributionApplicability.run_scheduled(
+               fixture.event.id,
+               fixture.round.id,
+               side.id
+             )
+
+    assert %{revision: 2, hole_result_id: result_id} =
+             Enum.find(scheduled, &(&1.round_entry_id == entry.id and &1.play_index == 0))
+
+    assert result_id == original.hole_result_id
   end
 
   test "ambiguous confirmation audits fail closed", %{fixture: fixture, side: side} do
@@ -322,6 +450,17 @@ defmodule GolfScoring.Scoring.Services.LoadContributionApplicabilityTest do
                LoadContributionApplicability.run(fixture.event.id, fixture.round.id, side.id)
 
       assert length(facts) == 19
+      assert_receive :projection_query
+      refute_receive :projection_query
+
+      assert {:ok, scheduled} =
+               LoadContributionApplicability.run_scheduled(
+                 fixture.event.id,
+                 fixture.round.id,
+                 side.id
+               )
+
+      assert length(scheduled) == 36
       assert_receive :projection_query
       refute_receive :projection_query
     after
@@ -437,6 +576,19 @@ defmodule GolfScoring.Scoring.Services.LoadContributionApplicabilityTest do
              unresolved_reason: :inconsistent_withdrawal_evidence,
              ruling_id: ^ruling_id
            } = Enum.find(facts, &(&1.round_entry_id == entry.id))
+
+    assert {:ok, scheduled} =
+             LoadContributionApplicability.run_scheduled(
+               fixture.event.id,
+               fixture.round.id,
+               side.id
+             )
+
+    assert Enum.all?(
+             Enum.filter(scheduled, &(&1.round_entry_id == entry.id)),
+             &(&1.withdrawal_applicability == :unresolved and
+                 &1.unresolved_reason == :inconsistent_withdrawal_evidence)
+           )
 
     assert authoritative_snapshot(entry.id, ruling_id) == before
   end
