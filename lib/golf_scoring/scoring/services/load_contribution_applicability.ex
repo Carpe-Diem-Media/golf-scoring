@@ -42,6 +42,7 @@ defmodule GolfScoring.Scoring.Services.LoadContributionApplicability do
             'round_id', w.round_id::text, 'entry_id', w.round_entry_id::text,
             'group_id', w.playing_group_id::text, 'effective_hole_id', w.effective_round_hole_id::text,
             'effective_index', w.effective_play_index, 'confirmed', w.preplay_boundary_confirmed,
+            'accepted_at', w.accepted_at AT TIME ZONE 'UTC',
             'checkpoint_hole_id', w.checkpoint_round_hole_id::text,
             'checkpoint_index', w.checkpoint_play_index,
             'submission_id', w.checkpoint_hole_submission_id::text,
@@ -217,6 +218,7 @@ defmodule GolfScoring.Scoring.Services.LoadContributionApplicability do
         boundary["play_index"] == ruling["effective_index"],
         checkpoint["round_hole_id"] == ruling["checkpoint_hole_id"],
         checkpoint["play_index"] == ruling["checkpoint_index"],
+        checkpoint["scoring_revision"] === ruling["effective_index"],
         checkpoint["hole_submission_id"] == ruling["submission_id"]
       ])
     else
@@ -231,7 +233,7 @@ defmodule GolfScoring.Scoring.Services.LoadContributionApplicability do
 
     is_binary(location) and String.trim(location) != "" and
       Enum.all?([
-        valid_attestation_time?(attestation),
+        valid_attestation_time?(attestation, ruling["accepted_at"]),
         attestation["method"] == "direct_visual",
         attestation["confirms_unplayed"] == true,
         attestation["round_id"] == scope.round,
@@ -241,12 +243,15 @@ defmodule GolfScoring.Scoring.Services.LoadContributionApplicability do
       ])
   end
 
-  defp valid_attestation_time?(attestation) do
+  defp valid_attestation_time?(attestation, accepted_at) do
     with observed when is_binary(observed) <- attestation["observed_at"],
          received when is_binary(received) <- attestation["attested_at"],
+         accepted when is_binary(accepted) <- accepted_at,
          {:ok, observed, _} <- DateTime.from_iso8601(observed),
-         {:ok, received, _} <- DateTime.from_iso8601(received) do
-      DateTime.diff(received, observed, :microsecond) in 0..60_000_000
+         {:ok, received, _} <- DateTime.from_iso8601(received),
+         {:ok, accepted, _} <- DateTime.from_iso8601(accepted) do
+      DateTime.compare(received, accepted) == :eq and
+        DateTime.diff(received, observed, :microsecond) in 0..60_000_000
     else
       _ -> false
     end

@@ -329,6 +329,118 @@ defmodule GolfScoring.Scoring.Services.LoadContributionApplicabilityTest do
     end
   end
 
+  test "mismatched attestation time fails closed", %{fixture: fixture, side: side} do
+    {entry, accepted} = accepted_fixture!(fixture)
+
+    [[attested]] =
+      Repo.query!(
+        "SELECT context #>> '{attestation,attested_at}' FROM audit_events WHERE target_id = $1::uuid AND action = 'accept_round_entry_withdrawal'",
+        [Ecto.UUID.dump!(accepted.ruling_id)]
+      ).rows
+
+    {:ok, instant, _} = DateTime.from_iso8601(attested)
+
+    update_audit!(
+      accepted.ruling_id,
+      ["attestation", "attested_at"],
+      DateTime.to_iso8601(DateTime.add(instant, 1, :microsecond))
+    )
+
+    assert_unresolved_and_preserved!(fixture, side, entry, accepted.ruling_id)
+  end
+
+  test "equivalent offset timestamp remains applicable", %{fixture: fixture, side: side} do
+    {entry, accepted} = accepted_fixture!(fixture)
+
+    [[attested]] =
+      Repo.query!(
+        "SELECT context #>> '{attestation,attested_at}' FROM audit_events WHERE target_id = $1::uuid AND action = 'accept_round_entry_withdrawal'",
+        [Ecto.UUID.dump!(accepted.ruling_id)]
+      ).rows
+
+    {:ok, instant, _} = DateTime.from_iso8601(attested)
+
+    offset =
+      instant
+      |> DateTime.add(2, :hour)
+      |> DateTime.to_iso8601()
+      |> String.replace_suffix("Z", "+02:00")
+
+    update_audit!(accepted.ruling_id, ["attestation", "attested_at"], offset)
+
+    assert {:ok, facts} =
+             LoadContributionApplicability.run(fixture.event.id, fixture.round.id, side.id)
+
+    assert %{withdrawal_applicability: :applicable} =
+             Enum.find(facts, &(&1.round_entry_id == entry.id))
+  end
+
+  test "mismatched checkpoint revision fails closed", %{fixture: fixture, side: side} do
+    {entry, accepted} = accepted_fixture!(fixture)
+    update_audit!(accepted.ruling_id, ["checkpoint", "scoring_revision"], 2)
+    assert_unresolved_and_preserved!(fixture, side, entry, accepted.ruling_id)
+  end
+
+  for {label, path} <- [
+        {"event", ["event_id"]},
+        {"round", ["round_id"]},
+        {"group", ["playing_group_id"]},
+        {"entry", ["round_entry_id"]},
+        {"attestation round", ["attestation", "round_id"]},
+        {"attestation group", ["attestation", "playing_group_id"]}
+      ] do
+    test "mismatched #{label} in the audit fails closed", %{fixture: fixture, side: side} do
+      {entry, accepted} = accepted_fixture!(fixture)
+      update_audit!(accepted.ruling_id, unquote(path), Ecto.UUID.generate())
+      assert_unresolved_and_preserved!(fixture, side, entry, accepted.ruling_id)
+    end
+  end
+
+  defp accepted_fixture!(fixture) do
+    entry = List.last(fixture.entries)
+    {:ok, accepted} = accept!(fixture, entry, Enum.at(fixture.route, 1), 1)
+    {entry, accepted}
+  end
+
+  defp update_audit!(ruling_id, path, value) do
+    %{num_rows: 1} =
+      Repo.query!(
+        "UPDATE audit_events SET context = jsonb_set(context, $2::text[], $3::jsonb) WHERE target_id = $1::uuid AND action = 'accept_round_entry_withdrawal'",
+        [Ecto.UUID.dump!(ruling_id), path, value]
+      )
+  end
+
+  defp authoritative_snapshot(entry_id, ruling_id) do
+    ruling =
+      Repo.query!(
+        "SELECT row_to_json(r) FROM round_entry_participation_rulings r WHERE id = $1::uuid",
+        [Ecto.UUID.dump!(ruling_id)]
+      ).rows
+
+    results =
+      Repo.query!(
+        "SELECT row_to_json(h) FROM hole_results h JOIN scorecards s ON s.id = h.scorecard_id WHERE s.round_entry_id = $1::uuid ORDER BY h.id",
+        [Ecto.UUID.dump!(entry_id)]
+      ).rows
+
+    {ruling, results}
+  end
+
+  defp assert_unresolved_and_preserved!(fixture, side, entry, ruling_id) do
+    before = authoritative_snapshot(entry.id, ruling_id)
+
+    assert {:ok, facts} =
+             LoadContributionApplicability.run(fixture.event.id, fixture.round.id, side.id)
+
+    assert %{
+             withdrawal_applicability: :unresolved,
+             unresolved_reason: :inconsistent_withdrawal_evidence,
+             ruling_id: ^ruling_id
+           } = Enum.find(facts, &(&1.round_entry_id == entry.id))
+
+    assert authoritative_snapshot(entry.id, ruling_id) == before
+  end
+
   def observe_query(_event, _measurements, _metadata, parent) do
     if self() == parent, do: send(parent, :projection_query)
   end
