@@ -51,7 +51,7 @@ defmodule GolfScoring.CIWorkflowTest do
 
     workflow = File.read!(@workflow_path)
 
-    assert workflow =~ ~r/^on:\n  pull_request:\n  workflow_dispatch:\n\n/m
+    assert workflow =~ ~r/^on:\n  pull_request:\n  workflow_dispatch:\n\npermissions:\n/m
 
     assert workflow =~ ~r/^permissions:\s*\n  contents:\s*read\s*$/m
 
