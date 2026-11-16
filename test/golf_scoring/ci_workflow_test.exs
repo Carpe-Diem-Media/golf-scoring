@@ -45,20 +45,16 @@ defmodule GolfScoring.CIWorkflowTest do
              ~r/name: Verify Ash generated artifacts are current\s+env:\s+TEST_DATABASE_USERNAME: golf_scoring_ci\s+TEST_DATABASE_PASSWORD: golf_scoring_ci\s+TEST_DATABASE_HOST: localhost\s+TEST_DATABASE_PORT: "5432"\s+TEST_DATABASE_NAME: golf_scoring_test\s+run: mix ash.codegen --check/
   end
 
-  test "GitHub Actions runs the Phase 0 quality gate on pull requests and main pushes" do
+  test "GitHub Actions runs the Phase 0 quality gate on pull requests and manual dispatch" do
     assert File.regular?(@workflow_path),
            "expected .github/workflows/ci.yml to define the repository CI workflow"
 
     workflow = File.read!(@workflow_path)
 
-    assert workflow =~ ~r/^on:\s*$/m
-    assert workflow =~ ~r/^  pull_request:\s*$/m
-    assert workflow =~ ~r/^  push:\s*$/m
-    assert workflow =~ ~r/^    branches:\s*$/m
-    assert workflow =~ ~r/^      - main\s*$/m
+    assert workflow =~ ~r/^on:\n  pull_request:\n  workflow_dispatch:\n\n/m
 
     assert workflow =~ ~r/^permissions:\s*\n  contents:\s*read\s*$/m
-    refute workflow =~ ~r/\b(write|id-token)\b/
+    refute workflow =~ ~r/^\s*(?:[\w-]+:\s*write(?:-all)?\s*$|id-token:)/m
 
     assert workflow =~ ~r/^jobs:\s*$/m
 
