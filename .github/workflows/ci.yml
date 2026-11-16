@@ -2,9 +2,7 @@ name: CI
 
 on:
   pull_request:
-  push:
-    branches:
-      - main
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -79,10 +77,10 @@ jobs:
           TEST_DATABASE_NAME: golf_scoring_test
         run: mix ash.codegen --check
 
-      # PRs may restore trusted caches, but only main writes new caches.
+      # Only manual runs on main may write trusted caches.
       - name: Save BEAM build cache
         if: >-
-          github.event_name == 'push' &&
+          github.event_name == 'workflow_dispatch' &&
           github.ref == 'refs/heads/main' &&
           steps.beam_cache.outputs.cache-hit != 'true'
         # actions/cache v6.1.0
@@ -291,10 +289,10 @@ jobs:
         if: steps.plt_cache.outputs.cache-hit != 'true'
         run: mix dialyzer --plt
 
-      # Only trusted main pushes may populate the persistent PLT cache.
+      # Only manual runs on main may populate the persistent PLT cache.
       - name: Save Dialyzer PLT cache
         if: >-
-          github.event_name == 'push' &&
+          github.event_name == 'workflow_dispatch' &&
           github.ref == 'refs/heads/main' &&
           steps.plt_cache.outputs.cache-hit != 'true'
         # actions/cache v6.1.0
