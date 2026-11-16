@@ -13,7 +13,7 @@ defmodule GolfScoring.Scoring.Calculators.SideHoleContributorsTest do
             %{fact | hole_result_id: "result", revision: 2}
 
           fact.play_index == 0 and fact.round_entry_id == "b" ->
-            %{fact | withdrawal_applicability: :not_applicable}
+            %{fact | withdrawal_applicability: :not_applicable, ruling_id: "ruling-b"}
 
           true ->
             fact
@@ -28,6 +28,7 @@ defmodule GolfScoring.Scoring.Calculators.SideHoleContributorsTest do
 
     assert recorded == Enum.find(facts, &(&1.hole_result_id == "result"))
     assert excluded.round_entry_id == "b"
+    assert excluded.ruling_id == "ruling-b"
     assert %{recorded: [], missing: [_, _], excluded: []} = Enum.at(groups, 1)
   end
 
@@ -37,8 +38,8 @@ defmodule GolfScoring.Scoring.Calculators.SideHoleContributorsTest do
         case fact.play_index do
           0 -> %{fact | hole_result_id: "result-#{entry}", revision: 1}
           1 when entry == "a" -> %{fact | hole_result_id: "one", revision: 3}
-          1 -> %{fact | withdrawal_applicability: :not_applicable}
-          2 -> %{fact | withdrawal_applicability: :not_applicable}
+          1 -> %{fact | withdrawal_applicability: :not_applicable, ruling_id: "ruling-#{entry}"}
+          2 -> %{fact | withdrawal_applicability: :not_applicable, ruling_id: "ruling-#{entry}"}
           _ -> fact
         end
       end
@@ -62,6 +63,11 @@ defmodule GolfScoring.Scoring.Calculators.SideHoleContributorsTest do
                    unresolved_reason: :missing_withdrawal_ruling
                }
                | rest
+             ])
+
+    assert {:error, :invalid_input} =
+             SideHoleContributors.select([
+               %{first | withdrawal_applicability: :not_applicable} | rest
              ])
 
     assert {:error, :invalid_input} = SideHoleContributors.select([first | facts])

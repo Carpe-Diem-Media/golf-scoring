@@ -54,15 +54,23 @@ defmodule GolfScoring.Scoring.Calculators.SideHoleContributors do
          hole_result_id: result,
          revision: revision,
          withdrawal_applicability: applicability,
+         ruling_id: ruling_id,
          unresolved_reason: nil
        }) do
     is_binary(entry) and entry != "" and is_binary(hole) and hole != "" and
       is_integer(index) and index in 0..17 and
-      applicability in [:applicable, :not_applicable] and
+      valid_applicability?(applicability, ruling_id) and
       valid_result?(result, revision)
   end
 
   defp valid_fact?(_), do: false
+
+  defp valid_applicability?(:applicable, _ruling_id), do: true
+
+  defp valid_applicability?(:not_applicable, ruling_id),
+    do: is_binary(ruling_id) and ruling_id != ""
+
+  defp valid_applicability?(_, _), do: false
 
   defp valid_result?(nil, nil), do: true
 
