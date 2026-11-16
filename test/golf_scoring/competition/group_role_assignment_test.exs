@@ -350,9 +350,11 @@ defmodule GolfScoring.Competition.GroupRoleAssignmentTest do
     assert successor.assignment_version == original.assignment_version + 1
     assert successor.round_entry_id == replacement.id
 
+    group_id = setup.group.id
+
     assert {:ok, audit} =
              AuditEvent
-             |> Ash.Query.filter(action == "handover_group_role")
+             |> Ash.Query.filter(action == "handover_group_role" and target_id == ^group_id)
              |> Ash.read(authorize?: false)
 
     assert length(audit) == 1
