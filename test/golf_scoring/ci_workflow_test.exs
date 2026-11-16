@@ -45,20 +45,23 @@ defmodule GolfScoring.CIWorkflowTest do
              ~r/name: Verify Ash generated artifacts are current\s+env:\s+TEST_DATABASE_USERNAME: golf_scoring_ci\s+TEST_DATABASE_PASSWORD: golf_scoring_ci\s+TEST_DATABASE_HOST: localhost\s+TEST_DATABASE_PORT: "5432"\s+TEST_DATABASE_NAME: golf_scoring_test\s+run: mix ash.codegen --check/
   end
 
-  test "GitHub Actions runs the Phase 0 quality gate on pull requests and main pushes" do
+  test "GitHub Actions runs the Phase 0 quality gate on pull requests and manual dispatch" do
     assert File.regular?(@workflow_path),
            "expected .github/workflows/ci.yml to define the repository CI workflow"
 
     workflow = File.read!(@workflow_path)
 
-    assert workflow =~ ~r/^on:\s*$/m
-    assert workflow =~ ~r/^  pull_request:\s*$/m
-    assert workflow =~ ~r/^  push:\s*$/m
-    assert workflow =~ ~r/^    branches:\s*$/m
-    assert workflow =~ ~r/^      - main\s*$/m
+    assert workflow =~ ~r/^on:\n  pull_request:\n  workflow_dispatch:\n\n/m
 
     assert workflow =~ ~r/^permissions:\s*\n  contents:\s*read\s*$/m
-    refute workflow =~ ~r/\b(write|id-token)\b/
+
+    without_comments =
+      workflow
+      |> String.split("\n")
+      |> Enum.reject(&String.starts_with?(String.trim_leading(&1), "#"))
+      |> Enum.join("\n")
+
+    refute without_comments =~ ~r/\b(write|id-token)\b/
 
     assert workflow =~ ~r/^jobs:\s*$/m
 
@@ -105,6 +108,24 @@ defmodule GolfScoring.CIWorkflowTest do
     assert command_positions == Enum.sort(command_positions)
     refute workflow =~ ~r/^\s*matrix:\s*$/m
     refute workflow =~ ~r/^\s*redis:\s*$/mi
+  end
+
+  test "cache writes are restricted to manual runs on main" do
+    workflow = File.read!(@workflow_path)
+
+    for {name, cache} <- [
+          {"BEAM build", "beam_cache"},
+          {"Dialyzer PLT", "plt_cache"}
+        ] do
+      assert workflow =~
+               "- name: Save #{name} cache\n" <>
+                 "        if: >-\n" <>
+                 "          github.event_name == 'workflow_dispatch' &&\n" <>
+                 "          github.ref == 'refs/heads/main' &&\n" <>
+                 "          steps.#{cache}.outputs.cache-hit != 'true'"
+    end
+
+    assert length(Regex.scan(~r/uses: actions\/cache\/save@/, workflow)) == 2
   end
 
   test "Browser CI runs the native IndexedDB Playwright suite" do
