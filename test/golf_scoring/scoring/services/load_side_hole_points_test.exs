@@ -6,6 +6,7 @@ defmodule GolfScoring.Scoring.Services.LoadSideHolePointsTest do
   alias GolfScoring.Repo
   alias GolfScoring.Scoring
   alias GolfScoring.Scoring.Services.LoadSideHolePoints
+  alias GolfScoring.Scoring.Services.LoadStandardSideHoles
   alias GolfScoring.Scoring.Services.PaperRecoveryFixtures, as: Fixtures
 
   test "repeatable read keeps applicability and score revision on one snapshot during correction" do
@@ -109,6 +110,61 @@ defmodule GolfScoring.Scoring.Services.LoadSideHolePointsTest do
                  Enum.flat_map(tl(holes), & &1.members),
                  &(&1.status == :pending and is_nil(&1.points))
                )
+
+        Process.put(:gls90_queries, [])
+
+        :ok =
+          :telemetry.attach(
+            handler,
+            [:golf_scoring, :repo, :query],
+            &__MODULE__.capture_query/4,
+            self()
+          )
+
+        standard =
+          try do
+            LoadStandardSideHoles.run(
+              f.event.id,
+              f.round.id,
+              f.side.id
+            )
+          after
+            :telemetry.detach(handler)
+          end
+
+        queries = Process.get(:gls90_queries)
+        reads = Enum.filter(queries, &String.starts_with?(&1, ["WITH ", "SELECT "]))
+        assert length(reads) == 2
+        assert Enum.count(reads, &String.starts_with?(&1, "WITH scope AS")) == 1
+        assert Enum.count(reads, &String.starts_with?(&1, "SELECT e.id::text")) == 1
+
+        assert Enum.all?(
+                 queries,
+                 fn sql ->
+                   String.upcase(String.trim(sql)) in [
+                     "BEGIN",
+                     "COMMIT",
+                     "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY"
+                   ] or sql in reads
+                 end
+               )
+
+        assert {:ok, standard_holes} = standard
+
+        assert Enum.map(standard_holes, & &1.round_hole_id) ==
+                 [List.last(f.route).id | Enum.map(Enum.drop(f.route, -1), & &1.id)]
+
+        assert Enum.map(standard_holes, & &1.play_index) == Enum.to_list(0..17)
+        assert Enum.map(standard_holes, & &1.members) == Enum.map(holes, & &1.members)
+        assert %{status: :computed, points: best} = hd(standard_holes)
+        assert best == Enum.max(Enum.map(hd(holes).members, & &1.points))
+
+        assert Enum.any?(
+                 hd(standard_holes).members,
+                 &(&1.status == :recorded and &1.points == 0 and &1.hole_result_id != nil)
+               )
+
+        assert Enum.all?(tl(standard_holes), &(&1.status == :pending and is_nil(&1.points)))
 
         assert {:ok, {:error, :outer_transaction_required}} =
                  Repo.transaction(fn ->
@@ -276,6 +332,25 @@ defmodule GolfScoring.Scoring.Services.LoadSideHolePointsTest do
           excluded = Enum.find(hole.members, &(&1.round_entry_id == entry.id))
           assert excluded.status == :excluded and is_nil(excluded.points)
           assert excluded.ruling_id == ruling.ruling_id
+        end
+
+        assert {:ok, standard_holes} =
+                 LoadStandardSideHoles.run(
+                   f.event.id,
+                   f.round.id,
+                   f.side.id
+                 )
+
+        assert Enum.map(standard_holes, & &1.members) == Enum.map(holes, & &1.members)
+        assert %{status: :computed, points: 0} = hd(standard_holes)
+
+        for hole <- tl(standard_holes) do
+          assert hole.status == :pending and is_nil(hole.points)
+
+          assert Enum.any?(
+                   hole.members,
+                   &(&1.status == :excluded and &1.ruling_id == ruling.ruling_id)
+                 )
         end
 
         assert {:error, :invalid_scope} =

@@ -449,7 +449,7 @@ defmodule GolfScoring.Scoring.Services.PaperRecoveryFixtures do
   end
 
   defp create_staff_user! do
-    email = "#{Process.get(:gls34_prefix)}-#{System.unique_integer([:positive])}@example.com"
+    email = "#{Process.get(:gls34_prefix)}-#{Ecto.UUID.generate()}@example.com"
 
     Accounts.StaffUser
     |> Ash.Changeset.for_create(:provision_staff_user, %{
