@@ -171,54 +171,143 @@ defmodule GolfScoring.Scoring.Services.LoadSideHolePointsTest do
     assert old_member.revision == 1 and old_member.hole_result_id == fact.hole_result_id
     assert old_member.points > 0
 
+    before_withdrawal =
+      verified_unboxed(fn ->
+        assert {:ok, holes} = LoadSideHolePoints.run(f.event.id, f.round.id, f.side.id)
+        member = Enum.find(hd(holes).members, &(&1.round_entry_id == hd(f.entries).id))
+        assert member.hole_result_id == fact.hole_result_id
+        assert member.revision == 2
+        assert member.points == 0
+
+        assert [[2, 9]] =
+                 Repo.query!(
+                   "SELECT revision, gross_strokes FROM hole_results WHERE id = $1::uuid",
+                   [uuid(fact.hole_result_id)]
+                 ).rows
+
+        holes
+      end)
+
+    entry = List.last(f.entries)
+    boundary = hd(f.route)
+    withdrawn_fact = Enum.find(hd(before_withdrawal).members, &(&1.round_entry_id == entry.id))
+    assert withdrawn_fact.withdrawal_applicability == :applicable
+    assert withdrawn_fact.status == :recorded and withdrawn_fact.points == 0
+
+    withdrawal_reader =
+      Task.async(fn ->
+        verified_unboxed(fn ->
+          [[pid]] = Repo.query!("SELECT pg_backend_pid()").rows
+          handler = {__MODULE__, make_ref()}
+          config = %{parent: parent, owner: self(), fact: withdrawn_fact, db_pid: pid}
+
+          :ok =
+            :telemetry.attach(
+              handler,
+              [:golf_scoring, :repo, :query],
+              &__MODULE__.pause_after_applicability/4,
+              config
+            )
+
+          try do
+            LoadSideHolePoints.run(f.event.id, f.round.id, f.side.id)
+          after
+            :telemetry.detach(handler)
+          end
+        end)
+      end)
+
+    try do
+      assert_receive {:snapshot_ready, withdrawal_reader_pid, ^withdrawn_fact, withdrawal_db_pid},
+                     30_000
+
+      withdrawal_writer =
+        Task.async(fn ->
+          verified_unboxed(fn ->
+            [[pid]] = Repo.query!("SELECT pg_backend_pid()").rows
+
+            result =
+              AcceptRoundEntryWithdrawal.run(
+                f.admin,
+                f.event.id,
+                f.round.id,
+                f.group.id,
+                entry.id,
+                %{
+                  reason: "fixture withdrawal",
+                  attestation: %{
+                    observed_at: DateTime.add(DateTime.utc_now(:microsecond), -1, :second),
+                    method: "direct_visual",
+                    observation_location: "fixture",
+                    round_id: f.round.id,
+                    playing_group_id: f.group.id,
+                    effective_round_hole_id: boundary.id,
+                    effective_play_index: 1,
+                    confirms_unplayed?: true
+                  }
+                }
+              )
+
+            {pid, result}
+          end)
+        end)
+
+      {withdrawal_writer_pid, withdrawal_result} = Task.await(withdrawal_writer, 30_000)
+      assert withdrawal_writer_pid != withdrawal_db_pid
+      assert {:ok, ruling} = withdrawal_result
+      send(withdrawal_reader_pid, :continue)
+      assert {:ok, ^before_withdrawal} = Task.await(withdrawal_reader, 30_000)
+
+      verified_unboxed(fn ->
+        assert {:ok, holes} = LoadSideHolePoints.run(f.event.id, f.round.id, f.side.id)
+        historical = Enum.find(hd(holes).members, &(&1.round_entry_id == entry.id))
+        assert historical.status == :recorded and historical.ruling_id == ruling.ruling_id
+        assert historical.hole_result_id == withdrawn_fact.hole_result_id
+        assert historical.revision == withdrawn_fact.revision
+        assert historical.points == withdrawn_fact.points
+
+        for {before_hole, after_hole} <- Enum.zip(before_withdrawal, holes) do
+          before_partner = Enum.reject(before_hole.members, &(&1.round_entry_id == entry.id))
+          after_partner = Enum.reject(after_hole.members, &(&1.round_entry_id == entry.id))
+          assert after_partner == before_partner
+        end
+
+        for hole <- tl(holes) do
+          excluded = Enum.find(hole.members, &(&1.round_entry_id == entry.id))
+          assert excluded.status == :excluded and is_nil(excluded.points)
+          assert excluded.ruling_id == ruling.ruling_id
+        end
+
+        assert {:error, :invalid_scope} =
+                 LoadSideHolePoints.run(Ecto.UUID.generate(), f.round.id, f.side.id)
+      end)
+    after
+      send(withdrawal_reader.pid, :continue)
+      Task.shutdown(withdrawal_reader, 5_000)
+    end
+
     verified_unboxed(fn ->
-      assert {:ok, holes} = LoadSideHolePoints.run(f.event.id, f.round.id, f.side.id)
-      member = Enum.find(hd(holes).members, &(&1.round_entry_id == hd(f.entries).id))
-      assert member.hole_result_id == fact.hole_result_id
-      assert member.revision == 2
-      assert member.points == 0
+      [[tee_hole_id, original_index]] =
+        Repo.query!(
+          "SELECT id::text, stroke_index FROM round_tee_hole_snapshots WHERE round_tee_profile_snapshot_id = $1::uuid AND round_hole_id = $2::uuid",
+          [uuid(f.tee_snapshot.id), uuid(f.start_hole.id)]
+        ).rows
 
-      assert [[2, 9]] =
-               Repo.query!(
-                 "SELECT revision, gross_strokes FROM hole_results WHERE id = $1::uuid",
-                 [uuid(fact.hole_result_id)]
-               ).rows
+      Repo.query!("UPDATE round_tee_hole_snapshots SET stroke_index = 19 WHERE id = $1::uuid", [
+        uuid(tee_hole_id)
+      ])
 
-      entry = List.last(f.entries)
-      boundary = hd(f.route)
+      try do
+        assert {:error, :inconsistent_evidence} =
+                 LoadSideHolePoints.run(f.event.id, f.round.id, f.side.id)
+      after
+        Repo.query!("UPDATE round_tee_hole_snapshots SET stroke_index = $2 WHERE id = $1::uuid", [
+          uuid(tee_hole_id),
+          original_index
+        ])
+      end
 
-      assert {:ok, ruling} =
-               AcceptRoundEntryWithdrawal.run(
-                 f.admin,
-                 f.event.id,
-                 f.round.id,
-                 f.group.id,
-                 entry.id,
-                 %{
-                   reason: "fixture withdrawal",
-                   attestation: %{
-                     observed_at: DateTime.add(DateTime.utc_now(:microsecond), -1, :second),
-                     method: "direct_visual",
-                     observation_location: "fixture",
-                     round_id: f.round.id,
-                     playing_group_id: f.group.id,
-                     effective_round_hole_id: boundary.id,
-                     effective_play_index: 1,
-                     confirms_unplayed?: true
-                   }
-                 }
-               )
-
-      assert {:ok, holes} = LoadSideHolePoints.run(f.event.id, f.round.id, f.side.id)
-      historical = Enum.find(hd(holes).members, &(&1.round_entry_id == entry.id))
-      assert historical.status == :recorded and historical.ruling_id == ruling.ruling_id
-      excluded = Enum.find(Enum.at(holes, 1).members, &(&1.round_entry_id == entry.id))
-
-      assert excluded.status == :excluded and is_nil(excluded.points) and
-               excluded.ruling_id == ruling.ruling_id
-
-      assert {:error, :invalid_scope} =
-               LoadSideHolePoints.run(Ecto.UUID.generate(), f.round.id, f.side.id)
+      assert {:ok, _holes} = LoadSideHolePoints.run(f.event.id, f.round.id, f.side.id)
 
       Repo.query!("DELETE FROM competition_handicaps WHERE round_entry_id = $1::uuid", [
         uuid(entry.id)
@@ -243,7 +332,7 @@ defmodule GolfScoring.Scoring.Services.LoadSideHolePointsTest do
       receive do
         :continue -> :ok
       after
-        30_000 -> raise "timed out waiting for correction"
+        30_000 -> raise "timed out waiting for concurrent writer"
       end
     end
   end
