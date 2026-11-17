@@ -14,6 +14,229 @@ defmodule GolfScoring.Scoring.Services.LoadStandardStandingsTest do
     assert {:error, :invalid_scope} = LoadStandardStandings.run("invalid", "invalid", "invalid")
   end
 
+  test "an event admin can read staff standings" do
+    {:ok, f} = verified_unboxed_transaction(fn -> fixture!() end)
+    on_exit(fn -> cleanup!(f) end)
+
+    verified_unboxed(fn ->
+      assert {:ok, standings} =
+               LoadStandardStandings.run_for_staff(f.admin, f.event.id, f.round.id, f.track.id)
+
+      assert length(standings) == 2
+    end)
+  end
+
+  test "staff authorization uses current event roles and stops before standings queries" do
+    {:ok, f} = verified_unboxed_transaction(fn -> fixture!() end)
+    on_exit(fn -> cleanup!(f) end)
+    {:ok, other} = verified_unboxed_transaction(fn -> fixture!() end)
+    on_exit(fn -> cleanup!(other) end)
+
+    verified_unboxed(fn ->
+      read = fn ->
+        LoadStandardStandings.run_for_staff(f.admin, f.event.id, f.round.id, f.track.id)
+      end
+
+      handler = {__MODULE__, make_ref()}
+
+      :ok =
+        :telemetry.attach(
+          handler,
+          [:golf_scoring, :repo, :query],
+          &__MODULE__.capture_query/4,
+          self()
+        )
+
+      try do
+        for role <- ["event_admin", "competition_manager"] do
+          Repo.query!("UPDATE event_staff_assignments SET role = $2 WHERE event_id = $1::uuid", [
+            uuid(f.event.id),
+            role
+          ])
+
+          Process.put(:standings_queries, [])
+          {micros, result} = :timer.tc(read)
+
+          reads =
+            Process.get(:standings_queries)
+            |> Enum.filter(&String.starts_with?(&1, ["SELECT ", "WITH "]))
+
+          IO.puts("GLS-42.3A role=#{role} sides=2 reads=#{length(reads)} elapsed_us=#{micros}")
+          assert length(reads) == 10
+          assert {:ok, standings} = result
+          assert length(standings) == 2
+
+          assert Enum.all?(
+                   standings,
+                   &(Enum.sort(Map.keys(&1)) == [
+                       :display_status,
+                       :holes_completed,
+                       :position,
+                       :side_id,
+                       :subtotal
+                     ])
+                 )
+        end
+
+        for role <- ["scoring_support", "registration_staff"] do
+          Repo.query!("UPDATE event_staff_assignments SET role = $2 WHERE event_id = $1::uuid", [
+            uuid(f.event.id),
+            role
+          ])
+
+          assert_denied_without_evidence(read)
+        end
+
+        Repo.query!(
+          "UPDATE event_staff_assignments SET role = 'event_admin' WHERE event_id = $1::uuid",
+          [uuid(f.event.id)]
+        )
+
+        for status <- ["suspended", "disabled"] do
+          Repo.query!("UPDATE staff_users SET status = $2 WHERE id = $1::uuid", [
+            uuid(f.admin.id),
+            status
+          ])
+
+          assert_denied_without_evidence(read)
+        end
+
+        Repo.query!(
+          "UPDATE staff_users SET status = 'active', system_admin = true WHERE id = $1::uuid",
+          [uuid(f.admin.id)]
+        )
+
+        assert {:ok, _} = read.()
+
+        Repo.query!(
+          "UPDATE event_staff_assignments SET status = 'revoked' WHERE event_id = $1::uuid",
+          [uuid(f.event.id)]
+        )
+
+        assert_denied_without_evidence(read)
+
+        assert_denied_without_evidence(fn ->
+          LoadStandardStandings.run_for_staff(other.admin, f.event.id, f.round.id, f.track.id)
+        end)
+
+        assert {:error, :invalid_scope} =
+                 LoadStandardStandings.run_for_staff(nil, f.event.id, f.round.id, f.track.id)
+
+        assert {:error, :invalid_scope} =
+                 LoadStandardStandings.run_for_staff(
+                   %{id: f.admin.id},
+                   f.event.id,
+                   f.round.id,
+                   f.track.id
+                 )
+
+        for {event, round, track} <- [
+              {"bad", f.round.id, f.track.id},
+              {f.event.id, "bad", f.track.id},
+              {f.event.id, f.round.id, "bad"}
+            ] do
+          assert {:error, :invalid_scope} =
+                   LoadStandardStandings.run_for_staff(f.admin, event, round, track)
+        end
+
+        assert {:ok, {:error, :outer_transaction_required}} = Repo.transaction(read)
+
+        assert {:error, :invalid_scope} =
+                 LoadStandardStandings.run_for_staff(
+                   other.admin,
+                   other.event.id,
+                   f.round.id,
+                   f.track.id
+                 )
+
+        assert {:error, :invalid_scope} =
+                 LoadStandardStandings.run_for_staff(
+                   other.admin,
+                   other.event.id,
+                   other.round.id,
+                   f.track.id
+                 )
+      after
+        :telemetry.detach(handler)
+      end
+    end)
+  end
+
+  defp assert_denied_without_evidence(read) do
+    Process.put(:standings_queries, [])
+    assert {:error, :not_found_or_forbidden} = read.()
+
+    reads =
+      Process.get(:standings_queries)
+      |> Enum.filter(&String.starts_with?(&1, ["SELECT ", "WITH "]))
+
+    assert length(reads) == 1
+    assert hd(reads) =~ "FROM staff_users"
+  end
+
+  test "authorization and standings share a snapshot across revocation" do
+    {:ok, f} = verified_unboxed_transaction(fn -> fixture!() end)
+    on_exit(fn -> cleanup!(f) end)
+    parent = self()
+
+    reader =
+      Task.async(fn ->
+        verified_unboxed(fn ->
+          handler = {__MODULE__, make_ref()}
+
+          :ok =
+            :telemetry.attach(
+              handler,
+              [:golf_scoring, :repo, :query],
+              &__MODULE__.pause_after_authorization/4,
+              %{owner: self(), parent: parent}
+            )
+
+          try do
+            LoadStandardStandings.run_for_staff(f.admin, f.event.id, f.round.id, f.track.id)
+          after
+            :telemetry.detach(handler)
+          end
+        end)
+      end)
+
+    try do
+      assert_receive {:authorization_read, reader_pid}, 30_000
+
+      verified_unboxed(fn ->
+        Repo.query!(
+          "UPDATE event_staff_assignments SET status = 'revoked' WHERE event_id = $1::uuid",
+          [uuid(f.event.id)]
+        )
+      end)
+
+      send(reader_pid, :continue)
+      assert {:ok, standings} = Task.await(reader, 30_000)
+      assert length(standings) == 2
+
+      verified_unboxed(fn ->
+        assert {:error, :not_found_or_forbidden} =
+                 LoadStandardStandings.run_for_staff(f.admin, f.event.id, f.round.id, f.track.id)
+      end)
+    after
+      send(reader.pid, :continue)
+      Task.shutdown(reader, 5_000)
+    end
+  end
+
+  @doc false
+  def pause_after_authorization(_event, _measurements, metadata, config) do
+    if self() == config.owner and String.contains?(metadata.query, "FROM staff_users staff") do
+      send(config.parent, {:authorization_read, self()})
+
+      receive do
+        :continue -> :ok
+      after
+        30_000 -> raise "timed out waiting for revocation"
+      end
+    end
+  end
+
   test "loads scoped sides deterministically with pending and recorded zero and no private evidence" do
     {:ok, f} = verified_unboxed_transaction(fn -> fixture!() end)
     on_exit(fn -> cleanup!(f) end)
