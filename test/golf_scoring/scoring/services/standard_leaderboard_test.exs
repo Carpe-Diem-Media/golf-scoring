@@ -18,8 +18,7 @@ defmodule GolfScoring.Scoring.Services.StandardLeaderboardTest do
     assert Enum.map([a, b, c], &{&1.side_id, &1.subtotal, &1.holes_completed, &1.position}) ==
              [{"a", 2, 1, 1}, {"b", 2, 2, 1}, {"c", 1, 1, 3}]
 
-    assert Enum.at(b.holes, 1).points == 0
-    assert Enum.at(b.holes, 2).points == nil
+    assert b.display_status == :provisional
   end
 
   test "withholds excluded, zero-progress and non-computable sides but retains review position" do
@@ -28,9 +27,23 @@ defmodule GolfScoring.Scoring.Services.StandardLeaderboardTest do
     pending = side("pending", [])
     unavailable = side("unavailable", [4]) |> put_hole(1, :not_computable, nil)
     assert {:ok, rows} = project([excluded, pending, unavailable, review])
-    assert %{position: 1, side_result_state: :review_required} = find(rows, "review")
+    assert %{position: 1, display_status: :under_review} = find(rows, "review")
     for id <- ["excluded", "pending", "unavailable"], do: assert(find(rows, id).position == nil)
-    assert Enum.at(find(rows, "unavailable").holes, 1).points == nil
+    assert find(rows, "unavailable").display_status == :unranked
+  end
+
+  test "derives neutral status from each lifecycle state and progress" do
+    for state <- [:provisional, :ready_to_finalize, :finalized] do
+      assert {:ok, [%{display_status: :provisional}]} = project([side("a", [0], state)])
+      assert {:ok, [%{display_status: :unranked}]} = project([side("a", [], state)])
+    end
+
+    assert {:ok, [%{display_status: :under_review}]} = project([side("a", [], :review_required)])
+
+    assert {:ok, [%{display_status: :under_review}]} =
+             project([side("a", [1], :review_required) |> put_hole(1, :not_computable, nil)])
+
+    assert {:ok, [%{display_status: :unranked}]} = project([side("a", [1], :excluded)])
   end
 
   test "a correction changes order" do
@@ -129,6 +142,17 @@ defmodule GolfScoring.Scoring.Services.StandardLeaderboardTest do
     assert Enum.map(rows, & &1.position) == [1, 1, 3]
   end
 
+  test "complete ties with identical countback keys share positions" do
+    assert {:ok, rows} =
+             project([
+               side("a", List.duplicate(1, 18)),
+               side("b", List.duplicate(1, 18)),
+               side("c", [1])
+             ])
+
+    assert Enum.map(rows, & &1.position) == [1, 1, 3]
+  end
+
   test "rejects missing result, duplicate ids, malformed evidence, policy and mapping" do
     good = side("a", [1])
 
@@ -176,8 +200,7 @@ defmodule GolfScoring.Scoring.Services.StandardLeaderboardTest do
                :side_id,
                :subtotal,
                :holes_completed,
-               :side_result_state,
-               :holes,
+               :display_status,
                :position
              ])
 

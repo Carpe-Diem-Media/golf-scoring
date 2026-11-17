@@ -133,7 +133,12 @@ defmodule GolfScoring.Scoring.Services.Leaderboard do
 
   defp finish(row, position) do
     row
-    |> Map.take([:side_id, :subtotal, :holes_completed, :side_result_state, :holes])
+    |> Map.take([:side_id, :subtotal, :holes_completed])
     |> Map.put(:position, position)
+    |> Map.put(:display_status, display_status(row))
   end
+
+  defp display_status(%{side_result_state: :review_required}), do: :under_review
+  defp display_status(%{rankable: false}), do: :unranked
+  defp display_status(_), do: :provisional
 end
