@@ -24,6 +24,28 @@ defmodule GolfScoring.Scoring.Services.LoadSideHolePoints do
     end
   end
 
+  @doc """
+  Projects within an existing caller-owned repeatable-read, read-only transaction.
+
+  The caller owns the transaction and its lifetime. Unsafe contexts are rejected
+  before scoring evidence is read.
+  """
+  def run_in_snapshot(event_id, round_id, side_id) do
+    with true <- Repo.in_transaction?(),
+         [["repeatable read", "on"]] <-
+           Repo.query!(
+             "SELECT current_setting('transaction_isolation'), current_setting('transaction_read_only')"
+           ).rows,
+         {:ok, event} <- Ecto.UUID.dump(event_id),
+         {:ok, round} <- Ecto.UUID.dump(round_id),
+         {:ok, side} <- Ecto.UUID.dump(side_id) do
+      project_snapshot({event_id, round_id, side_id}, {event, round, side})
+    else
+      :error -> {:error, :invalid_scope}
+      _ -> {:error, :invalid_snapshot}
+    end
+  end
+
   defp execute(ids, dumped) do
     case Repo.transaction(fn -> read_snapshot(ids, dumped) end) do
       {:ok, result} -> result
@@ -34,6 +56,10 @@ defmodule GolfScoring.Scoring.Services.LoadSideHolePoints do
   defp read_snapshot({event_id, round_id, side_id}, {event, round, side}) do
     Repo.query!("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
 
+    project_snapshot({event_id, round_id, side_id}, {event, round, side})
+  end
+
+  defp project_snapshot({event_id, round_id, side_id}, {event, round, side}) do
     with {:ok, facts} <- LoadContributionApplicability.run_scheduled(event_id, round_id, side_id),
          {:ok, groups} <- SideHoleContributors.select(facts),
          {:ok, inputs} <- load_inputs(event, round, side),
