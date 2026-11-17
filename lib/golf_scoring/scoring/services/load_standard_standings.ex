@@ -2,9 +2,11 @@ defmodule GolfScoring.Scoring.Services.LoadStandardStandings do
   @moduledoc """
   Internal Standard standings derived from one read-only PostgreSQL snapshot.
 
-  The caller is responsible for authorization. No result certifies finality.
+  The caller of `run/3` is responsible for authorization. No result certifies finality.
   """
 
+  alias GolfScoring.Accounts.Checks.ActiveEventRole
+  alias GolfScoring.Accounts.StaffUser
   alias GolfScoring.Repo
   alias GolfScoring.Scoring.Services.{Leaderboard, LoadSideHolePoints, LoadStandardSideHoles}
 
@@ -21,6 +23,40 @@ defmodule GolfScoring.Scoring.Services.LoadStandardStandings do
     end
   end
 
+  @doc "Loads provisional standings for staff with an active Event administration role."
+  def run_for_staff(actor, event_id, round_id, scoring_track_id) do
+    with %StaffUser{id: actor_id} <- actor,
+         {:ok, _} <- Ecto.UUID.dump(actor_id),
+         {:ok, event} <- Ecto.UUID.dump(event_id),
+         {:ok, round} <- Ecto.UUID.dump(round_id),
+         {:ok, track} <- Ecto.UUID.dump(scoring_track_id),
+         false <- Repo.in_transaction?() do
+      staff_transaction(actor_id, event_id, round_id, event, round, track)
+    else
+      true -> {:error, :outer_transaction_required}
+      _ -> {:error, :invalid_scope}
+    end
+  end
+
+  defp staff_transaction(actor_id, event_id, round_id, event, round, track) do
+    case Repo.transaction(fn ->
+           staff_snapshot(actor_id, event_id, round_id, event, round, track)
+         end) do
+      {:ok, result} -> result
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp staff_snapshot(actor_id, event_id, round_id, event, round, track) do
+    Repo.query!("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+
+    if ActiveEventRole.authorized?(actor_id, event_id, [:event_admin, :competition_manager]) do
+      projection(event_id, round_id, event, round, track)
+    else
+      {:error, :not_found_or_forbidden}
+    end
+  end
+
   defp run_transaction(event_id, round_id, event, round, track) do
     case Repo.transaction(fn -> snapshot(event_id, round_id, event, round, track) end) do
       {:ok, result} -> result
@@ -31,6 +67,10 @@ defmodule GolfScoring.Scoring.Services.LoadStandardStandings do
   defp snapshot(event_id, round_id, event, round, track_id) do
     Repo.query!("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
 
+    projection(event_id, round_id, event, round, track_id)
+  end
+
+  defp projection(event_id, round_id, event, round, track_id) do
     with {:ok, competition, track} <- load_track(event, round, track_id),
          {:ok, sides} <- load_sides(round, competition),
          {:ok, mapping} <- load_mapping(event, round),
