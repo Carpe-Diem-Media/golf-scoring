@@ -393,6 +393,156 @@ defmodule GolfScoring.Scoring.Services.LoadSideHolePointsTest do
     end)
   end
 
+  test "caller-owned snapshot retains facts across an accepted correction" do
+    {:ok, f} =
+      verified_unboxed_transaction(fn ->
+        f = Fixtures.setup_submit_fixture!(2)
+        Fixtures.set_round_state!(f.round, :draft)
+
+        {:ok, side} =
+          Competition.create_competition_side(
+            f.admin,
+            f.event.id,
+            f.round.id,
+            f.competition.id,
+            :partnership
+          )
+
+        {:ok, _} =
+          Fixtures.set_side_membership_for_fixture(
+            f.admin,
+            f.event.id,
+            f.round.id,
+            f.competition.id,
+            side.id,
+            Enum.map(f.entries, & &1.id)
+          )
+
+        Fixtures.set_round_state!(f.round, :scoring_open)
+        Map.put(f, :side, side)
+      end)
+
+    on_exit(fn -> cleanup!(f) end)
+
+    verified_unboxed(fn ->
+      assert {:ok, _} =
+               Scoring.submit_group_hole(f.admin, f.event.id, f.round.id, %{
+                 client_submission_id: Ecto.UUID.generate(),
+                 playing_group_id: f.group.id,
+                 round_hole_id: hd(f.route).id,
+                 expected_group_score_revision: 0,
+                 captured_at: DateTime.utc_now(),
+                 results:
+                   Enum.map(
+                     f.entries,
+                     &%{round_entry_id: &1.id, outcome: :holed_out, gross_strokes: 4}
+                   )
+               })
+    end)
+
+    parent = self()
+
+    reader =
+      Task.async(fn ->
+        verified_unboxed(fn ->
+          Repo.transaction(fn ->
+            Repo.query!("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+
+            assert [["repeatable read", "on", reader_db_pid]] =
+                     Repo.query!(
+                       "SELECT current_setting('transaction_isolation'), current_setting('transaction_read_only'), pg_backend_pid()"
+                     ).rows
+
+            assert {:ok, first} =
+                     LoadSideHolePoints.run_in_snapshot(f.event.id, f.round.id, f.side.id)
+
+            member = Enum.find(hd(first).members, &(&1.round_entry_id == hd(f.entries).id))
+            assert member.revision == 1 and member.points > 0
+            send(parent, {:caller_snapshot_ready, self(), reader_db_pid, first, member})
+
+            receive do
+              :continue -> :ok
+            after
+              30_000 -> raise "timed out waiting for correction"
+            end
+
+            assert {:ok, second} =
+                     LoadSideHolePoints.run_in_snapshot(f.event.id, f.round.id, f.side.id)
+
+            assert second == first
+            second
+          end)
+        end)
+      end)
+
+    try do
+      assert_receive {:caller_snapshot_ready, reader_pid, reader_db_pid, before, member}, 30_000
+
+      writer =
+        Task.async(fn ->
+          verified_unboxed(fn ->
+            [[writer_db_pid]] = Repo.query!("SELECT pg_backend_pid()").rows
+
+            result =
+              Scoring.correct_hole_result(f.admin, f.event.id, f.round.id, %{
+                hole_result_id: member.hole_result_id,
+                expected_revision: 1,
+                new_gross_strokes: 9,
+                reason: "caller snapshot correction"
+              })
+
+            {self(), writer_db_pid, result}
+          end)
+        end)
+
+      {writer_pid, writer_db_pid, result} = Task.await(writer, 30_000)
+      assert writer_pid != reader_pid and writer_db_pid != reader_db_pid
+      assert {:ok, correction} = result
+      assert correction.hole_result.revision == 2
+      assert correction.hole_result.gross_strokes == 9
+      assert correction.score_revision.original_revision == 1
+      assert correction.score_revision.resulting_revision == 2
+      assert Enum.all?(correction.side_results, &(&1.state == :review_required))
+      assert correction.audit.action == "correct_hole_result"
+      send(reader_pid, :continue)
+      assert {:ok, ^before} = Task.await(reader, 30_000)
+
+      verified_unboxed(fn ->
+        assert {:ok, holes} = LoadSideHolePoints.run(f.event.id, f.round.id, f.side.id)
+        corrected = Enum.find(hd(holes).members, &(&1.round_entry_id == hd(f.entries).id))
+        assert corrected.hole_result_id == member.hole_result_id
+        assert corrected.revision == 2 and corrected.points == 0
+      end)
+    after
+      send(reader.pid, :continue)
+      Task.shutdown(reader, 5_000)
+    end
+  end
+
+  test "caller-owned snapshot rejects an absent transaction" do
+    verified_unboxed(fn ->
+      id = Ecto.UUID.generate()
+      assert {:error, :invalid_snapshot} = LoadSideHolePoints.run_in_snapshot(id, id, id)
+    end)
+  end
+
+  test "caller-owned snapshot rejects unsafe transaction settings" do
+    verified_unboxed(fn ->
+      id = Ecto.UUID.generate()
+
+      assert {:ok, {:error, :invalid_snapshot}} =
+               Repo.transaction(fn ->
+                 LoadSideHolePoints.run_in_snapshot(id, id, id)
+               end)
+
+      assert {:ok, {:error, :invalid_snapshot}} =
+               Repo.transaction(fn ->
+                 Repo.query!("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ WRITE")
+                 LoadSideHolePoints.run_in_snapshot(id, id, id)
+               end)
+    end)
+  end
+
   test "rejects invalid scope" do
     assert {:error, :invalid_scope} =
              LoadSideHolePoints.run("bad", "bad", "bad")
