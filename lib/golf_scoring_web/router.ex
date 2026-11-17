@@ -105,6 +105,10 @@ defmodule GolfScoringWeb.Router do
            GolfScoringWeb.Admin.ScoreQueriesLive,
            :index
 
+      live "/events/:event_id/rounds/:round_id/standard-standings/:scoring_track_id",
+           GolfScoringWeb.Admin.StandardStandingsLive,
+           :index
+
       live "/events/:event_id/rounds/:round_id/groups",
            GolfScoringWeb.Admin.GroupAssignmentLive,
            :index

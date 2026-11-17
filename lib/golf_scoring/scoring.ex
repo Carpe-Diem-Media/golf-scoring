@@ -20,6 +20,7 @@ defmodule GolfScoring.Scoring do
   alias GolfScoring.Scoring.Services.LoadGroupScorecard
   alias GolfScoring.Scoring.Services.LoadPlayerVerificationContext
   alias GolfScoring.Scoring.Services.LoadStaffScoreQueryReview
+  alias GolfScoring.Scoring.Services.LoadStandardStandings
   alias GolfScoring.Scoring.Services.OpenScoreQuery
   alias GolfScoring.Scoring.Services.OverrideHandicapBasis
   alias GolfScoring.Scoring.Services.ResolveScoreQueryWithCorrection
@@ -35,6 +36,11 @@ defmodule GolfScoring.Scoring do
     resource GolfScoring.Scoring.ScoreQuery
     resource GolfScoring.Scoring.ScoreRevision
     resource GolfScoring.Scoring.HoleSubmission
+  end
+
+  @doc "Loads provisional Standard standings for authorized Event staff."
+  def load_standard_standings_for_staff(staff, event_id, round_id, track_id) do
+    LoadStandardStandings.run_for_staff(staff, event_id, round_id, track_id)
   end
 
   def confirm_handicap_input(actor, event_id, round_id, round_entry_id, attrs) do
